@@ -17,6 +17,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"dabet/pkg/tracing"
 )
 
 // PathPrefix is the internal endpoint path prefix; the creator_id follows.
@@ -59,7 +61,7 @@ func WithHTTPClient(h *http.Client) Option { return func(c *Client) { c.httpc = 
 func NewClient(baseURL string, opts ...Option) *Client {
 	c := &Client{
 		base:  strings.TrimSuffix(baseURL, "/"),
-		httpc: &http.Client{Timeout: 2 * time.Second},
+		httpc: tracing.HTTPClient(2 * time.Second),
 		ttl:   60 * time.Second,
 		cache: make(map[string]cacheEntry),
 		now:   time.Now,

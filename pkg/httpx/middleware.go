@@ -43,12 +43,15 @@ func RequestIDFrom(ctx context.Context) string {
 	return id
 }
 
-// ContextLogger returns l with the context's request_id attached, if any.
+// ContextLogger returns l with the context's request_id attached, if any,
+// plus trace_id/span_id when the context carries a recorded span — which
+// is what lets an operator pivot from a log line to its trace and back
+// (§4.5). With tracing off nothing is added.
 func ContextLogger(ctx context.Context, l *slog.Logger) *slog.Logger {
 	if id := RequestIDFrom(ctx); id != "" {
-		return l.With("request_id", id)
+		l = l.With("request_id", id)
 	}
-	return l
+	return withTrace(ctx, l)
 }
 
 type statusWriter struct {
