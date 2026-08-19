@@ -12,6 +12,13 @@
 // hour, on demand) and emit usage.v1 messages_reclustered events with
 // deterministic idempotency keys (§4.2).
 //
+// A run that rewrites a creator's topics also rewrites that creator's
+// topic_counts for the window, so the §8.8 dashboard stops attributing
+// history to superseded topic ids (§8.6 — reclustering rewrites history
+// for the requesting creator). That backfill is on for on-demand and
+// RUN_ONCE runs and off for periodic triggers by default; see
+// CLUSTERS_BACKFILL_COUNTS and job.ValidBackfillMode.
+//
 // Environment (beyond the shared names of §4.4 — KAFKA_BROKERS,
 // EMBEDDING_ENDPOINT, VLLM_ENDPOINT, MILVUS_ADDR, CLICKHOUSE_DSN,
 // S3_ENDPOINT, JWT_SECRET, HTTP_ADDR, METRICS_ADDR):
@@ -37,6 +44,8 @@
 //	CLUSTERS_UNASSIGNED_RATE         A24 unassigned-rate threshold     (default 0.30)
 //	CLUSTERS_UNASSIGNED_MIN_POINTS   min embedded points in the hour   (default 100)
 //	CLUSTERS_RUN_COOLDOWN            min gap between periodic runs     (default 30m)
+//	CLUSTERS_BACKFILL_COUNTS         topic_counts rewrite scope        (off|on_demand|always, default on_demand)
+//	CLUSTERS_BACKFILL_LAG            newest bucket the rewrite touches (default 2h behind now)
 //	CLUSTERS_S3_BYTES_PER_RECORD     listing-size -> point estimate    (default 1600)
 //	S3_BUCKET                        embeddings bucket                 (default "embeddings")
 //	S3_ACCESS_KEY / S3_SECRET_KEY    object store credentials          (default minioadmin)
@@ -149,6 +158,7 @@ func run(svc *service.Service) error {
 		Store:     store,
 		Centroids: centroids,
 		Topics:    ch,
+		Counts:    ch,
 		Texts:     job.NewKafkaTextSource(brokers, textLookback, textScanMax, textBudget),
 		Embed:     embeddings.NewClient(config.GetDefault(config.EnvEmbeddingEndpoint, "http://localhost:8088"), embedTimeout),
 		LLM: job.NewVLLMLabeler(
@@ -214,6 +224,17 @@ func loadJobConfig() (job.Config, error) {
 	}
 	if cfg.TextSampleMax, err = config.GetInt("CLUSTERS_TEXT_SAMPLE_MAX", 2000); err != nil {
 		return cfg, err
+	}
+	cfg.BackfillCounts = config.GetDefault("CLUSTERS_BACKFILL_COUNTS", job.BackfillOnDemand)
+	if !job.ValidBackfillMode(cfg.BackfillCounts) {
+		return cfg, fmt.Errorf("environment variable CLUSTERS_BACKFILL_COUNTS: want %s, %s or %s, got %q",
+			job.BackfillOff, job.BackfillOnDemand, job.BackfillAlways, cfg.BackfillCounts)
+	}
+	if cfg.BackfillLag, err = config.GetDuration("CLUSTERS_BACKFILL_LAG", 2*time.Hour); err != nil {
+		return cfg, err
+	}
+	if cfg.BackfillLag < 0 {
+		return cfg, fmt.Errorf("environment variable CLUSTERS_BACKFILL_LAG must not be negative")
 	}
 	cfg.EmbedBatch = 64
 	return cfg, nil

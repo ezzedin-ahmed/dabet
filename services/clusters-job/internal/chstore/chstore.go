@@ -145,6 +145,67 @@ func (s *Store) DeleteTopicsExcept(ctx context.Context, creatorID string, keep [
 	return nil
 }
 
+// DeleteCounts implements job.CountStore: remove the creator's
+// topic_counts rows whose bucket_hour is in [from, to), reporting how many
+// rows went. topic_counts is a SummingMergeTree (§8.7) — it sums rows, it
+// never replaces them — so a rewrite has to delete before it inserts or
+// every count doubles.
+//
+// The delete is a lightweight DELETE, the same mechanism
+// DeleteTopicsExcept already uses, scoped to one creator and one bucket
+// range so no other creator's rows and no row outside the window can be
+// touched (§8.6). lightweight_deletes_sync = 2 makes the statement wait
+// for the delete to be applied, so the caller's subsequent insert cannot
+// be swallowed by an in-flight mutation.
+//
+// The row count is taken before the delete because ClickHouse does not
+// report affected rows for a mutation; the extra SELECT is over the same
+// creator-and-range scope as the delete itself.
+func (s *Store) DeleteCounts(ctx context.Context, creatorID string, from, to time.Time) (int64, error) {
+	row := s.conn.QueryRow(ctx,
+		`SELECT toInt64(count()) FROM topic_counts
+		 WHERE creator_id = ? AND bucket_hour >= ? AND bucket_hour < ?`,
+		creatorID, from.UTC(), to.UTC())
+	var n int64
+	if err := row.Scan(&n); err != nil {
+		return 0, fmt.Errorf("clickhouse count topic_counts: %w", err)
+	}
+	if n == 0 {
+		return 0, nil
+	}
+	if err := s.conn.Exec(ctx,
+		`DELETE FROM topic_counts
+		 WHERE creator_id = ? AND bucket_hour >= ? AND bucket_hour < ?
+		 SETTINGS lightweight_deletes_sync = 2`,
+		creatorID, from.UTC(), to.UTC()); err != nil {
+		return 0, fmt.Errorf("clickhouse delete topic_counts: %w", err)
+	}
+	return n, nil
+}
+
+// InsertCounts implements job.CountStore as one batched insert — the same
+// statement and column order clustering-service's live writer uses, so
+// backfilled and live rows are indistinguishable to the §8.8 API.
+func (s *Store) InsertCounts(ctx context.Context, rows []job.CountRow) error {
+	if len(rows) == 0 {
+		return nil
+	}
+	batch, err := s.conn.PrepareBatch(ctx,
+		"INSERT INTO topic_counts (creator_id, content_id, topic_id, theme_id, bucket_hour, count)")
+	if err != nil {
+		return fmt.Errorf("clickhouse prepare topic_counts: %w", err)
+	}
+	for _, r := range rows {
+		if err := batch.Append(r.CreatorID, r.ContentID, r.TopicID, r.ThemeID, r.BucketHour.UTC(), r.Count); err != nil {
+			return fmt.Errorf("clickhouse append topic_counts: %w", err)
+		}
+	}
+	if err := batch.Send(); err != nil {
+		return fmt.Errorf("clickhouse send topic_counts: %w", err)
+	}
+	return nil
+}
+
 // AssignedSince sums the creator's live topic_counts assignments from
 // since on — the numerator of the unassigned-rate trigger approximation.
 func (s *Store) AssignedSince(ctx context.Context, creatorID string, since time.Time) (int64, error) {

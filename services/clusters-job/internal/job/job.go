@@ -47,6 +47,11 @@ type Result struct {
 	PointsProcessed int // after the cap
 	Topics          int
 	Themes          int
+	// CountsDeleted / CountsWritten are the topic_counts rows the counts
+	// backfill removed and wrote for the window; both zero when the
+	// backfill is disabled or skipped for this run.
+	CountsDeleted int64
+	CountsWritten int64
 }
 
 // DeterministicUUID derives a stable UUID-formatted id from parts. Used

@@ -70,6 +70,12 @@ type Config struct {
 	LabelPoints         int     // texts per cluster sent to the LLM (default 20, A25)
 	TextSampleMax       int     // recent texts sampled per run (default 2000)
 	EmbedBatch          int     // embedding request batch size (default 64)
+	// BackfillCounts is off | on_demand | always (default on_demand); see
+	// ValidBackfillMode.
+	BackfillCounts string
+	// BackfillLag is how far behind now the counts rewrite stops, bounding
+	// the concurrent-live-writer race (default 2h). See backfillCounts.
+	BackfillLag time.Duration
 }
 
 // Runner executes clustering runs. All dependencies are interfaces; tests
@@ -78,6 +84,7 @@ type Runner struct {
 	Store     ObjectStore
 	Centroids CentroidStore
 	Topics    TopicStore
+	Counts    CountStore // nil disables the topic_counts backfill
 	Texts     TextSource
 	Embed     Embedder
 	LLM       LLMLabeler
@@ -283,9 +290,29 @@ func (r *Runner) Run(ctx context.Context, d Decision) (res Result, err error) {
 		return res, fmt.Errorf("delete stale topics: %w", err)
 	}
 
+	// Rewrite this creator's topic_counts for the window so the §8.8
+	// dashboard attributes history to the ids just written, instead of to
+	// the topic ids that were superseded a moment ago. Scoped to this
+	// creator and this window (§8.6).
+	deleted, written, backfillErr := r.backfillCounts(
+		ctx, d, points, topics, themes, topicIDs, themeIDs, log)
+	res.CountsDeleted, res.CountsWritten = deleted, written
+
 	log.Info("clustering run complete", "points", res.PointsProcessed,
-		"topics", res.Topics, "themes", res.Themes, "version", version)
-	return res, r.emitUsage(ctx, d, res.PointsProcessed, log)
+		"topics", res.Topics, "themes", res.Themes, "version", version,
+		"counts_deleted", res.CountsDeleted, "counts_written", res.CountsWritten)
+
+	// usage.v1 is emitted for the compute that happened regardless of the
+	// backfill outcome, with the same quantity (points processed) and the
+	// same deterministic idempotency key (§4.2). The backfill is part of
+	// the same recluster, so it emits no event of its own.
+	if err := r.emitUsage(ctx, d, res.PointsProcessed, log); err != nil {
+		return res, err
+	}
+	if backfillErr != nil {
+		return res, fmt.Errorf("backfill counts: %w", backfillErr)
+	}
+	return res, nil
 }
 
 // Point is one embedding read from S3.
