@@ -20,6 +20,10 @@ type Metrics struct {
 	// picking a deletions.v1 record up to its terminal outcome, retries
 	// included.
 	DeletionLatency *prometheus.HistogramVec
+	// ConnectionRefreshTotal is connection_refresh_total{platform,outcome}
+	// (§5.9). It lives here rather than in user-service because §5.6 makes
+	// the adapter the component that performs refreshes.
+	ConnectionRefreshTotal *prometheus.CounterVec
 }
 
 // New constructs and registers the adapter metric set.
@@ -42,7 +46,11 @@ func New(reg prometheus.Registerer) *Metrics {
 			Help:    "Latency from deletion record receipt to terminal outcome.",
 			Buckets: prometheus.DefBuckets,
 		}, []string{"platform"}),
+		ConnectionRefreshTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "connection_refresh_total",
+			Help: "Lazy token refresh attempts by outcome (§5.6).",
+		}, []string{"platform", "outcome"}),
 	}
-	reg.MustRegister(m.ConnectionsActive, m.IngestTotal, m.DeletionsTotal, m.DeletionLatency)
+	reg.MustRegister(m.ConnectionsActive, m.IngestTotal, m.DeletionsTotal, m.DeletionLatency, m.ConnectionRefreshTotal)
 	return m
 }

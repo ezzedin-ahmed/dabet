@@ -19,6 +19,7 @@ import (
 	"dabet/pkg/httpx"
 
 	"dabet/services/user-service/internal/auth"
+	"dabet/services/user-service/internal/oauth"
 	"dabet/services/user-service/internal/repo"
 )
 
@@ -34,9 +35,20 @@ type Handler struct {
 	// Logins is auth_logins_total{outcome} (§5.9).
 	Logins *prometheus.CounterVec
 
-	// Now and NewToken are injection points for tests.
-	Now      func() time.Time
-	NewToken func() (raw, hash string, err error)
+	// Providers is the §5.5 OAuth provider set, keyed by platform. Left
+	// empty, every connect attempt fails validation — main.go loads it
+	// from env (oauth.LoadProviders).
+	Providers map[string]*oauth.Provider
+	// OAuth performs the provider HTTP calls of the connect flow.
+	OAuth *oauth.Client
+	// AppRedirectURL is where the callback 302s to when the state row
+	// carries no redirect_after (APP_REDIRECT_URL).
+	AppRedirectURL string
+
+	// Now, NewToken, and NewVerifier are injection points for tests.
+	Now         func() time.Time
+	NewToken    func() (raw, hash string, err error)
+	NewVerifier func() (string, error)
 
 	AccessTTL  time.Duration
 	RefreshTTL time.Duration
@@ -64,16 +76,19 @@ func NewHandler(r repo.Repository, jwtSecret []byte, logger *slog.Logger, logins
 		return nil, err
 	}
 	return &Handler{
-		Repo:       r,
-		JWTSecret:  jwtSecret,
-		Logger:     logger,
-		Logins:     logins,
-		Now:        func() time.Time { return time.Now().UTC() },
-		NewToken:   auth.NewOpaqueToken,
-		AccessTTL:  auth.AccessTokenTTL,
-		RefreshTTL: auth.RefreshTokenTTL,
-		VerifyTTL:  VerificationTokenTTL,
-		dummyHash:  dummy,
+		Repo:           r,
+		JWTSecret:      jwtSecret,
+		Logger:         logger,
+		Logins:         logins,
+		OAuth:          oauth.NewClient(),
+		AppRedirectURL: "http://localhost:3000/connections",
+		Now:            func() time.Time { return time.Now().UTC() },
+		NewToken:       auth.NewOpaqueToken,
+		NewVerifier:    oauth.NewVerifier,
+		AccessTTL:      auth.AccessTokenTTL,
+		RefreshTTL:     auth.RefreshTokenTTL,
+		VerifyTTL:      VerificationTokenTTL,
+		dummyHash:      dummy,
 	}, nil
 }
 
@@ -86,6 +101,7 @@ func (h *Handler) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/auth/refresh", h.handleRefresh)
 	mux.HandleFunc("POST /v1/auth/logout", h.handleLogout)
 	mux.Handle("GET /v1/me", httpx.Auth(h.JWTSecret)(http.HandlerFunc(h.handleMe)))
+	h.connectionsRoutes(mux)
 }
 
 func (h *Handler) internal(w http.ResponseWriter, r *http.Request, op string, err error) {
