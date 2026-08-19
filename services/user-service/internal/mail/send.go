@@ -43,7 +43,6 @@ func (m *Mailer) SendVerification(_ context.Context, email, fullname, token stri
 		template: TemplateVerification,
 		resolve:  static(Recipient{Email: email, Name: fullname}),
 		data: verificationData{
-			Name:         greeting(fullname),
 			VerifyURL:    verifyLink(m.cfg.VerifyURL, token),
 			ExpiresHours: int(verificationTTLHours),
 		},
@@ -64,12 +63,27 @@ func (m *Mailer) SendConnectionExpired(_ context.Context, email, fullname, platf
 		template: TemplateConnectionExpired,
 		resolve:  static(Recipient{Email: email, Name: fullname}),
 		data: connectionExpiredData{
-			Name:           greeting(fullname),
 			Platform:       platform,
 			DisplayName:    displayName,
 			ConnectionsURL: m.cfg.AppConnectionsURL,
 		},
 	})
+}
+
+// applyRecipient fills the greeting once the recipient is known. Here
+// the recipient is constant, but the worker fills it in all the same, so
+// both services' mailers render a message the same way.
+func applyRecipient(data any, to Recipient) any {
+	switch d := data.(type) {
+	case verificationData:
+		d.Name = greeting(to.Name)
+		return d
+	case connectionExpiredData:
+		d.Name = greeting(to.Name)
+		return d
+	default:
+		return data
+	}
 }
 
 // verificationTTLHours mirrors api.VerificationTokenTTL. It lives here as

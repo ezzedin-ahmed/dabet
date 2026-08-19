@@ -1,6 +1,12 @@
-// Package mail is user-service's outbound email path: an SMTP client, a
-// bounded asynchronous send queue, and the transactional templates of
-// §5.4 (email verification) and §5.5/A6 (a platform connection expired).
+// Package mail is credits-service's outbound email path: an SMTP client,
+// a bounded asynchronous send queue, and the two §5.8/A8 balance
+// templates — 20 % of the last top-up, and zero.
+//
+// It is a deliberate copy of user-service's package of the same name
+// rather than a shared library: pkg/ carries the cross-service contracts
+// of §4, and a mail transport is not a contract. The copies differ in
+// their templates, their configuration surface, and the seam they plug
+// into.
 //
 // Two rules shape the design:
 //
@@ -12,10 +18,9 @@
 //     log-only behaviour, so local development, Compose and test/e2e are
 //     unaffected by this package existing.
 //
-// P4: no chat message text ever reaches an email, and the only secret a
-// message may carry is the single-use email-verification token, which
-// appears in the verification link and nowhere else — not in a log line
-// at info or above, not in a metric label.
+// P4: no chat message text ever reaches an email. These messages carry
+// no secrets at all — a balance, a threshold, and a link to the billing
+// page.
 package mail
 
 import (
@@ -46,8 +51,7 @@ const (
 	EnvMaxAttempts = "MAIL_MAX_ATTEMPTS" // attempts per message
 	EnvRetryBase   = "MAIL_RETRY_BASE"   // first backoff, doubled per attempt
 	EnvHelo        = "MAIL_HELO"         // EHLO name
-	EnvVerifyURL   = "APP_VERIFY_URL"    // base of the verification link
-	EnvAppConnsURL = "APP_REDIRECT_URL"  // connections page, for the A6 mail
+	EnvBillingURL  = "APP_BILLING_URL"   // top-up page, linked from the A8 mail
 )
 
 // TLSMode selects how the SMTP connection is protected.
@@ -83,8 +87,7 @@ const (
 	DefaultMaxAttempts = 3
 	DefaultRetryBase   = time.Second
 	DefaultHelo        = "localhost"
-	DefaultVerifyURL   = "http://localhost:3000/verify"
-	DefaultAppConnsURL = "http://localhost:3000/connections"
+	DefaultBillingURL  = "http://localhost:3000/billing"
 )
 
 // Config is the mailer's configuration. The zero value is a valid,
@@ -113,12 +116,8 @@ type Config struct {
 	// Helo is the EHLO name.
 	Helo string
 
-	// VerifyURL is the base of the verification link (§5.4); the token is
-	// appended as a query parameter.
-	VerifyURL string
-	// AppConnectionsURL is where the A6 mail sends the creator to
-	// reconnect.
-	AppConnectionsURL string
+	// BillingURL is where the A8 mail sends the creator to top up.
+	BillingURL string
 
 	// TLSConfig overrides the derived client TLS configuration. Tests set
 	// it to trust a throwaway CA; production leaves it nil.
@@ -134,19 +133,18 @@ func (c Config) Enabled() bool { return c.Addr != "" }
 // configuration is not an error, it is the log-only default.
 func ConfigFromEnv(get func(string) string) (Config, error) {
 	cfg := Config{
-		Addr:              strings.TrimSpace(get(EnvSMTPAddr)),
-		From:              strings.TrimSpace(get(EnvFrom)),
-		Username:          get(EnvUsername),
-		Password:          get(EnvPassword),
-		TLS:               TLSMode(strings.ToLower(strings.TrimSpace(get(EnvTLS)))),
-		Timeout:           DefaultTimeout,
-		QueueSize:         DefaultQueueSize,
-		Workers:           DefaultWorkers,
-		MaxAttempts:       DefaultMaxAttempts,
-		RetryBase:         DefaultRetryBase,
-		Helo:              orDefault(get(EnvHelo), DefaultHelo),
-		VerifyURL:         orDefault(get(EnvVerifyURL), DefaultVerifyURL),
-		AppConnectionsURL: orDefault(get(EnvAppConnsURL), DefaultAppConnsURL),
+		Addr:        strings.TrimSpace(get(EnvSMTPAddr)),
+		From:        strings.TrimSpace(get(EnvFrom)),
+		Username:    get(EnvUsername),
+		Password:    get(EnvPassword),
+		TLS:         TLSMode(strings.ToLower(strings.TrimSpace(get(EnvTLS)))),
+		Timeout:     DefaultTimeout,
+		QueueSize:   DefaultQueueSize,
+		Workers:     DefaultWorkers,
+		MaxAttempts: DefaultMaxAttempts,
+		RetryBase:   DefaultRetryBase,
+		Helo:        orDefault(get(EnvHelo), DefaultHelo),
+		BillingURL:  orDefault(get(EnvBillingURL), DefaultBillingURL),
 	}
 	if cfg.TLS == "" {
 		cfg.TLS = TLSStartTLS
@@ -271,6 +269,8 @@ type Mailer struct {
 	tmpl map[string]templateSet
 	met  *metrics
 	log  *slog.Logger
+	// recipients resolves creator ids to addresses, on the worker.
+	recipients Recipients
 
 	queue chan job
 	wg    sync.WaitGroup
@@ -287,8 +287,10 @@ type Mailer struct {
 
 // New builds a Mailer and, when enabled, starts its workers. Templates
 // are parsed once here so a broken template is a startup failure.
-// Metrics register on reg (§4.5); reg may be nil in tests.
-func New(cfg Config, reg prometheus.Registerer, logger *slog.Logger) (*Mailer, error) {
+// recipients resolves creator ids to addresses and may be nil when the
+// mailer is disabled. Metrics register on reg (§4.5); reg may be nil in
+// tests.
+func New(cfg Config, recipients Recipients, reg prometheus.Registerer, logger *slog.Logger) (*Mailer, error) {
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
@@ -300,10 +302,11 @@ func New(cfg Config, reg prometheus.Registerer, logger *slog.Logger) (*Mailer, e
 		logger = slog.New(slog.DiscardHandler)
 	}
 	m := &Mailer{
-		cfg:  cfg,
-		tmpl: tmpl,
-		log:  logger,
-		now:  func() time.Time { return time.Now().UTC() },
+		cfg:        cfg,
+		tmpl:       tmpl,
+		log:        logger,
+		recipients: recipients,
+		now:        func() time.Time { return time.Now().UTC() },
 	}
 	if cfg.Enabled() {
 		m.queue = make(chan job, cfg.QueueSize)
