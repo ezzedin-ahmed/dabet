@@ -11,5 +11,6 @@ use (
 	./services/provider-adapter
 	./services/review-service
 	./services/user-service
+	./test/e2e
 	./tools
 )

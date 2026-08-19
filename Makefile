@@ -2,7 +2,7 @@ COMPOSE := docker compose -f deploy/compose/docker-compose.yml
 GOBIN   := $(shell go env GOPATH)/bin
 MODULES := $(shell go work edit -json | grep DiskPath | cut -d'"' -f4)
 
-.PHONY: build test vet proto up down logs
+.PHONY: build test vet proto up up-full down logs ps e2e
 
 build:
 	@for m in $(MODULES); do (cd $$m && go build ./...) || exit 1; done
@@ -21,11 +21,28 @@ proto:
 		--go-grpc_out=paths=source_relative:pkg/policyapi \
 		pkg/policyapi/policy.proto
 
+# Infrastructure, mocks and all services except the Milvus-backed pair.
+# --wait blocks until every healthcheck passes, so `make up && make e2e`
+# is a race-free sequence.
 up:
-	$(COMPOSE) up -d --build
+	$(COMPOSE) up -d --build --wait
+
+# Adds etcd + Milvus + clustering-service + clusters-job (§8.5, §8.6).
+# Milvus alone wants several GB, hence the separate target.
+up-full:
+	CLUSTERING_ENDPOINT=http://clustering-service:8080 \
+	$(COMPOSE) --profile clustering up -d --build --wait
 
 down:
-	$(COMPOSE) down
+	$(COMPOSE) --profile clustering down -v
 
 logs:
 	$(COMPOSE) logs -f
+
+ps:
+	$(COMPOSE) --profile clustering ps
+
+# End-to-end smoke test against the running stack (see test/e2e). It is
+# build-tagged, so `make test` never touches the network.
+e2e:
+	cd test/e2e && go test -tags e2e -count=1 -timeout 20m -v ./...

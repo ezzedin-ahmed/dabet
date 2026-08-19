@@ -17,7 +17,24 @@ import (
 // the parquet path is the durable one, assignment is best-effort.
 type AssignSender interface {
 	Send(recs []EmbeddingRecord)
+	// Run serves whatever Send enqueued until ctx is cancelled.
+	Run(ctx context.Context)
 }
+
+// NoopAssigner is the assigner used when live classification is not
+// deployed (CLUSTERING_ENDPOINT empty). It drops batches silently and,
+// crucially, counts nothing: fail_open_total is the count of work that
+// went undone because something was BROKEN (§4.5), and a component that
+// was never deployed is not broken. Counting it would leave the metric
+// permanently non-zero and destroy its value as an alert.
+type NoopAssigner struct{}
+
+// Send implements AssignSender.
+func (NoopAssigner) Send([]EmbeddingRecord) {}
+
+// Run implements AssignSender: there is nothing to serve, so it simply
+// waits for shutdown alongside the other pipeline goroutines.
+func (NoopAssigner) Run(ctx context.Context) { <-ctx.Done() }
 
 // assignPath is clustering-service's internal assign endpoint. Both
 // services are Area D, so this synchronous hop is an in-area internal call

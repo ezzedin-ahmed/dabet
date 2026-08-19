@@ -65,6 +65,13 @@ func run(ctx context.Context, svc *service.Service) error {
 	mockEnabled := isTrue(config.GetDefault("OAUTH_MOCK_ENABLED", ""))
 	h.Providers = oauth.LoadProviders(config.GetDefault, mockEnabled)
 	h.AppRedirectURL = config.GetDefault("APP_REDIRECT_URL", h.AppRedirectURL)
+	// Test-only: return the email-verification token in the registration
+	// response so an automated e2e run can verify an address without a
+	// mailer. Defaults off; local Compose only (see api.Handler).
+	h.EchoVerificationToken = isTrue(config.GetDefault("DEV_EXPOSE_VERIFICATION_TOKEN", ""))
+	if h.EchoVerificationToken {
+		svc.Logger.Warn("DEV_EXPOSE_VERIFICATION_TOKEN is set: registration responses carry the raw email-verification token; never enable this outside local development")
+	}
 	h.Routes(svc.Mux)
 
 	// connections_active{platform} (§5.9), refreshed periodically from

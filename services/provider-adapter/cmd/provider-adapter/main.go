@@ -69,6 +69,10 @@ func run(svc *service.Service) error {
 	// Drivers. Adding a platform is one implementation plus one Register
 	// call and one opaque tag (N3).
 	mock := mockdriver.New(nil)
+	// Like the real drivers, the mock resolves opaque ids back to native
+	// ones before "calling the platform" — which is what makes an
+	// injected message correlatable with its deletion.
+	mock.Resolver = minter
 	registry := driver.NewRegistry()
 	registry.Register(mock)
 	registry.Register(youtube.New(minter))

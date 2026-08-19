@@ -14,7 +14,9 @@
 // EMBEDDING_ENDPOINT, S3_ENDPOINT, CLICKHOUSE_DSN, JWT_SECRET, HTTP_ADDR,
 // METRICS_ADDR):
 //
-//	CLUSTERING_ENDPOINT            clustering-service base URL (default http://localhost:8085)
+//	CLUSTERING_ENDPOINT            clustering-service base URL (default
+//	                               http://localhost:8085; set empty to
+//	                               disable live assignment entirely)
 //	INSIGHTS_ASSIGN_TIMEOUT_MS     assign request timeout    (default 2000)
 //	INSIGHTS_ASSIGN_QUEUE_BATCHES  assign queue depth        (default 256)
 //	INSIGHTS_BUFFER_SECONDS        exclusion window          (default 2, §8.3/A20)
@@ -108,7 +110,15 @@ func run(svc *service.Service) error {
 	s3Bucket := config.GetDefault("S3_BUCKET", "embeddings")
 	s3AccessKey := config.GetDefault("S3_ACCESS_KEY", "minioadmin")
 	s3SecretKey := config.GetDefault("S3_SECRET_KEY", "minioadmin")
-	clusteringEndpoint := config.GetDefault("CLUSTERING_ENDPOINT", "http://localhost:8085")
+	// CLUSTERING_ENDPOINT set-but-empty means "live classification (§8.5)
+	// is not part of this deployment", which is different from unset.
+	// config.GetDefault cannot express that distinction — it substitutes
+	// the default for an empty value — so read the variable directly.
+	clusteringEndpoint, clusteringSet := os.LookupEnv("CLUSTERING_ENDPOINT")
+	if !clusteringSet {
+		clusteringEndpoint = "http://localhost:8085"
+	}
+	clusteringEndpoint = strings.TrimSpace(clusteringEndpoint)
 	chDSN := config.GetDefault(config.EnvClickhouseDSN, "clickhouse://localhost:9002/dabet")
 	jwtSecret, err := config.Get(config.EnvJWTSecret)
 	if err != nil {
@@ -128,9 +138,19 @@ func run(svc *service.Service) error {
 
 	metrics := ingest.NewMetrics(svc.Registry)
 	embedClient := embeddings.NewClient(embedEndpoint, time.Duration(embedTimeoutMS)*time.Millisecond)
-	assigner := ingest.NewAsyncAssigner(clusteringEndpoint,
-		time.Duration(assignTimeoutMS)*time.Millisecond, assignQueue,
-		svc.Metrics.FailOpenTotal, svc.Metrics.DependencyUp)
+	// An empty CLUSTERING_ENDPOINT means live classification is not part
+	// of this deployment (§8.5 is optional; the vectors are in S3 either
+	// way and the next clusters-job run picks them up). Posting to a
+	// service that was never deployed would climb fail_open_total forever
+	// and make the §4.5 alert useless, so it is switched off instead.
+	var assigner ingest.AssignSender = ingest.NoopAssigner{}
+	if clusteringEndpoint != "" {
+		assigner = ingest.NewAsyncAssigner(clusteringEndpoint,
+			time.Duration(assignTimeoutMS)*time.Millisecond, assignQueue,
+			svc.Metrics.FailOpenTotal, svc.Metrics.DependencyUp)
+	} else {
+		svc.Logger.Info("CLUSTERING_ENDPOINT is empty: live centroid assignment is disabled")
+	}
 	pipeline := ingest.NewPipeline(
 		ingest.NewBuffer(time.Duration(bufferSecs)*time.Second, bufferMax, metrics),
 		ingest.NewSampler(float64(samplePerMinute), float64(sampleCapacity), 500_000),

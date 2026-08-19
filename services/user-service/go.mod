@@ -10,7 +10,10 @@ require (
 	golang.org/x/crypto v0.55.0
 )
 
+require github.com/oklog/ulid/v2 v2.1.2 // indirect
+
 require (
+	dabet/pkg v0.0.0
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/jackc/pgpassfile v1.0.0 // indirect
@@ -24,5 +27,7 @@ require (
 	golang.org/x/sync v0.22.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/text v0.41.0 // indirect
-	google.golang.org/protobuf v1.36.11 // indirect
+	google.golang.org/protobuf v1.36.12 // indirect
 )
+
+replace dabet/pkg => ../../pkg
