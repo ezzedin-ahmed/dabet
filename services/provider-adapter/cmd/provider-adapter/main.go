@@ -11,11 +11,14 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"dabet/pkg/config"
 	"dabet/pkg/contracts"
 	"dabet/pkg/kafkax"
 	"dabet/pkg/service"
 
+	"dabet/services/provider-adapter/internal/connpg"
 	"dabet/services/provider-adapter/internal/connsource"
 	"dabet/services/provider-adapter/internal/deletion"
 	"dabet/services/provider-adapter/internal/driver"
@@ -26,6 +29,7 @@ import (
 	"dabet/services/provider-adapter/internal/metrics"
 	"dabet/services/provider-adapter/internal/mockdriver"
 	"dabet/services/provider-adapter/internal/opaque"
+	"dabet/services/provider-adapter/internal/refresh"
 )
 
 func main() {
@@ -71,16 +75,53 @@ func run(svc *service.Service) error {
 	registry.Register(twitch.New(minter, config.GetDefault("TWITCH_CLIENT_ID", "")))
 	registry.Register(discord.New(minter))
 
-	// Connection assignment: single-instance Static source for v1; the
-	// consistent-hash coordinator (A13) slots in behind the same interface.
+	// Connection assignment: env-seeded Static source (also the mock
+	// injection endpoint's registry), plus — when POSTGRES_DSN is set —
+	// the Postgres-backed poller over Area A's identity.connections
+	// (§5.5/§5.6). The consistent-hash coordinator (A13) slots in behind
+	// the same interface.
 	seed, err := connsource.ParseEnv(config.GetDefault("ADAPTER_CONNECTIONS", ""))
 	if err != nil {
 		return err
 	}
-	source := connsource.NewStatic(seed...)
+	static := connsource.NewStatic(seed...)
 
 	// Mock platform HTTP surface for local e2e.
-	mockdriver.NewHandlers(mock, source).Register(svc.Mux)
+	mockdriver.NewHandlers(mock, static).Register(svc.Mux)
+
+	var source connsource.Source = static
+	var refresher deletion.TokenRefresher = deletion.StubRefresher{}
+	if dsn := config.GetDefault(config.EnvPostgresDSN, ""); dsn != "" {
+		pollInterval, err := config.GetDuration("ADAPTER_CONNSOURCE_POLL", 15*time.Second)
+		if err != nil {
+			return err
+		}
+		pool, err := connectWithRetry(ctx, svc, dsn)
+		if err != nil {
+			return err
+		}
+		defer pool.Close()
+
+		store := connpg.New(pool)
+		poller := connsource.NewPoller(store, pollInterval, svc.Logger)
+		if err := poller.Load(ctx); err != nil {
+			svc.Logger.Warn("initial connection load failed; will retry on poll", "error", err.Error())
+		}
+		go func() {
+			if err := poller.Run(ctx); err != nil && ctx.Err() == nil {
+				svc.Logger.Error("connection poller exited", "error", err.Error())
+			}
+		}()
+
+		multi := connsource.NewMulti(poller, static)
+		multi.Forward(ctx)
+		source = multi
+
+		// §5.6 lazy refresh, in place of the stub: advisory-locked
+		// re-read + refresh-token exchange, expired-on-auth-error.
+		refresher = refresh.New(store, refresh.EndpointsFromEnv(config.GetDefault),
+			m.ConnectionRefreshTotal, svc.Logger, poller.Evict, poller.Update)
+	}
 
 	producer, err := kafkax.NewProducer(brokers)
 	if err != nil {
@@ -92,7 +133,7 @@ func run(svc *service.Service) error {
 	manager.Buffer = buffer
 	manager.WatchRetry = watchRetry
 
-	processor := deletion.NewProcessor(registry, source, deletion.StubRefresher{}, opaque.Platform, m, svc.Metrics, svc.Logger)
+	processor := deletion.NewProcessor(registry, source, refresher, opaque.Platform, m, svc.Metrics, svc.Logger)
 	processor.BaseBackoff = deleteBackoff
 
 	consumer, err := kafkax.NewConsumer(brokers, deletion.Group, []string{contracts.TopicDeletions}, processor.Handle)
@@ -123,6 +164,29 @@ func run(svc *service.Service) error {
 	err = svc.Run(ctx)
 	cancel()
 	return err
+}
+
+// connectWithRetry tolerates Compose start ordering: Postgres may accept
+// connections a few seconds after provider-adapter starts.
+func connectWithRetry(ctx context.Context, svc *service.Service, dsn string) (*pgxpool.Pool, error) {
+	var lastErr error
+	for attempt := 1; attempt <= 10; attempt++ {
+		pool, err := pgxpool.New(ctx, dsn)
+		if err == nil {
+			if err = pool.Ping(ctx); err == nil {
+				return pool, nil
+			}
+			pool.Close()
+		}
+		lastErr = err
+		svc.Logger.Warn("postgres not ready, retrying", "attempt", attempt, "error", err.Error())
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(3 * time.Second):
+		}
+	}
+	return nil, lastErr
 }
 
 func splitCSV(s string) []string {
