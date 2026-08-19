@@ -18,10 +18,15 @@ import (
 
 	"dabet/services/user-service/internal/api"
 	"dabet/services/user-service/internal/auth"
+	"dabet/services/user-service/internal/expiry"
+	"dabet/services/user-service/internal/mail"
 	"dabet/services/user-service/internal/migrate"
 	"dabet/services/user-service/internal/oauth"
 	"dabet/services/user-service/internal/repo"
 )
+
+// envExpirySweep tunes the A6 notification sweep (§5.5).
+const envExpirySweep = "CONNECTION_EXPIRY_SWEEP_INTERVAL"
 
 func main() {
 	svc := service.New("user-service")
@@ -63,6 +68,29 @@ func run(ctx context.Context, svc *service.Service) error {
 	if err != nil {
 		return err
 	}
+
+	// Outbound email (§5.4, §5.5/A6). Off unless MAIL_SMTP_ADDR is set,
+	// in which case the mailer logs the verification token at debug
+	// exactly as v1 did. A broken mail configuration is a startup error;
+	// a broken mail *server* is not, and never fails a request (§4.7).
+	mailCfg, err := mail.ConfigFromEnv(os.Getenv)
+	if err != nil {
+		return err
+	}
+	mailer, err := mail.New(mailCfg, svc.Registry, authLogger(svc.Logger))
+	if err != nil {
+		return err
+	}
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := mailer.Close(shutdownCtx); err != nil {
+			svc.Logger.Warn("mail queue did not drain before shutdown", "error", err.Error())
+		}
+	}()
+	h.Mail = mailer
+	svc.Logger.Info("outbound email configured",
+		"enabled", mailCfg.Enabled(), "tls", string(mailCfg.TLS))
 	svc.Logger.Info("access tokens configured", "alg", keys.Signer.Alg(), "kid", keys.Signer.Kid())
 
 	// §5.5 OAuth provider set. OAUTH_MOCK_ENABLED gates the mock platform
@@ -90,6 +118,15 @@ func run(ctx context.Context, svc *service.Service) error {
 	gaugeCtx, stopGauge := context.WithCancel(ctx)
 	defer stopGauge()
 	go api.RunConnectionsGauge(gaugeCtx, r, gauge, platformNames(h.Providers), gaugeInterval)
+
+	// A6: provider-adapter marks a connection 'expired' when a refresh
+	// fails with an auth error (§5.6); this sweep is what tells the
+	// creator, since v1 has no in-app notifications.
+	sweepInterval, err := config.GetDuration(envExpirySweep, expiry.DefaultInterval)
+	if err != nil {
+		return err
+	}
+	go expiry.New(r, mailer, svc.Logger, sweepInterval, expiry.DefaultBatch).Run(gaugeCtx)
 
 	return svc.Run(ctx)
 }

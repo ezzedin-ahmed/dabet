@@ -78,6 +78,8 @@ func (f *Fake) UpsertConnection(_ context.Context, c *Connection) (string, error
 		target.Scopes = append([]string(nil), c.Scopes...)
 		target.Status = "active"
 		target.UpdatedAt = now
+		// Reconnecting clears the A6 stamp, mirroring the SQL upsert.
+		delete(f.expiryNotified, target.ID)
 		return target.ID, nil
 	}
 
@@ -125,6 +127,59 @@ func (f *Fake) RevokeConnection(_ context.Context, id, creatorID string, now tim
 	c.Status = "revoked"
 	c.UpdatedAt = now
 	return &before, nil
+}
+
+// ExpireConnection stands in for provider-adapter's §5.6 auth-error
+// transition (`UPDATE … SET status='expired'`), which is the only way a
+// connection reaches that state in production.
+func (f *Fake) ExpireConnection(id string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.initConnections()
+	if c, ok := f.connections[id]; ok {
+		c.Status = "expired"
+		c.UpdatedAt = time.Now().UTC()
+	}
+}
+
+func (f *Fake) PendingExpiryNotifications(_ context.Context, limit int) ([]ExpiredConnection, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.initConnections()
+	var out []ExpiredConnection
+	for _, c := range f.connections {
+		if c.Status != "expired" {
+			continue
+		}
+		if _, done := f.expiryNotified[c.ID]; done {
+			continue
+		}
+		e := ExpiredConnection{
+			ID: c.ID, CreatorID: c.CreatorID,
+			Platform: c.Platform, DisplayName: c.DisplayName,
+		}
+		if cr, ok := f.creators[c.CreatorID]; ok {
+			e.Email, e.Fullname = cr.Email, cr.Fullname
+		}
+		out = append(out, e)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+func (f *Fake) MarkExpiryNotified(_ context.Context, id string, now time.Time) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.expiryNotified == nil {
+		f.expiryNotified = make(map[string]time.Time)
+	}
+	if _, done := f.expiryNotified[id]; !done {
+		f.expiryNotified[id] = now
+	}
+	return nil
 }
 
 func (f *Fake) ActiveConnectionCounts(context.Context) (map[string]int, error) {

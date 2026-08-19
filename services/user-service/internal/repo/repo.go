@@ -60,6 +60,19 @@ type Connection struct {
 	UpdatedAt      time.Time
 }
 
+// ExpiredConnection is one pending A6 notification: a connection the
+// platform revoked (provider-adapter moved it to 'expired', §5.5/§5.6)
+// whose creator has not been emailed yet, joined to the address the mail
+// goes to. It carries no tokens.
+type ExpiredConnection struct {
+	ID          string
+	CreatorID   string
+	Email       string
+	Fullname    string
+	Platform    string
+	DisplayName string
+}
+
 // OAuthState is a row of identity.oauth_states: one pending authorization
 // round-trip, single-use, short TTL (§5.5).
 type OAuthState struct {
@@ -125,4 +138,12 @@ type Repository interface {
 	// ActiveConnectionCounts returns active-connection counts by
 	// platform, for the connections_active gauge (§5.9).
 	ActiveConnectionCounts(ctx context.Context) (map[string]int, error)
+
+	// PendingExpiryNotifications returns up to limit connections that are
+	// 'expired' and not yet notified (A6), oldest first.
+	PendingExpiryNotifications(ctx context.Context, limit int) ([]ExpiredConnection, error)
+	// MarkExpiryNotified stamps a connection as notified. It is the
+	// exactly-once guard: a stamped row is never picked up again unless
+	// the creator reconnects and the connection expires afresh.
+	MarkExpiryNotified(ctx context.Context, id string, now time.Time) error
 }

@@ -17,6 +17,8 @@ type Fake struct {
 	refresh       map[string]*RefreshToken // by token hash
 	states        map[string]*OAuthState   // by state
 	connections   map[string]*Connection   // by id
+	// expiryNotified stands in for connections.expired_notified_at (A6).
+	expiryNotified map[string]time.Time // by connection id
 }
 
 type verification struct {
@@ -28,11 +30,12 @@ type verification struct {
 // NewFake returns an empty in-memory repository.
 func NewFake() *Fake {
 	return &Fake{
-		creators:      make(map[string]*Creator),
-		verifications: make(map[string]*verification),
-		refresh:       make(map[string]*RefreshToken),
-		states:        make(map[string]*OAuthState),
-		connections:   make(map[string]*Connection),
+		creators:       make(map[string]*Creator),
+		verifications:  make(map[string]*verification),
+		refresh:        make(map[string]*RefreshToken),
+		states:         make(map[string]*OAuthState),
+		connections:    make(map[string]*Connection),
+		expiryNotified: make(map[string]time.Time),
 	}
 }
 
