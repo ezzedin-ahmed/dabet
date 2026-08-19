@@ -1,8 +1,11 @@
 COMPOSE := docker compose -f deploy/compose/docker-compose.yml
+# Tracing overlay. Base file first: the collector config is bind-mounted from a
+# path relative to the first -f file's directory (deploy/compose/).
+TRACED  := $(COMPOSE) -f deploy/compose/fragments/observability.yml
 GOBIN   := $(shell go env GOPATH)/bin
 MODULES := $(shell go work edit -json | grep DiskPath | cut -d'"' -f4)
 
-.PHONY: build test vet proto up up-full down logs ps e2e
+.PHONY: build test vet proto up up-full up-traced down logs ps e2e
 
 build:
 	@for m in $(MODULES); do (cd $$m && go build ./...) || exit 1; done
@@ -33,8 +36,14 @@ up-full:
 	CLUSTERING_ENDPOINT=http://clustering-service:8080 \
 	$(COMPOSE) --profile clustering up -d --build --wait
 
+# As `make up`, plus an OTel collector and Jaeger (UI on :16686), with every
+# service exporting traces. The base file must come first: the collector config
+# is bind-mounted from a path relative to the first file's directory.
+up-traced:
+	$(TRACED) up -d --build --wait
+
 down:
-	$(COMPOSE) --profile clustering down -v
+	$(TRACED) --profile clustering down -v
 
 logs:
 	$(COMPOSE) logs -f

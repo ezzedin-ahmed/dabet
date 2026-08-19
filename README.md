@@ -135,10 +135,10 @@ To turn it on locally, overlay the observability fragment, which adds an OTel
 collector plus Jaeger and sets the environment the services read:
 
 ```sh
-docker compose -f deploy/compose/docker-compose.yml \
-               -f deploy/compose/fragments/observability.yml up -d
-# traces at http://localhost:16686
+make up-traced   # same stack, plus an OTel collector and Jaeger
 ```
+
+Jaeger UI: <http://localhost:16686>. `make down` tears the overlay down too.
 
 One chat message's journey is then one trace, end to end:
 `adapter.ingest` → `messages.v1 send` → `messages.v1 process` →
