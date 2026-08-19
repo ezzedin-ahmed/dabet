@@ -5,6 +5,9 @@ import (
 	"errors"
 	"net/http"
 	"testing"
+	"time"
+
+	"github.com/coder/websocket"
 
 	"dabet/services/provider-adapter/internal/driver"
 	"dabet/services/provider-adapter/internal/opaque"
@@ -81,12 +84,52 @@ func TestDeleteUnresolvableContentIsNotFound(t *testing.T) {
 	}
 }
 
-func TestWatchAndDiscoverAreNotImplemented(t *testing.T) {
+func TestWatchRejectsAConnectionWithNoBroadcaster(t *testing.T) {
+	// Without a native user id there is no condition to subscribe with, and
+	// no amount of retrying invents one.
 	d := New(opaque.NewMinter(), "client-abc")
-	if err := d.Watch(context.Background(), driver.Connection{}, nil); !errors.Is(err, driver.ErrNotImplemented) {
-		t.Errorf("Watch = %v", err)
+	err := d.Watch(context.Background(), driver.Connection{Platform: "twitch"}, nil)
+	if !errors.Is(err, driver.ErrPermanent) {
+		t.Errorf("Watch = %v, want ErrPermanent", err)
 	}
-	if _, err := d.DiscoverLive(context.Background(), driver.Connection{}); !errors.Is(err, driver.ErrNotImplemented) {
-		t.Errorf("DiscoverLive = %v", err)
+}
+
+func TestEventSubURLCarriesTheKeepaliveTimeout(t *testing.T) {
+	d := New(opaque.NewMinter(), "client-abc")
+	if got := d.eventSubURL(); got != DefaultEventSubURL+"?keepalive_timeout_seconds=30" {
+		t.Errorf("url = %q", got)
+	}
+	// Twitch accepts 10-600 s; out-of-range requests are clamped rather
+	// than sent and rejected.
+	d.KeepaliveTimeout = time.Second
+	if got := d.eventSubURL(); got != DefaultEventSubURL+"?keepalive_timeout_seconds=10" {
+		t.Errorf("clamped low = %q", got)
+	}
+	d.KeepaliveTimeout = time.Hour
+	if got := d.eventSubURL(); got != DefaultEventSubURL+"?keepalive_timeout_seconds=600" {
+		t.Errorf("clamped high = %q", got)
+	}
+	// A reconnect URL already carries a query string.
+	d.EventSubURL = "wss://eventsub.wss.twitch.tv/ws?challenge=abc"
+	d.KeepaliveTimeout = 30 * time.Second
+	if got := d.eventSubURL(); got != "wss://eventsub.wss.twitch.tv/ws?challenge=abc&keepalive_timeout_seconds=30" {
+		t.Errorf("existing query = %q", got)
+	}
+}
+
+func TestCloseClassification(t *testing.T) {
+	// Every documented Twitch close code is transient; the permanent
+	// failures arrive as revocations or Helix responses instead.
+	for _, code := range []int{4000, 4001, 4002, 4003, 4004, 4005, 4006, 4007} {
+		err := classifyClose(websocket.CloseError{Code: websocket.StatusCode(code)})
+		if err == nil {
+			t.Errorf("close %d classified as a clean end", code)
+		}
+		if driver.Terminal(err) {
+			t.Errorf("close %d should be retryable, got terminal %v", code, err)
+		}
+	}
+	if err := classifyClose(websocket.CloseError{Code: websocket.StatusNormalClosure}); err != nil {
+		t.Errorf("normal closure = %v, want nil", err)
 	}
 }

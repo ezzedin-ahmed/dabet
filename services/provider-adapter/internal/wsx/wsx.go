@@ -14,9 +14,9 @@ package wsx
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/coder/websocket"
 )
@@ -54,15 +54,6 @@ const StatusNormalClosure = 1000
 // branch on this to decide reconnect-versus-give-up.
 func CloseStatus(err error) int {
 	return int(websocket.CloseStatus(err))
-}
-
-// ErrClosed reports whether err is any form of connection termination
-// (peer close, transport failure) rather than a caller-side cancellation.
-func ErrClosed(err error) bool {
-	if err == nil {
-		return false
-	}
-	return !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)
 }
 
 // Frame is one inbound message, or the error that ended the stream.
@@ -159,13 +150,28 @@ func (c *conn) Write(ctx context.Context, data []byte) error {
 	return c.c.Write(ctx, websocket.MessageText, data)
 }
 
+// CloseHandshakeTimeout bounds how long Close waits for the peer to answer
+// the close frame. The library's own wait is five seconds, which an ingest
+// manager tearing down thousands of connections on a rebalance cannot
+// afford to pay per connection — and a peer that has already gone away is
+// the common case, so the polite handshake is best-effort by design.
+const CloseHandshakeTimeout = 500 * time.Millisecond
+
 func (c *conn) Close(code int, reason string) error {
-	// CloseNow on a normal-closure request would skip the close handshake;
-	// Close sends the frame and gives the peer a moment to answer. Either
-	// way the underlying conn is released, so errors here are advisory.
-	err := c.c.Close(websocket.StatusCode(code), reason)
-	if err != nil {
-		_ = c.c.CloseNow()
+	// Send the close frame and give the peer a brief moment to answer;
+	// abandon the handshake rather than block a shutdown behind it. Either
+	// path releases the underlying connection, so errors here are advisory.
+	done := make(chan error, 1)
+	go func() { done <- c.c.Close(websocket.StatusCode(code), reason) }()
+	t := time.NewTimer(CloseHandshakeTimeout)
+	defer t.Stop()
+	select {
+	case err := <-done:
+		if err != nil {
+			_ = c.c.CloseNow()
+		}
+		return err
+	case <-t.C:
+		return c.c.CloseNow()
 	}
-	return err
 }
