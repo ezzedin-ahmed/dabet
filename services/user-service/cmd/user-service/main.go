@@ -18,6 +18,7 @@ import (
 
 	"dabet/services/user-service/internal/api"
 	"dabet/services/user-service/internal/migrate"
+	"dabet/services/user-service/internal/oauth"
 	"dabet/services/user-service/internal/repo"
 )
 
@@ -53,13 +54,42 @@ func run(ctx context.Context, svc *service.Service) error {
 	logins := api.NewLoginsCounter()
 	svc.Registry.MustRegister(logins)
 
-	h, err := api.NewHandler(repo.NewPostgres(pool), []byte(jwtSecret), authLogger(svc.Logger), logins)
+	r := repo.NewPostgres(pool)
+	h, err := api.NewHandler(r, []byte(jwtSecret), authLogger(svc.Logger), logins)
 	if err != nil {
 		return err
 	}
+
+	// §5.5 OAuth provider set. OAUTH_MOCK_ENABLED gates the mock platform
+	// (documented deviation, for e2e against a stub provider).
+	mockEnabled := isTrue(config.GetDefault("OAUTH_MOCK_ENABLED", ""))
+	h.Providers = oauth.LoadProviders(config.GetDefault, mockEnabled)
+	h.AppRedirectURL = config.GetDefault("APP_REDIRECT_URL", h.AppRedirectURL)
 	h.Routes(svc.Mux)
 
+	// connections_active{platform} (§5.9), refreshed periodically from
+	// the database.
+	gaugeInterval, err := config.GetDuration("CONNECTIONS_GAUGE_INTERVAL", 30*time.Second)
+	if err != nil {
+		return err
+	}
+	gauge := api.NewConnectionsGauge()
+	svc.Registry.MustRegister(gauge)
+	gaugeCtx, stopGauge := context.WithCancel(ctx)
+	defer stopGauge()
+	go api.RunConnectionsGauge(gaugeCtx, r, gauge, platformNames(h.Providers), gaugeInterval)
+
 	return svc.Run(ctx)
+}
+
+func isTrue(v string) bool { return v == "1" || v == "true" || v == "yes" }
+
+func platformNames(providers map[string]*oauth.Provider) []string {
+	out := make([]string, 0, len(providers))
+	for p := range providers {
+		out = append(out, p)
+	}
+	return out
 }
 
 // connectWithRetry tolerates Compose start ordering: Postgres may accept

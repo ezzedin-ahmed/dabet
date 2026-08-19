@@ -15,6 +15,8 @@ type Fake struct {
 	creators      map[string]*Creator      // by id
 	verifications map[string]*verification // by token hash
 	refresh       map[string]*RefreshToken // by token hash
+	states        map[string]*OAuthState   // by state
+	connections   map[string]*Connection   // by id
 }
 
 type verification struct {
@@ -29,6 +31,8 @@ func NewFake() *Fake {
 		creators:      make(map[string]*Creator),
 		verifications: make(map[string]*verification),
 		refresh:       make(map[string]*RefreshToken),
+		states:        make(map[string]*OAuthState),
+		connections:   make(map[string]*Connection),
 	}
 }
 
