@@ -31,6 +31,7 @@ type Pipeline struct {
 	batcher  *Batcher
 	embedder *Embedder
 	roller   *Roller
+	assign   AssignSender
 	metrics  *Metrics
 	std      *obs.Metrics
 	logger   *slog.Logger
@@ -38,14 +39,17 @@ type Pipeline struct {
 }
 
 // NewPipeline wires the stages. std is the standard pkg/obs metric set of
-// the service runner.
-func NewPipeline(buffer *Buffer, sampler *Sampler, batcher *Batcher, embedder *Embedder, roller *Roller, m *Metrics, std *obs.Metrics, logger *slog.Logger, tick time.Duration) *Pipeline {
+// the service runner. assign may be nil to run without live classification;
+// when set, every successfully embedded batch is also handed to it
+// fire-and-forget (§8.5) after the parquet path has taken it.
+func NewPipeline(buffer *Buffer, sampler *Sampler, batcher *Batcher, embedder *Embedder, roller *Roller, assign AssignSender, m *Metrics, std *obs.Metrics, logger *slog.Logger, tick time.Duration) *Pipeline {
 	return &Pipeline{
 		buffer:   buffer,
 		sampler:  sampler,
 		batcher:  batcher,
 		embedder: embedder,
 		roller:   roller,
+		assign:   assign,
 		metrics:  m,
 		std:      std,
 		logger:   logger,
@@ -126,6 +130,9 @@ func (p *Pipeline) step(ctx context.Context, now time.Time) {
 func (p *Pipeline) process(ctx context.Context, batch []BufferedMessage, now time.Time) {
 	if recs := p.embedder.EmbedBatch(ctx, batch, now); recs != nil {
 		p.roller.Add(ctx, recs, now)
+		if p.assign != nil {
+			p.assign.Send(recs)
+		}
 	}
 }
 

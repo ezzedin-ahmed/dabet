@@ -27,6 +27,7 @@ func newTestPipeline(t *testing.T, fe EmbedClient, store ObjectStore) (*Pipeline
 		NewBatcher(64, 250*time.Millisecond),
 		NewEmbedder(fe, m, std.FailOpenTotal),
 		NewRoller(store, 8<<20, time.Minute, m, std.FailOpenTotal),
+		nil,
 		m, std, logger, 50*time.Millisecond,
 	)
 	return p, m

@@ -5,9 +5,18 @@
 // parquet embedding files to S3. It stores no text and no author_id,
 // anywhere, ever (§4.8, P4).
 //
-// Environment (beyond the shared names of §4.4 — KAFKA_BROKERS,
-// EMBEDDING_ENDPOINT, S3_ENDPOINT, HTTP_ADDR, METRICS_ADDR):
+// Each successfully embedded batch is also handed fire-and-forget to
+// clustering-service's internal assign API for live classification (§8.5) —
+// clustering being down never blocks or fails the parquet path. And it
+// serves the creator-facing topics API (§8.8) over ClickHouse.
 //
+// Environment (beyond the shared names of §4.4 — KAFKA_BROKERS,
+// EMBEDDING_ENDPOINT, S3_ENDPOINT, CLICKHOUSE_DSN, JWT_SECRET, HTTP_ADDR,
+// METRICS_ADDR):
+//
+//	CLUSTERING_ENDPOINT            clustering-service base URL (default http://localhost:8085)
+//	INSIGHTS_ASSIGN_TIMEOUT_MS     assign request timeout    (default 2000)
+//	INSIGHTS_ASSIGN_QUEUE_BATCHES  assign queue depth        (default 256)
 //	INSIGHTS_BUFFER_SECONDS        exclusion window          (default 2, §8.3/A20)
 //	INSIGHTS_BUFFER_MAX_MESSAGES   buffer size bound         (default 200000)
 //	INSIGHTS_SAMPLE_PER_MINUTE     per-content refill        (default 60, §8.4)
@@ -36,6 +45,7 @@ import (
 	"dabet/pkg/service"
 
 	"dabet/services/insights-service/internal/ingest"
+	"dabet/services/insights-service/internal/topics"
 )
 
 func main() {
@@ -83,6 +93,14 @@ func run(svc *service.Service) error {
 	if err != nil {
 		return err
 	}
+	assignTimeoutMS, err := config.GetInt("INSIGHTS_ASSIGN_TIMEOUT_MS", 2_000)
+	if err != nil {
+		return err
+	}
+	assignQueue, err := config.GetInt("INSIGHTS_ASSIGN_QUEUE_BATCHES", 256)
+	if err != nil {
+		return err
+	}
 
 	brokers := strings.Split(config.GetDefault(config.EnvKafkaBrokers, "localhost:9092"), ",")
 	embedEndpoint := config.GetDefault(config.EnvEmbeddingEndpoint, "http://localhost:8091")
@@ -90,20 +108,36 @@ func run(svc *service.Service) error {
 	s3Bucket := config.GetDefault("S3_BUCKET", "embeddings")
 	s3AccessKey := config.GetDefault("S3_ACCESS_KEY", "minioadmin")
 	s3SecretKey := config.GetDefault("S3_SECRET_KEY", "minioadmin")
+	clusteringEndpoint := config.GetDefault("CLUSTERING_ENDPOINT", "http://localhost:8085")
+	chDSN := config.GetDefault(config.EnvClickhouseDSN, "clickhouse://localhost:9002/dabet")
+	jwtSecret, err := config.Get(config.EnvJWTSecret)
+	if err != nil {
+		return err
+	}
 
 	store, err := ingest.NewS3Store(s3Endpoint, s3AccessKey, s3SecretKey, s3Bucket)
 	if err != nil {
 		return fmt.Errorf("object store: %w", err)
 	}
+	topicStore, err := topics.OpenCH(chDSN)
+	if err != nil {
+		return fmt.Errorf("topic store: %w", err)
+	}
+	defer topicStore.Close()
+	topics.Register(svc.Mux, []byte(jwtSecret), topicStore, svc.Logger)
 
 	metrics := ingest.NewMetrics(svc.Registry)
 	embedClient := embeddings.NewClient(embedEndpoint, time.Duration(embedTimeoutMS)*time.Millisecond)
+	assigner := ingest.NewAsyncAssigner(clusteringEndpoint,
+		time.Duration(assignTimeoutMS)*time.Millisecond, assignQueue,
+		svc.Metrics.FailOpenTotal, svc.Metrics.DependencyUp)
 	pipeline := ingest.NewPipeline(
 		ingest.NewBuffer(time.Duration(bufferSecs)*time.Second, bufferMax, metrics),
 		ingest.NewSampler(float64(samplePerMinute), float64(sampleCapacity), 500_000),
 		ingest.NewBatcher(batchSize, time.Duration(lingerMS)*time.Millisecond),
 		ingest.NewEmbedder(embedClient, metrics, svc.Metrics.FailOpenTotal),
 		ingest.NewRoller(store, rollBytes, time.Duration(rollSecs)*time.Second, metrics, svc.Metrics.FailOpenTotal),
+		assigner,
 		metrics,
 		svc.Metrics,
 		svc.Logger,
@@ -114,7 +148,11 @@ func run(svc *service.Service) error {
 	defer cancel()
 
 	var wg sync.WaitGroup
-	wg.Add(3)
+	wg.Add(4)
+	go func() {
+		defer wg.Done()
+		assigner.Run(ctx)
+	}()
 	go func() {
 		defer wg.Done()
 		runConsumer(ctx, svc, contracts.TopicMessages, brokers, pipeline.HandleMessage)
