@@ -31,10 +31,16 @@ var testNow = time.Date(2026, 8, 19, 15, 0, 0, 0, time.UTC)
 
 func token(t *testing.T, creatorID string) string {
 	t.Helper()
+	// httpx.Auth validates `exp` against the wall clock, not against the
+	// handler's injected clock, so the token must be minted from
+	// time.Now(). Pinning it to testNow made the whole suite pass only
+	// while the wall clock happened to sit inside a 15-minute window on
+	// one calendar day, and 401 everywhere after that.
+	now := time.Now()
 	tok := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.RegisteredClaims{
 		Subject:   creatorID,
-		IssuedAt:  jwt.NewNumericDate(testNow),
-		ExpiresAt: jwt.NewNumericDate(testNow.Add(15 * time.Minute)),
+		IssuedAt:  jwt.NewNumericDate(now),
+		ExpiresAt: jwt.NewNumericDate(now.Add(15 * time.Minute)),
 	})
 	s, err := tok.SignedString([]byte(testSecret))
 	if err != nil {
