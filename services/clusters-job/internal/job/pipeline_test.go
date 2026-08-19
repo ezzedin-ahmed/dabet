@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"regexp"
 	"sort"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -60,6 +62,80 @@ func (f *fakeTopics) DeleteTopicsExcept(_ context.Context, _ string, keep []stri
 	f.deleteCall = true
 	f.deletedKeep = keep
 	return nil
+}
+
+// fakeCounts stands in for the topic_counts SummingMergeTree: inserts
+// accumulate (they are summed, never replaced — which is exactly the
+// hazard the backfill has to handle) and DeleteCounts removes rows by
+// (creator, bucket range) the way the lightweight DELETE does.
+type fakeCounts struct {
+	mu        sync.Mutex
+	rows      []CountRow
+	ops       []string // "delete"/"insert", in call order
+	deletes   []countCall
+	inserts   [][]CountRow
+	deleteErr error
+	insertErr error
+}
+
+type countCall struct {
+	creatorID string
+	from, to  time.Time
+}
+
+func (f *fakeCounts) DeleteCounts(_ context.Context, creatorID string, from, to time.Time) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ops = append(f.ops, "delete")
+	f.deletes = append(f.deletes, countCall{creatorID, from, to})
+	if f.deleteErr != nil {
+		return 0, f.deleteErr
+	}
+	kept := make([]CountRow, 0, len(f.rows))
+	var n int64
+	for _, r := range f.rows {
+		if r.CreatorID == creatorID && !r.BucketHour.Before(from) && r.BucketHour.Before(to) {
+			n++
+			continue
+		}
+		kept = append(kept, r)
+	}
+	f.rows = kept
+	return n, nil
+}
+
+func (f *fakeCounts) InsertCounts(_ context.Context, rows []CountRow) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ops = append(f.ops, "insert")
+	f.inserts = append(f.inserts, append([]CountRow(nil), rows...))
+	if f.insertErr != nil {
+		return f.insertErr
+	}
+	f.rows = append(f.rows, rows...)
+	return nil
+}
+
+// merged collapses the stored rows the way SummingMergeTree does: sum
+// count over the ordering key. This is what the §8.8 API reads.
+func (f *fakeCounts) merged() map[string]uint64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := map[string]uint64{}
+	for _, r := range f.rows {
+		key := strings.Join([]string{r.CreatorID, r.BucketHour.UTC().Format(time.RFC3339),
+			r.TopicID, r.ThemeID, r.ContentID}, "|")
+		out[key] += r.Count
+	}
+	return out
+}
+
+func (f *fakeCounts) total() uint64 {
+	var n uint64
+	for _, v := range f.merged() {
+		n += v
+	}
+	return n
 }
 
 type fakeTexts struct {
@@ -145,6 +221,10 @@ func testWindow() (time.Time, time.Time) {
 		time.Date(2026, 8, 2, 0, 0, 0, 0, time.UTC)
 }
 
+// testNow is well past testWindow, so the default backfill lag never
+// truncates the rewrite unless a test moves the clock deliberately.
+func testNow() time.Time { return time.Date(2026, 8, 10, 12, 0, 0, 0, time.UTC) }
+
 func testConfig() Config {
 	return Config{
 		MinClusterSize: 15, MinSamples: 3,
@@ -152,6 +232,7 @@ func testConfig() Config {
 		MaxPoints:       200_000,
 		AssignThreshold: 0.75, ReuseThreshold: 0.75,
 		LabelPoints: 20, TextSampleMax: 100, EmbedBatch: 64,
+		BackfillCounts: BackfillOnDemand, BackfillLag: 2 * time.Hour,
 	}
 }
 
@@ -160,10 +241,12 @@ type harness struct {
 	store     *fakeStore
 	centroids *fakeCentroids
 	topics    *fakeTopics
+	counts    *fakeCounts
 	texts     *fakeTexts
 	embed     *fakeEmbed
 	llm       *fakeLLM
 	usage     *fakeUsage
+	registry  *prometheus.Registry
 }
 
 func newHarness(t *testing.T, recs []EmbeddingRecord) *harness {
@@ -175,19 +258,30 @@ func newHarness(t *testing.T, recs []EmbeddingRecord) *harness {
 		},
 		centroids: &fakeCentroids{},
 		topics:    &fakeTopics{},
+		counts:    &fakeCounts{},
 		texts:     &fakeTexts{},
 		embed:     &fakeEmbed{byText: map[string][]float32{}},
 		llm:       &fakeLLM{err: errors.New("llm down")},
 		usage:     &fakeUsage{},
+		registry:  prometheus.NewRegistry(),
 	}
 	h.runner = &Runner{
-		Store: h.store, Centroids: h.centroids, Topics: h.topics,
+		Store: h.store, Centroids: h.centroids, Topics: h.topics, Counts: h.counts,
 		Texts: h.texts, Embed: h.embed, LLM: h.llm, Usage: h.usage,
-		Metrics: NewMetrics(prometheus.NewRegistry()),
+		Metrics: NewMetrics(h.registry),
 		Log:     slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Cfg:     testConfig(),
+		Now:     testNow,
 	}
 	return h
+}
+
+// onDemandDecision is a creator-requested recluster of the test window —
+// the path §8.6 says rewrites history, and the backfill's default path.
+func onDemandDecision() Decision {
+	from, to := testWindow()
+	return Decision{CreatorID: "cr-1", Trigger: TriggerOnDemand, From: from, To: to,
+		JobID: ReclusterJobID("cr-1", from, to)}
 }
 
 func scheduledDecision() Decision {
