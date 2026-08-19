@@ -2,10 +2,12 @@ COMPOSE := docker compose -f deploy/compose/docker-compose.yml
 # Tracing overlay. Base file first: the collector config is bind-mounted from a
 # path relative to the first -f file's directory (deploy/compose/).
 TRACED  := $(COMPOSE) -f deploy/compose/fragments/observability.yml
+# Mail overlay: Mailpit captures everything; UI on :8025.
+MAILED  := $(COMPOSE) -f deploy/compose/fragments/mail.yml
 GOBIN   := $(shell go env GOPATH)/bin
 MODULES := $(shell go work edit -json | grep DiskPath | cut -d'"' -f4)
 
-.PHONY: build test vet proto up up-full up-traced down logs ps e2e
+.PHONY: build test vet proto up up-full up-traced up-mail down logs ps e2e
 
 build:
 	@for m in $(MODULES); do (cd $$m && go build ./...) || exit 1; done
@@ -42,8 +44,13 @@ up-full:
 up-traced:
 	$(TRACED) up -d --build --wait
 
+# As `make up`, plus Mailpit; services send real SMTP to it (UI on :8025).
+up-mail:
+	$(MAILED) up -d --build --wait
+
+# Tears down every overlay, whether or not it was started.
 down:
-	$(TRACED) --profile clustering down -v
+	$(COMPOSE) -f deploy/compose/fragments/observability.yml -f deploy/compose/fragments/mail.yml --profile clustering down -v
 
 logs:
 	$(COMPOSE) logs -f
