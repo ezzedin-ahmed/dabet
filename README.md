@@ -29,11 +29,12 @@ Go multi-module workspace (`go.work` at the root pre-declares every module — i
 | Package | Contents |
 | --- | --- |
 | `contracts` | Kafka topic names, the four event schemas (§4.2), detector/action/event_type enums, partition-key helpers |
-| `httpx` | Error envelope + code table (§4.1), strict JSON decoding, request-ID middleware, cursor pagination, JWT auth, idempotency key |
+| `httpx` | Error envelope + code table (§4.1), strict JSON decoding, request-ID and tracing middleware, cursor pagination, JWT auth (HS256/RS256), idempotency key |
 | `config` | Env helpers and the canonical variable names (§4.4) |
 | `obs` | Standard Prometheus metrics (§4.5), healthz/readyz, slog JSON logging. Read the package comment for the cardinality rule |
-| `service` | Shared service runner: env config, logging, health, metrics, graceful shutdown |
-| `kafkax` | franz-go producer (zstd, acks=all, idempotent) and consumer-group wrapper (at-least-once, commit after success) |
+| `tracing` | OpenTelemetry setup (§4.5): OTLP exporter, sampling, instrumented HTTP/gRPC clients. Off unless an endpoint is configured. Read the package comment for the P4 rule on span attributes |
+| `service` | Shared service runner: env config, logging, health, metrics, tracing, graceful shutdown |
+| `kafkax` | franz-go producer (zstd, acks=all, idempotent) and consumer-group wrapper (at-least-once, commit after success), with W3C trace context in record headers |
 | `policyapi` | `GetPolicy` gRPC contract (§6.7). Generated `.pb.go` files are committed; `make proto` regenerates |
 | `credits` | Internal `credits_ok` contract (§5.8): client with 60s cache + fail-open, and the server handler |
 | `embeddings` | Shared embedding HTTP contract (384-dim) + client |
@@ -122,6 +123,39 @@ protocol so the code under test is exercised rather than bypassed.
   `Idempotency-Key`) plus a test-only `POST /internal/confirm` that delivers the
   `payment_intent.succeeded` webhook with a real HMAC-SHA256 `Stripe-Signature`.
   Credits are still granted only by the webhook (§5.7).
+
+### Tracing (opt-in)
+
+OpenTelemetry tracing (§4.5) is **off by default**: with no OTLP endpoint
+configured every service installs the no-op tracer provider — no exporter, no
+background goroutine, no headers on Kafka records. `make up` and `make e2e` run
+with it off and are unaffected by any of it.
+
+To turn it on locally, overlay the observability fragment, which adds an OTel
+collector plus Jaeger and sets the environment the services read:
+
+```sh
+docker compose -f deploy/compose/docker-compose.yml \
+               -f deploy/compose/fragments/observability.yml up -d
+# traces at http://localhost:16686
+```
+
+One chat message's journey is then one trace, end to end:
+`adapter.ingest` → `messages.v1 send` → `messages.v1 process` →
+`moderation.cascade` → `GetPolicy` (gRPC) / `/v1/embed` / the LLM call →
+`flagged.v1 send` and `deletions.v1 send` → `deletions.v1 process` → the
+platform delete. HTTP handlers put `request_id` on their span and `trace_id` on
+their log lines, so logs and traces find each other.
+
+Configuration is the standard OpenTelemetry variables — `OTEL_EXPORTER_OTLP_ENDPOINT`
+enables it, `OTEL_TRACES_SAMPLER_ARG` sets the ratio. The **default sample ratio
+is 0.01**, parent-based: at the N6 target of 500 000 msg/s, head-sampling
+everything is neither affordable nor useful. The fragment raises it to 1.0 for
+local work, which is fine for a laptop and wrong everywhere else.
+
+Per **P4**, no span anywhere carries message text; see the note in
+`pkg/tracing` for exactly which identifiers are permitted and why `author_id`
+is not one of them.
 
 ## End-to-end smoke test
 
