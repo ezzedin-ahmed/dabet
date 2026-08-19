@@ -4,6 +4,7 @@ go 1.26
 
 require (
 	dabet/pkg v0.0.0
+	github.com/coder/websocket v1.8.14
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/prometheus/client_golang v1.24.1
 	github.com/twmb/franz-go v1.21.6

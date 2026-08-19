@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"sort"
 	"sync"
+	"time"
 )
 
 // Connection is one linked platform account, resolved to its Dabet creator.
@@ -42,13 +43,47 @@ type ContentRef struct {
 }
 
 // Message is one raw chat message as received from a platform, in native
-// terms. The ingest loop mints the opaque IDs and stamps ingested_at; the
-// driver only reports what the platform said.
+// terms. The ingest loop mints the opaque IDs; the driver only reports what
+// the platform said, plus the instant it said it.
 type Message struct {
 	NativeChannelID string
 	NativeAuthorID  string
 	NativeMessageID string
 	Text            string
+	// ReceivedAt is the instant the adapter took delivery of this message —
+	// the moment the poll response or WebSocket frame was read, before any
+	// parsing, buffering or produce. It becomes messages.v1's ingested_at
+	// and therefore starts the §4.6 latency clock at adapter ingress.
+	//
+	// Drivers must stamp it themselves rather than leaving it to the ingest
+	// loop, because a full channel or a slow broker can put arbitrary delay
+	// between receipt and produce, and that delay is ours — it belongs
+	// inside the SLI, not outside it. A zero value falls back to the ingest
+	// loop's clock.
+	ReceivedAt time.Time
+}
+
+// Send hands one message to the ingest loop, honouring both the
+// backpressure contract and ctx cancellation.
+//
+// out is bounded on purpose (see package ingest): when the broker is slow
+// the channel fills and the driver blocks, which throttles the driver
+// rather than growing memory. Blocking is therefore correct — but only
+// until ctx is cancelled, which is what stops a stopped watch loop from
+// wedging on a channel nobody drains any more.
+//
+// ReceivedAt is stamped here when the caller left it zero, so it is set as
+// close to actual receipt as the call site allows.
+func Send(ctx context.Context, out chan<- Message, msg Message) error {
+	if msg.ReceivedAt.IsZero() {
+		msg.ReceivedAt = time.Now()
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case out <- msg:
+		return nil
+	}
 }
 
 // Driver is the per-platform integration (docs §7.2, quoted verbatim).
@@ -89,8 +124,27 @@ var (
 	// ErrRateLimited: provider returned 429. Backoff with jitter, retry.
 	ErrRateLimited = errors.New("driver: rate limited")
 	// ErrUnauthorized: provider returned 401. Refresh token (§5.6), retry once.
+	//
+	// Watch returns this — wrapped, so errors.Is finds it — when a live
+	// stream dies of an auth failure. The ingest manager then runs the same
+	// §5.6 lazy-refresh path the deletion consumer uses and restarts the
+	// watch with the fresh token, instead of leaving a dead stream behind.
 	ErrUnauthorized = errors.New("driver: unauthorized")
+	// ErrPermanent: the operation cannot succeed however often it is
+	// retried and the fault is not the token's — a bot without the intents
+	// it asked for, an API version the provider withdrew, a malformed
+	// subscription. Watch ends terminally; retrying would be a hot loop
+	// against a guaranteed failure (P2).
+	ErrPermanent = errors.New("driver: permanent failure")
 )
+
+// Terminal reports whether a Watch error should end the watch loop for
+// good rather than be retried. ErrGone (the channel or chat no longer
+// exists) and ErrPermanent are terminal; ErrUnauthorized is not, because
+// the refresh path (§5.6) can still rescue it.
+func Terminal(err error) bool {
+	return errors.Is(err, ErrGone) || errors.Is(err, ErrPermanent) || errors.Is(err, ErrNotImplemented)
+}
 
 // FromHTTPStatus maps a provider HTTP status onto the shared error classes.
 // 2xx is success; unknown non-2xx statuses become transient errors so the
