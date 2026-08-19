@@ -26,9 +26,9 @@ type API struct {
 }
 
 // Register mounts the policy routes on mux behind JWT auth.
-func Register(mux *http.ServeMux, jwtSecret []byte, repo store.Repo, m *metrics.Metrics, log *slog.Logger) {
+func Register(mux *http.ServeMux, verifier *httpx.Verifier, repo store.Repo, m *metrics.Metrics, log *slog.Logger) {
 	a := &API{repo: repo, m: m, log: log}
-	auth := httpx.Auth(jwtSecret)
+	auth := httpx.Auth(verifier)
 	mux.Handle("POST /v1/policies", auth(http.HandlerFunc(a.create)))
 	mux.Handle("GET /v1/policies", auth(http.HandlerFunc(a.list)))
 	mux.Handle("GET /v1/policies/{id}", auth(http.HandlerFunc(a.get)))

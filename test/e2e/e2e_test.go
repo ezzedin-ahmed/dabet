@@ -47,7 +47,7 @@ type scenario struct {
 	creatorID string
 	token     string
 
-	channel string // native mock channel id
+	channel  string // native mock channel id
 	policyID string
 
 	// nativeIDs maps a human label to the native message id the adapter

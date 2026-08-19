@@ -87,7 +87,7 @@ func (f *fakeStore) Get(_ context.Context, creatorID, topicID string) (Meta, boo
 // authWrap applies the same httpx.Auth middleware Register uses.
 func authWrap(t *testing.T, h http.Handler) http.Handler {
 	t.Helper()
-	return httpx.Auth([]byte(secret))(h)
+	return httpx.Auth(httpx.HMACVerifier([]byte(secret)))(h)
 }
 
 // get performs an authed GET against a mux built around the fixed clock

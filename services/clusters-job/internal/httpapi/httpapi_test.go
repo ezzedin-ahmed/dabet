@@ -13,6 +13,8 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 
 	"dabet/services/clusters-job/internal/job"
+
+	"dabet/pkg/httpx"
 )
 
 var secret = []byte("test-secret")
@@ -32,7 +34,7 @@ func (f *fakeEnqueuer) Enqueue(d job.Decision) bool {
 
 func newMux(enq Enqueuer) *http.ServeMux {
 	mux := http.NewServeMux()
-	Register(mux, secret, enq, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	Register(mux, httpx.HMACVerifier(secret), enq, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	return mux
 }
 

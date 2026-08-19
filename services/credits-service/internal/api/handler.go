@@ -86,8 +86,8 @@ func NewHandler(repo ledger.Repository, pi stripe.PaymentIntents, met *metrics.C
 // Routes mounts every endpoint on mux. Balance, entries, and topup are
 // JWT-authed; the Stripe webhook is authenticated by its signature and
 // the credits-ok endpoint is internal (§5.8).
-func (h *Handler) Routes(mux *http.ServeMux, jwtSecret []byte) {
-	auth := httpx.Auth(jwtSecret)
+func (h *Handler) Routes(mux *http.ServeMux, verifier *httpx.Verifier) {
+	auth := httpx.Auth(verifier)
 	mux.Handle("GET /v1/credits", auth(http.HandlerFunc(h.getCredits)))
 	mux.Handle("GET /v1/credits/entries", auth(http.HandlerFunc(h.getEntries)))
 	mux.Handle("POST /v1/credits/topup", auth(http.HandlerFunc(h.postTopup)))

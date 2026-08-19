@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"dabet/pkg/tracing"
 )
 
 // LLMLabeler produces a short label and description for one cluster from
@@ -35,7 +37,7 @@ func NewVLLMLabeler(endpoint, model string, timeout time.Duration) *VLLMLabeler 
 		url:     strings.TrimSuffix(endpoint, "/") + "/v1/chat/completions",
 		model:   model,
 		timeout: timeout,
-		httpc:   &http.Client{},
+		httpc:   tracing.HTTPClient(0),
 	}
 }
 

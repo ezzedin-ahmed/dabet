@@ -26,6 +26,7 @@ import (
 	"dabet/pkg/kafkax"
 	"dabet/pkg/policyapi"
 	"dabet/pkg/service"
+	"dabet/pkg/tracing"
 
 	"dabet/services/moderation-service/internal/mod"
 )
@@ -139,7 +140,9 @@ func run(svc *service.Service) error {
 	// Policy gRPC client + in-process LRU (§6.8).
 	policyConn, err := grpc.NewClient(
 		config.GetDefault(envPolicyEndpoint, "localhost:7101"),
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		append([]grpc.DialOption{
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+		}, tracing.GRPCDialOptions()...)...,
 	)
 	if err != nil {
 		return err

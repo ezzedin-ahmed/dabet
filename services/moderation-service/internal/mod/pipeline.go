@@ -7,11 +7,13 @@ import (
 	"time"
 
 	"github.com/twmb/franz-go/pkg/kgo"
+	"go.opentelemetry.io/otel/trace"
 
 	"dabet/pkg/contracts"
 	"dabet/pkg/kafkax"
 	"dabet/pkg/policyapi"
 	"dabet/pkg/rediskeys"
+	"dabet/pkg/tracing"
 )
 
 // CreditsChecker is the advisory credits_ok flag (§5.8); implemented by
@@ -105,6 +107,14 @@ func NewPipeline(cfg Config, policies PolicyGetter, credits CreditsChecker, stat
 func (p *Pipeline) Handler(group string) kafkax.Handler {
 	return func(ctx context.Context, rec *kgo.Record) error {
 		p.met.KafkaConsumed.WithLabelValues(rec.Topic, group, "ok").Inc()
+		// One span for the whole cascade, hanging off the consumer span
+		// kafkax opened from the record's traceparent — so this is the
+		// same trace as the adapter ingest that produced the record.
+		// Per-stage timings deliberately stay in the histograms
+		// (observeStage): a span per stage at 500 000 msg/s would cost
+		// more than the stages do.
+		ctx, span := tracing.Tracer().Start(ctx, "moderation.cascade")
+		defer span.End()
 		p.Process(ctx, rec.Value)
 		return nil
 	}
@@ -119,6 +129,13 @@ func (p *Pipeline) Process(ctx context.Context, value []byte) {
 		p.met.MessagesTotal.WithLabelValues("skipped").Inc()
 		return
 	}
+	// P4: identifiers only. msg.Text never reaches a span, an event, or an
+	// error — and author_id is deliberately absent (see pkg/tracing).
+	trace.SpanFromContext(ctx).SetAttributes(
+		tracing.MessageID(msg.MessageID),
+		tracing.ContentID(msg.ContentID),
+		tracing.CreatorID(msg.CreatorID),
+	)
 
 	// Redis availability is decided per message: the first failing Redis
 	// operation marks it down for the remaining stages and counts ONE
@@ -346,6 +363,9 @@ func (p *Pipeline) dispatch(ctx context.Context, batch *LLMBatch) {
 func (p *Pipeline) flag(ctx context.Context, msg contracts.Message, det contracts.Detector, action contracts.Action, policyID string) {
 	now := p.now()
 	p.met.DetectorHits.WithLabelValues(string(det), string(action)).Inc()
+	// The detector NAME, not what it matched (P4).
+	trace.SpanFromContext(ctx).SetAttributes(
+		tracing.Outcome("flagged"), tracing.Detector(string(det)))
 
 	flagged := contracts.Flagged{
 		MessageID: msg.MessageID,

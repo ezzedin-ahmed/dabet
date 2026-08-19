@@ -36,9 +36,9 @@ func NewAPI(enq Enqueuer, log *slog.Logger) *API {
 }
 
 // Register mounts the route on mux behind JWT auth.
-func Register(mux *http.ServeMux, jwtSecret []byte, enq Enqueuer, log *slog.Logger) {
+func Register(mux *http.ServeMux, verifier *httpx.Verifier, enq Enqueuer, log *slog.Logger) {
 	a := NewAPI(enq, log)
-	auth := httpx.Auth(jwtSecret)
+	auth := httpx.Auth(verifier)
 	mux.Handle("POST /v1/topics/recluster", auth(http.HandlerFunc(a.Recluster)))
 }
 

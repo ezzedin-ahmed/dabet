@@ -131,8 +131,8 @@ func New(reader queue.Reader, cursors store.Store, producer Producer, mapper *pa
 }
 
 // Register mounts the review routes on mux behind JWT auth.
-func (a *API) Register(mux *http.ServeMux, jwtSecret []byte) {
-	auth := httpx.Auth(jwtSecret)
+func (a *API) Register(mux *http.ServeMux, verifier *httpx.Verifier) {
+	auth := httpx.Auth(verifier)
 	mux.Handle("GET /v1/reviews", auth(http.HandlerFunc(a.list)))
 	mux.Handle("POST /v1/reviews", auth(http.HandlerFunc(a.post)))
 }

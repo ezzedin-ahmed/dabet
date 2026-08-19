@@ -29,9 +29,11 @@ const VerificationTokenTTL = 24 * time.Hour
 
 // Handler serves the /v1/auth endpoints and /v1/me.
 type Handler struct {
-	Repo      repo.Repository
-	JWTSecret []byte
-	Logger    *slog.Logger
+	Repo repo.Repository
+	// Keys is the access-token signer/verifier pair (§5.4): HS256 by
+	// default, RS256 when the deployment configures a private key.
+	Keys   *auth.Keyring
+	Logger *slog.Logger
 	// Logins is auth_logins_total{outcome} (§5.9).
 	Logins *prometheus.CounterVec
 
@@ -80,15 +82,16 @@ func NewLoginsCounter() *prometheus.CounterVec {
 	}, []string{"outcome"})
 }
 
-// NewHandler wires a Handler with production defaults.
-func NewHandler(r repo.Repository, jwtSecret []byte, logger *slog.Logger, logins *prometheus.CounterVec) (*Handler, error) {
+// NewHandler wires a Handler with production defaults. keys carries the
+// access-token signing and verification configuration of §5.4.
+func NewHandler(r repo.Repository, keys *auth.Keyring, logger *slog.Logger, logins *prometheus.CounterVec) (*Handler, error) {
 	dummy, err := auth.HashPassword(uuid.NewString() + uuid.NewString())
 	if err != nil {
 		return nil, err
 	}
 	return &Handler{
 		Repo:           r,
-		JWTSecret:      jwtSecret,
+		Keys:           keys,
 		Logger:         logger,
 		Logins:         logins,
 		OAuth:          oauth.NewClient(),
@@ -111,7 +114,7 @@ func (h *Handler) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/auth/login", h.handleLogin)
 	mux.HandleFunc("POST /v1/auth/refresh", h.handleRefresh)
 	mux.HandleFunc("POST /v1/auth/logout", h.handleLogout)
-	mux.Handle("GET /v1/me", httpx.Auth(h.JWTSecret)(http.HandlerFunc(h.handleMe)))
+	mux.Handle("GET /v1/me", httpx.Auth(h.Keys.Verifier)(http.HandlerFunc(h.handleMe)))
 	h.connectionsRoutes(mux)
 }
 
@@ -283,7 +286,7 @@ func (h *Handler) handleLogin(w http.ResponseWriter, r *http.Request) {
 // stores the refresh token hash.
 func (h *Handler) issueTokens(r *http.Request, creatorID, familyID string) (*tokenResponse, error) {
 	now := h.Now()
-	access, err := auth.IssueAccessToken(h.JWTSecret, creatorID, now, h.AccessTTL)
+	access, err := h.Keys.Signer.Issue(creatorID, now, h.AccessTTL)
 	if err != nil {
 		return nil, err
 	}
@@ -350,7 +353,7 @@ func (h *Handler) handleRefresh(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	access, err := auth.IssueAccessToken(h.JWTSecret, tok.CreatorID, now, h.AccessTTL)
+	access, err := h.Keys.Signer.Issue(tok.CreatorID, now, h.AccessTTL)
 	if err != nil {
 		h.internal(w, r, "issue access token", err)
 		return

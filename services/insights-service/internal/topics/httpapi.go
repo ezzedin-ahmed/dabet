@@ -28,9 +28,9 @@ func NewAPI(store Store, log *slog.Logger, now func() time.Time) *API {
 
 // Register mounts the topics routes on mux behind JWT auth. There are
 // deliberately no POST routes and no sample/message endpoints (§8.8).
-func Register(mux *http.ServeMux, jwtSecret []byte, store Store, log *slog.Logger) {
+func Register(mux *http.ServeMux, verifier *httpx.Verifier, store Store, log *slog.Logger) {
 	a := NewAPI(store, log, nil)
-	auth := httpx.Auth(jwtSecret)
+	auth := httpx.Auth(verifier)
 	mux.Handle("GET /v1/topics", auth(http.HandlerFunc(a.List)))
 	mux.Handle("GET /v1/topics/{id}", auth(http.HandlerFunc(a.Get)))
 	mux.Handle("GET /v1/topics/{id}/themes", auth(http.HandlerFunc(a.Themes)))

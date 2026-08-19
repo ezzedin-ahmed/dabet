@@ -18,6 +18,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
 	"dabet/pkg/contracts"
+	"dabet/pkg/httpx"
 
 	"dabet/services/review-service/internal/metrics"
 	"dabet/services/review-service/internal/partition"
@@ -107,7 +108,7 @@ func setup(t *testing.T, partitions int32) *env {
 	tracker := metrics.NewLagTracker(e.m, func() time.Time { return testNow })
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	a := New(e.log, e.mem, e.prod, e.mapper, e.m, tracker, logger, func() time.Time { return testNow })
-	a.Register(e.mux, []byte(testSecret))
+	a.Register(e.mux, httpx.HMACVerifier([]byte(testSecret)))
 	return e
 }
 

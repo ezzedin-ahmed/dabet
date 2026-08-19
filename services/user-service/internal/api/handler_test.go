@@ -44,7 +44,7 @@ func newFixture(t *testing.T) *fixture {
 	t.Helper()
 	fake := repo.NewFake()
 	logins := NewLoginsCounter()
-	h, err := NewHandler(fake, []byte(testSecret), slog.New(slog.DiscardHandler), logins)
+	h, err := NewHandler(fake, auth.HMACKeyring([]byte(testSecret)), slog.New(slog.DiscardHandler), logins)
 	if err != nil {
 		t.Fatalf("NewHandler: %v", err)
 	}

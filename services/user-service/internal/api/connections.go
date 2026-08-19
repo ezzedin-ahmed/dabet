@@ -67,7 +67,7 @@ type connectRequest struct {
 
 // connectionsRoutes registers the §5.5 endpoints; called from Routes.
 func (h *Handler) connectionsRoutes(mux *http.ServeMux) {
-	authed := httpx.Auth(h.JWTSecret)
+	authed := httpx.Auth(h.Keys.Verifier)
 	mux.Handle("POST /v1/connections/{platform}", authed(http.HandlerFunc(h.handleConnect)))
 	mux.HandleFunc("GET /v1/connections/callback", h.handleCallback)
 	mux.Handle("GET /v1/connections", authed(http.HandlerFunc(h.handleListConnections)))

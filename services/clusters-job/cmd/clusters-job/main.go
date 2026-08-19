@@ -58,6 +58,7 @@ import (
 
 	"dabet/pkg/config"
 	"dabet/pkg/embeddings"
+	"dabet/pkg/httpx"
 	"dabet/pkg/kafkax"
 	"dabet/pkg/service"
 
@@ -109,7 +110,9 @@ func run(svc *service.Service) error {
 	if err != nil {
 		return err
 	}
-	jwtSecret, err := config.Get(config.EnvJWTSecret)
+	// §5.4 access tokens: HS256 (JWT_SECRET) by default, RS256
+	// (JWT_PUBLIC_KEY / JWT_PUBLIC_KEY_FILE) when JWT_ALG says so.
+	verifier, err := httpx.VerifierFromEnv(os.Getenv)
 	if err != nil {
 		return err
 	}
@@ -175,7 +178,7 @@ func run(svc *service.Service) error {
 	sched := trigger.New(trigCfg, store, stats, ch, ch, runner, svc.Logger, nil)
 	go sched.Loop(ctx)
 
-	httpapi.Register(svc.Mux, []byte(jwtSecret), sched, svc.Logger)
+	httpapi.Register(svc.Mux, verifier, sched, svc.Logger)
 
 	err = svc.Run(ctx)
 	cancel()
