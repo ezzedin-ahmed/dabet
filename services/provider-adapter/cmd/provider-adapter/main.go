@@ -29,6 +29,7 @@ import (
 	"dabet/services/provider-adapter/internal/metrics"
 	"dabet/services/provider-adapter/internal/mockdriver"
 	"dabet/services/provider-adapter/internal/opaque"
+	"dabet/services/provider-adapter/internal/quota"
 	"dabet/services/provider-adapter/internal/refresh"
 )
 
@@ -75,9 +76,39 @@ func run(svc *service.Service) error {
 	mock.Resolver = minter
 	registry := driver.NewRegistry()
 	registry.Register(mock)
-	registry.Register(youtube.New(minter))
-	registry.Register(twitch.New(minter, config.GetDefault("TWITCH_CLIENT_ID", "")))
-	registry.Register(discord.New(minter))
+
+	// YouTube's daily quota is the binding constraint on how often it can
+	// poll, so it is the one ingestion knob worth exposing: raise it when
+	// Google raises the project allowance, set 0 for a quota-exempt
+	// deployment. See the youtube package comment for the cost model.
+	ytQuota, err := config.GetInt("ADAPTER_YOUTUBE_DAILY_QUOTA", youtube.DefaultDailyQuota)
+	if err != nil {
+		return err
+	}
+	ytDiscovery, err := config.GetDuration("ADAPTER_YOUTUBE_DISCOVERY_INTERVAL", youtube.DefaultDiscoveryInterval)
+	if err != nil {
+		return err
+	}
+	yt := youtube.New(minter)
+	yt.Budget = quota.New(ytQuota)
+	yt.DiscoveryInterval = ytDiscovery
+	yt.Log = svc.Logger
+	registry.Register(yt)
+
+	tw := twitch.New(minter, config.GetDefault("TWITCH_CLIENT_ID", ""))
+	tw.Log = svc.Logger
+	registry.Register(tw)
+
+	// 0 shards means "use whatever GET /gateway/bot recommends", which is
+	// the right answer until a bot outgrows one instance's socket budget.
+	dcShards, err := config.GetInt("ADAPTER_DISCORD_SHARDS", 0)
+	if err != nil {
+		return err
+	}
+	dc := discord.New(minter)
+	dc.Shards = dcShards
+	dc.Log = svc.Logger
+	registry.Register(dc)
 
 	// Connection assignment: env-seeded Static source (also the mock
 	// injection endpoint's registry), plus — when POSTGRES_DSN is set —
@@ -136,6 +167,12 @@ func run(svc *service.Service) error {
 	manager := ingest.NewManager(registry, source, producer, minter, m, svc.Logger)
 	manager.Buffer = buffer
 	manager.WatchRetry = watchRetry
+	// A watch is long-lived, so an access token can expire while a stream
+	// is running; the same §5.6 refresher the deletion consumer uses turns
+	// that 401 into a reconnect instead of a dead stream.
+	if r, ok := refresher.(ingest.TokenRefresher); ok {
+		manager.Refresher = r
+	}
 
 	processor := deletion.NewProcessor(registry, source, refresher, opaque.Platform, m, svc.Metrics, svc.Logger)
 	processor.BaseBackoff = deleteBackoff
