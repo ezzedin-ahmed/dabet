@@ -238,9 +238,15 @@ only because the compose healthchecks need a `wget`.
   databases.
 - Conventional commits.
 
-## Contributing
+## Continuous integration
 
-- **Frozen contracts:** `pkg/` and `go.work` are the interface between the four areas. They change only by cross-area agreement (docs §4). Everything else is area-local.
-- **Testing bar:** every feature branch must include unit tests for its logic; `go build ./...`, `go vet ./...`, and `go test ./...` must pass in every module. Integration/e2e testing lands as a dedicated later phase — do not block feature branches on it, and do not skip unit tests because of it.
-- **P4 — text is radioactive:** chat message text (and message/author/content IDs, for metrics) never goes into logs, metric labels, error messages, or databases.
-- Conventional commits.
+`.github/workflows/ci.yml` runs on every push and pull request: gofmt and
+`go vet`, then per-module `go build` / `go test` / `go test -race`, a
+`GOWORK=off` standalone build of every service (this is what container builds
+do, and it catches missing `require`/`replace`/`go.sum` entries that the
+workspace masks), and an image build for all nine services.
+
+`.github/workflows/e2e.yml` runs `make up && make e2e` on pushes to `main`,
+nightly, on manual dispatch, and on pull requests labelled `e2e`. It is not on
+every PR because the stack builds eleven images and waits on nineteen
+healthchecks. Compose logs are uploaded as an artifact when it fails.
