@@ -17,6 +17,7 @@ import (
 
 	"dabet/pkg/config"
 	"dabet/pkg/contracts"
+	"dabet/pkg/httpx"
 	"dabet/pkg/kafkax"
 	"dabet/pkg/service"
 
@@ -54,7 +55,9 @@ func run(ctx context.Context, svc *service.Service) error {
 	if err != nil {
 		return err
 	}
-	jwtSecret, err := config.Get(config.EnvJWTSecret)
+	// §5.4 access tokens: HS256 (JWT_SECRET) by default, RS256
+	// (JWT_PUBLIC_KEY / JWT_PUBLIC_KEY_FILE) when JWT_ALG says so.
+	verifier, err := httpx.VerifierFromEnv(os.Getenv)
 	if err != nil {
 		return err
 	}
@@ -101,7 +104,7 @@ func run(ctx context.Context, svc *service.Service) error {
 
 	h := api.NewHandler(ledgerRepo, stripeClient, met, []byte(webhookSecret), int64(creditsPerCent), log)
 	h.Notify = notifier
-	h.Routes(svc.Mux, []byte(jwtSecret))
+	h.Routes(svc.Mux, verifier)
 
 	consumer, err := kafkax.NewConsumer(brokers, group, []string{contracts.TopicUsage},
 		usage.NewConsumer(ledgerRepo, rates, met, svc.Metrics, group, notifier.BalanceChanged, log).Handle)

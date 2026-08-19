@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+
+	"dabet/pkg/tracing"
 )
 
 // AssignSender forwards freshly embedded batches to clustering-service for
@@ -74,7 +76,7 @@ type AsyncAssigner struct {
 func NewAsyncAssigner(endpoint string, timeout time.Duration, queueLen int, failOpen *prometheus.CounterVec, depUp *prometheus.GaugeVec) *AsyncAssigner {
 	return &AsyncAssigner{
 		endpoint: strings.TrimSuffix(endpoint, "/"),
-		httpc:    &http.Client{Timeout: timeout},
+		httpc:    tracing.HTTPClient(timeout),
 		queue:    make(chan []EmbeddingRecord, queueLen),
 		failOpen: failOpen,
 		depUp:    depUp,

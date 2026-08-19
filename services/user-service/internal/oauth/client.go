@@ -9,6 +9,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"dabet/pkg/tracing"
 )
 
 // Client performs the provider-side HTTP calls of the §5.5 flow. All
@@ -19,7 +21,7 @@ type Client struct {
 
 // NewClient returns a Client with a bounded-timeout http.Client.
 func NewClient() *Client {
-	return &Client{HTTP: &http.Client{Timeout: 10 * time.Second}}
+	return &Client{HTTP: tracing.HTTPClient(10 * time.Second)}
 }
 
 // Token is a provider token response.

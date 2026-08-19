@@ -17,6 +17,7 @@ import (
 	"dabet/pkg/service"
 
 	"dabet/services/user-service/internal/api"
+	"dabet/services/user-service/internal/auth"
 	"dabet/services/user-service/internal/migrate"
 	"dabet/services/user-service/internal/oauth"
 	"dabet/services/user-service/internal/repo"
@@ -35,7 +36,10 @@ func run(ctx context.Context, svc *service.Service) error {
 	if err != nil {
 		return err
 	}
-	jwtSecret, err := config.Get(config.EnvJWTSecret)
+	// §5.4: HS256 by default (JWT_SECRET), RS256 when the deployment sets
+	// JWT_ALG=RS256 and a private key. A broken key is a startup failure,
+	// not a per-request 401.
+	keys, err := auth.KeyringFromEnv(os.Getenv)
 	if err != nil {
 		return err
 	}
@@ -55,10 +59,11 @@ func run(ctx context.Context, svc *service.Service) error {
 	svc.Registry.MustRegister(logins)
 
 	r := repo.NewPostgres(pool)
-	h, err := api.NewHandler(r, []byte(jwtSecret), authLogger(svc.Logger), logins)
+	h, err := api.NewHandler(r, keys, authLogger(svc.Logger), logins)
 	if err != nil {
 		return err
 	}
+	svc.Logger.Info("access tokens configured", "alg", keys.Signer.Alg(), "kid", keys.Signer.Kid())
 
 	// §5.5 OAuth provider set. OAUTH_MOCK_ENABLED gates the mock platform
 	// (documented deviation, for e2e against a stub provider).

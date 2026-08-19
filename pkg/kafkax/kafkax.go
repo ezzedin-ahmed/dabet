@@ -30,9 +30,17 @@ func NewProducer(brokers []string) (*Producer, error) {
 	return &Producer{cl: cl}, nil
 }
 
-// Produce writes one record and waits for the broker ack.
+// Produce writes one record and waits for the broker ack. W3C trace
+// context is injected into the record headers (see trace.go), so a
+// consumer of this record continues the producer's trace; with tracing
+// off no headers are added at all.
 func (p *Producer) Produce(ctx context.Context, topic string, key, value []byte) error {
-	return p.cl.ProduceSync(ctx, &kgo.Record{Topic: topic, Key: key, Value: value}).FirstErr()
+	rec := &kgo.Record{Topic: topic, Key: key, Value: value}
+	ctx, span := StartProduceSpan(ctx, rec)
+	defer span.End()
+	err := p.cl.ProduceSync(ctx, rec).FirstErr()
+	recordError(span, err)
+	return err
 }
 
 // Close flushes and closes the client.
@@ -47,6 +55,7 @@ type Handler func(ctx context.Context, rec *kgo.Record) error
 // handler has succeeded for every polled record.
 type Consumer struct {
 	cl      *kgo.Client
+	group   string
 	handler Handler
 }
 
@@ -61,7 +70,7 @@ func NewConsumer(brokers []string, group string, topics []string, h Handler) (*C
 	if err != nil {
 		return nil, fmt.Errorf("kafka consumer: %w", err)
 	}
-	return &Consumer{cl: cl, handler: h}, nil
+	return &Consumer{cl: cl, group: group, handler: h}, nil
 }
 
 // Run polls until ctx is cancelled or the handler fails.
@@ -82,7 +91,7 @@ func (c *Consumer) Run(ctx context.Context) error {
 			if handlerErr != nil {
 				return
 			}
-			handlerErr = c.handler(ctx, rec)
+			handlerErr = c.handle(ctx, rec)
 		})
 		if handlerErr != nil {
 			return handlerErr
@@ -91,6 +100,18 @@ func (c *Consumer) Run(ctx context.Context) error {
 			return fmt.Errorf("kafka commit: %w", err)
 		}
 	}
+}
+
+// handle runs one record under a CONSUMER span that continues the
+// producer's trace, so the handler's own work (policy gRPC, Redis, the
+// LLM call, the verdict publish) hangs off the same trace as the ingest
+// that created the record.
+func (c *Consumer) handle(ctx context.Context, rec *kgo.Record) error {
+	ctx, span := StartConsumeSpan(ctx, rec, c.group)
+	defer span.End()
+	err := c.handler(ctx, rec)
+	recordError(span, err)
+	return err
 }
 
 // Close leaves the group and closes the client.

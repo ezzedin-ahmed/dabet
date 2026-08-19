@@ -16,7 +16,10 @@ import (
 	"log/slog"
 	"time"
 
+	"go.opentelemetry.io/otel/trace"
+
 	"dabet/pkg/contracts"
+	"dabet/pkg/tracing"
 
 	"dabet/services/provider-adapter/internal/connsource"
 	"dabet/services/provider-adapter/internal/driver"
@@ -169,7 +172,22 @@ func (m *Manager) watch(ctx context.Context, drv driver.Driver, conn driver.Conn
 }
 
 // emit mints opaque IDs, builds the messages.v1 event, and produces it.
+//
+// This span is the root of a message's trace: the clock the §4.6 SLI
+// measures starts here, at adapter ingress. Everything downstream —
+// messages.v1, the cascade, the verdict on flagged.v1, the delete call —
+// hangs off it via the record headers.
+//
+// P4: message_id, content_id, creator_id and the platform go on the span;
+// msg.Text does not, and neither does author_id (see pkg/tracing).
 func (m *Manager) emit(ctx context.Context, conn driver.Connection, msg driver.Message) error {
+	ctx, span := tracing.Tracer().Start(ctx, "adapter.ingest",
+		trace.WithAttributes(
+			tracing.Platform(conn.Platform),
+			tracing.CreatorID(conn.CreatorID),
+		))
+	defer span.End()
+
 	contentID, err := m.minter.ContentID(conn.Platform, msg.NativeChannelID)
 	if err != nil {
 		return err
@@ -194,6 +212,8 @@ func (m *Manager) emit(ctx context.Context, conn driver.Connection, msg driver.M
 	if err != nil {
 		return err
 	}
+	span.SetAttributes(tracing.MessageID(messageID), tracing.ContentID(contentID))
+
 	key := contracts.MessagesKey(authorID, contentID)
 	if err := m.producer.Produce(ctx, contracts.TopicMessages, key, value); err != nil {
 		return err

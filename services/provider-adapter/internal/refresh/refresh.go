@@ -34,6 +34,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 
 	"dabet/services/provider-adapter/internal/driver"
+
+	"dabet/pkg/tracing"
 )
 
 // Endpoint is one platform's token-endpoint configuration
@@ -113,7 +115,7 @@ func New(store Store, endpoints map[string]Endpoint, refreshTotal *prometheus.Co
 	return &Refresher{
 		store:        store,
 		endpoints:    endpoints,
-		http:         &http.Client{Timeout: 10 * time.Second},
+		http:         tracing.HTTPClient(10 * time.Second),
 		refreshTotal: refreshTotal,
 		log:          log,
 		evict:        evict,

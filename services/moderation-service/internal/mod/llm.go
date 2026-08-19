@@ -12,6 +12,7 @@ import (
 
 	"dabet/pkg/contracts"
 	"dabet/pkg/policyapi"
+	"dabet/pkg/tracing"
 )
 
 // LLMBatch is one dispatch unit: messages sharing a policy, so the policy
@@ -112,7 +113,9 @@ func NewLLMClient(endpoint, model string, timeout time.Duration) *LLMClient {
 		url:     strings.TrimSuffix(endpoint, "/") + "/v1/chat/completions",
 		model:   model,
 		timeout: timeout,
-		httpc:   &http.Client{},
+		// Instrumented transport: the LLM hop is the §4.6 budget's
+		// 1 000 ms elephant, so it has to be visible in the trace.
+		httpc: tracing.HTTPClient(0),
 	}
 }
 

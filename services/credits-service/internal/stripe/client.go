@@ -17,6 +17,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"dabet/pkg/tracing"
 )
 
 // PaymentIntent is the subset of Stripe's payment_intent object the topup
@@ -49,7 +51,7 @@ func NewClient(base, secretKey string) *Client {
 	return &Client{
 		base:  strings.TrimSuffix(base, "/"),
 		key:   secretKey,
-		httpc: &http.Client{Timeout: 10 * time.Second},
+		httpc: tracing.HTTPClient(10 * time.Second),
 	}
 }
 

@@ -15,8 +15,10 @@ import (
 	"google.golang.org/grpc"
 
 	"dabet/pkg/config"
+	"dabet/pkg/httpx"
 	"dabet/pkg/policyapi"
 	"dabet/pkg/service"
+	"dabet/pkg/tracing"
 
 	"dabet/services/policy-service/internal/cache"
 	"dabet/services/policy-service/internal/grpcapi"
@@ -40,7 +42,9 @@ func main() {
 		os.Exit(1)
 	}
 
-	jwtSecret, err := config.Get(config.EnvJWTSecret)
+	// §5.4 access tokens: HS256 (JWT_SECRET) by default, RS256
+	// (JWT_PUBLIC_KEY / JWT_PUBLIC_KEY_FILE) when JWT_ALG says so.
+	verifier, err := httpx.VerifierFromEnv(os.Getenv)
 	if err != nil {
 		fatal("config", err)
 	}
@@ -73,13 +77,16 @@ func main() {
 	mc := cache.NewMemcached(mcAddrs...)
 	res := resolver.New(repo, mc, m, svc.Metrics, cacheTTL)
 
-	httpapi.Register(svc.Mux, []byte(jwtSecret), repo, m, log)
+	httpapi.Register(svc.Mux, verifier, repo, m, log)
 
 	lis, err := net.Listen("tcp", grpcAddr)
 	if err != nil {
 		fatal("grpc listen", err)
 	}
-	grpcSrv := grpc.NewServer()
+	// otelgrpc server handler: GetPolicy is a hop inside a message's
+	// journey (moderation -> policy, §6.7), so the RPC must continue the
+	// caller's trace rather than start its own.
+	grpcSrv := grpc.NewServer(tracing.GRPCServerOptions()...)
 	policyapi.RegisterPolicyServiceServer(grpcSrv, grpcapi.New(res, log))
 	grpcErr := make(chan error, 1)
 	go func() { grpcErr <- grpcSrv.Serve(lis) }()

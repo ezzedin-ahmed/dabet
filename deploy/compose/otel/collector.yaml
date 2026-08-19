@@ -1,0 +1,54 @@
+# OpenTelemetry Collector config for the local Dabet stack (docs §4.5).
+#
+# The nine services export OTLP to this collector; the collector forwards
+# traces to Jaeger for viewing. In the k8s target the same collector sits
+# in front of whichever backend the platform team picks — which is the
+# reason for having it at all rather than pointing services straight at
+# Jaeger: the backend becomes a collector config change, not a redeploy of
+# nine services.
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  # Bounded queueing so a slow backend cannot grow the collector without
+  # limit — the collector must never be the thing that falls over.
+  batch:
+    timeout: 5s
+    send_batch_size: 512
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 384
+    spike_limit_mib: 96
+
+exporters:
+  otlp/jaeger:
+    endpoint: jaeger:4317
+    tls:
+      insecure: true
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+service:
+  extensions: [health_check]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlp/jaeger]
+  telemetry:
+    metrics:
+      # The collector's own Prometheus metrics, distinct from the §4.5
+      # per-service :9090/metrics.
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: 0.0.0.0
+                port: 8888

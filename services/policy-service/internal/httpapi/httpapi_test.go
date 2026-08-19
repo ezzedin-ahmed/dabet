@@ -49,7 +49,7 @@ func newEnv(t *testing.T) *env {
 	repo := memstore.New()
 	mux := http.NewServeMux()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	Register(mux, []byte(secret), repo, metrics.New(prometheus.NewRegistry()), log)
+	Register(mux, httpx.HMACVerifier([]byte(secret)), repo, metrics.New(prometheus.NewRegistry()), log)
 	srv := httptest.NewServer(httpx.RequestID(mux))
 	t.Cleanup(srv.Close)
 	return &env{srv: srv, repo: repo}

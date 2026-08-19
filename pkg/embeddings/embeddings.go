@@ -12,6 +12,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"dabet/pkg/tracing"
 )
 
 // Dimensions is the embedding width (docs §8.4, A21).
@@ -37,11 +39,13 @@ type Client struct {
 }
 
 // NewClient builds a client for the embedding service at baseURL with the
-// given request timeout.
+// given request timeout. The transport is trace-instrumented, so an embed
+// call made while handling a message shows up as a child span of that
+// message's trace — which matters because §4.6 budgets 100 ms for it.
 func NewClient(baseURL string, timeout time.Duration) *Client {
 	return &Client{
 		base:  strings.TrimSuffix(baseURL, "/"),
-		httpc: &http.Client{Timeout: timeout},
+		httpc: tracing.HTTPClient(timeout),
 	}
 }
 

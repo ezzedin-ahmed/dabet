@@ -7,9 +7,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"time"
-
-	"github.com/golang-jwt/jwt/v5"
-	"github.com/google/uuid"
 )
 
 // AccessTokenTTL is the access-JWT lifetime per A2 (15 minutes),
@@ -39,13 +36,9 @@ func HashToken(raw string) string {
 }
 
 // IssueAccessToken signs an HS256 access JWT with claims sub/iat/exp/jti
-// (A2), compatible with the pkg/httpx Auth middleware.
+// (A2), compatible with the pkg/httpx Auth middleware. It is the HS256
+// shorthand for Signer.Issue; production goes through the Keyring so
+// RS256 is available (see signer.go).
 func IssueAccessToken(secret []byte, creatorID string, now time.Time, ttl time.Duration) (string, error) {
-	claims := jwt.RegisteredClaims{
-		Subject:   creatorID,
-		IssuedAt:  jwt.NewNumericDate(now),
-		ExpiresAt: jwt.NewNumericDate(now.Add(ttl)),
-		ID:        uuid.NewString(),
-	}
-	return jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString(secret)
+	return HMACSigner(secret).Issue(creatorID, now, ttl)
 }

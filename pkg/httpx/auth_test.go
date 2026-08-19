@@ -30,7 +30,7 @@ func signToken(t *testing.T, secret []byte, sub string, expiresIn time.Duration)
 
 func authProbe() (http.Handler, *string) {
 	var got string
-	h := Auth(testSecret)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	h := Auth(HMACVerifier(testSecret))(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		got = CreatorIDFrom(r.Context())
 		w.WriteHeader(http.StatusNoContent)
 	}))

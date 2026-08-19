@@ -16,6 +16,8 @@ import (
 	"dabet/services/credits-service/internal/ledger"
 	"dabet/services/credits-service/internal/metrics"
 	"dabet/services/credits-service/internal/stripe"
+
+	"dabet/pkg/httpx"
 )
 
 var (
@@ -38,7 +40,7 @@ func newEnv(t *testing.T, pi stripe.PaymentIntents) *env {
 	h := NewHandler(mem, pi, met, webhookSecret, 1, slog.New(slog.DiscardHandler))
 	h.Now = func() time.Time { return testNow }
 	mux := http.NewServeMux()
-	h.Routes(mux, jwtSecret)
+	h.Routes(mux, httpx.HMACVerifier(jwtSecret))
 	return &env{h: h, mem: mem, mux: mux, met: met}
 }
 

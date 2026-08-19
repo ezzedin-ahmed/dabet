@@ -1,0 +1,145 @@
+# Tracing overlay for the local Dabet stack (docs §4.5, "OpenTelemetry
+# traces").
+#
+# Tracing is OFF in the base stack: no service sets an OTLP endpoint, so
+# every one of them installs the no-op tracer provider and exports
+# nothing. This file is what turns it on, and it is the only thing that
+# needs to change to do so — the services themselves are unmodified.
+#
+#   docker compose \
+#     -f deploy/compose/docker-compose.yml \
+#     -f deploy/compose/fragments/observability.yml \
+#     up -d
+#
+# Then open http://localhost:16686, pick a service, and one chat message's
+# whole journey is one trace:
+#
+#   provider-adapter  adapter.ingest -> messages.v1 send
+#   moderation-service  messages.v1 process -> moderation.cascade
+#                         -> GetPolicy (gRPC, policy-service)
+#                         -> POST /v1/embed (mockembed)
+#                         -> POST /v1/chat/completions (mockllm)
+#                         -> flagged.v1 send / deletions.v1 send
+#   provider-adapter  deletions.v1 process -> the platform delete call
+#   insights-service  messages.v1 / flagged.v1 process
+#
+# Sampling defaults to 1 % (parent-based), which is right for the N6
+# 500 000 msg/s target and useless for a local demo, so this file raises
+# it to 100 %. Do not copy that number to anything resembling production.
+#
+# Validate:
+#   docker compose -f deploy/compose/docker-compose.yml \
+#                  -f deploy/compose/fragments/observability.yml config
+
+# The variables every Dabet service needs to start exporting. OTEL_* are
+# the OpenTelemetry standard names, read by pkg/tracing and by the OTLP
+# exporter itself.
+x-otel-env: &otel-env
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+  OTEL_EXPORTER_OTLP_PROTOCOL: grpc
+  # parentbased_traceidratio is also the code default; stated here so the
+  # local override of the ratio is not mistaken for the shipped default.
+  OTEL_TRACES_SAMPLER: parentbased_traceidratio
+  OTEL_TRACES_SAMPLER_ARG: "${OTEL_TRACES_SAMPLER_ARG:-1.0}"
+  OTEL_RESOURCE_ATTRIBUTES: deployment.environment=local
+
+services:
+  # Jaeger all-in-one: OTLP in, UI out. Storage is in-memory, so traces
+  # vanish on restart — which is exactly what you want locally.
+  jaeger:
+    image: jaegertracing/all-in-one:1.62.0
+    restart: unless-stopped
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+      # Bound the in-memory store so a long soak does not eat the host.
+      MEMORY_MAX_TRACES: "50000"
+    ports:
+      - "16686:16686" # UI
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:14269/"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
+  # The collector the services actually talk to. Having it here rather
+  # than pointing services straight at Jaeger is deliberate: swapping the
+  # backend then means editing otel/collector.yaml, not redeploying nine
+  # services.
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.115.1
+    restart: unless-stopped
+    command: ["--config=/etc/otelcol/collector.yaml"]
+    volumes:
+      # Relative to the COMPOSE PROJECT DIRECTORY, which is the directory
+      # of the first -f file — deploy/compose. Keep docker-compose.yml
+      # first on the command line (or merge this file into it) or the
+      # bind mount lands somewhere else and Docker helpfully creates an
+      # empty directory there.
+      - ./otel/collector.yaml:/etc/otelcol/collector.yaml:ro
+    ports:
+      - "4317:4317" # OTLP gRPC, for tracing a service run on the host
+      - "4318:4318" # OTLP HTTP
+      - "8888:8888" # the collector's own Prometheus metrics
+      - "13133:13133" # collector health_check extension
+    depends_on:
+      jaeger:
+        condition: service_healthy
+
+  # --- the nine Dabet services: env only, nothing else changes ---------
+
+  user-service:
+    environment: *otel-env
+    depends_on:
+      otel-collector:
+        condition: service_started
+
+  credits-service:
+    environment: *otel-env
+    depends_on:
+      otel-collector:
+        condition: service_started
+
+  policy-service:
+    environment: *otel-env
+    depends_on:
+      otel-collector:
+        condition: service_started
+
+  provider-adapter:
+    environment: *otel-env
+    depends_on:
+      otel-collector:
+        condition: service_started
+
+  moderation-service:
+    environment: *otel-env
+    depends_on:
+      otel-collector:
+        condition: service_started
+
+  review-service:
+    environment: *otel-env
+    depends_on:
+      otel-collector:
+        condition: service_started
+
+  insights-service:
+    environment: *otel-env
+    depends_on:
+      otel-collector:
+        condition: service_started
+
+  clustering-service:
+    profiles: ["clustering"]
+    environment: *otel-env
+    depends_on:
+      otel-collector:
+        condition: service_started
+
+  clusters-job:
+    profiles: ["clustering"]
+    environment: *otel-env
+    depends_on:
+      otel-collector:
+        condition: service_started
