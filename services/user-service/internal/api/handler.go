@@ -6,6 +6,7 @@
 package api
 
 import (
+	"context"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -27,6 +28,17 @@ import (
 // redeemable.
 const VerificationTokenTTL = 24 * time.Hour
 
+// Mailer delivers the §5.4 verification email. It is the seam between
+// the auth handlers and internal/mail; implementations must return
+// promptly and must never make the outcome of a request depend on the
+// outcome of a delivery (§4.7). internal/mail satisfies it by queueing.
+//
+// A nil Mailer means no email at all, which is what unit tests that
+// construct a Handler directly get.
+type Mailer interface {
+	SendVerification(ctx context.Context, email, fullname, token string) error
+}
+
 // Handler serves the /v1/auth endpoints and /v1/me.
 type Handler struct {
 	Repo repo.Repository
@@ -34,6 +46,9 @@ type Handler struct {
 	// default, RS256 when the deployment configures a private key.
 	Keys   *auth.Keyring
 	Logger *slog.Logger
+	// Mail sends the verification email of §5.4. Optional: nil disables
+	// outbound email entirely.
+	Mail Mailer
 	// Logins is auth_logins_total{outcome} (§5.9).
 	Logins *prometheus.CounterVec
 
@@ -48,9 +63,9 @@ type Handler struct {
 	AppRedirectURL string
 
 	// EchoVerificationToken puts the raw email-verification token in the
-	// registration response. There is no mailer in v1, so without it the
-	// token is only reachable through a debug log line and an automated
-	// end-to-end run cannot verify an address at all.
+	// registration response, so an automated end-to-end run can verify an
+	// address without reading a mailbox. It predates the mailer and stays
+	// independent of it: test/e2e runs with no SMTP server configured.
 	//
 	// DEVIATION (documented, test-only): this hands an unauthenticated
 	// caller a token that grants email verification, so it is gated on
@@ -165,13 +180,18 @@ func (h *Handler) handleRegister(w http.ResponseWriter, r *http.Request) {
 		h.internal(w, r, "store verification token", err)
 		return
 	}
-	// DEVIATION (documented): no mailer exists in v1, so the debug log is
-	// the dev-mode delivery channel for the verification token. This is a
-	// deliberate, narrow exception to P4's no-token-logging rule; the
-	// default logger level is info, so it is silent unless debug logging
-	// is explicitly enabled.
-	h.Logger.Debug("email verification token issued (dev-mode delivery channel)",
-		"creator_id", creatorID, "verification_token", raw)
+	// §4.7: the email is queued, never awaited. A dead SMTP server, a full
+	// queue, or a template failure must not turn a successful
+	// registration into a 5xx — the creator's account exists either way,
+	// and the token is still redeemable. With no MAIL_SMTP_ADDR the
+	// mailer keeps v1's debug-log delivery channel instead of sending.
+	if h.Mail != nil {
+		if err := h.Mail.SendVerification(r.Context(), req.Email, req.Fullname, raw); err != nil {
+			h.Logger.Warn("verification email not queued",
+				"creator_id", creatorID, "error", err.Error(),
+				"request_id", httpx.RequestIDFrom(r.Context()))
+		}
+	}
 
 	body := map[string]any{"creator_id": creatorID}
 	if h.EchoVerificationToken {

@@ -65,7 +65,10 @@ func (p *Postgres) UpsertConnection(ctx context.Context, c *Connection) (string,
 	err = tx.QueryRow(ctx, `
 		UPDATE identity.connections
 		SET display_name = $4, access_token = $5, refresh_token = $6,
-		    expires_at = $7, scopes = $8, status = 'active', updated_at = now()
+		    expires_at = $7, scopes = $8, status = 'active', updated_at = now(),
+		    -- Reconnecting clears the A6 notification stamp, so a later
+		    -- expiry of the same row is notified again.
+		    expired_notified_at = NULL
 		WHERE id = (
 			SELECT id FROM identity.connections
 			WHERE creator_id = $1 AND platform = $2 AND provider_user_id = $3
@@ -186,4 +189,51 @@ func (p *Postgres) ActiveConnectionCounts(ctx context.Context) (map[string]int, 
 		return nil, fmt.Errorf("active connection counts: %w", err)
 	}
 	return out, nil
+}
+
+// PendingExpiryNotifications returns the A6 backlog: connections the
+// adapter moved to 'expired' whose creator has not been emailed yet,
+// joined to the address the mail goes to. Oldest first, so a burst is
+// worked through in the order the connections broke.
+func (p *Postgres) PendingExpiryNotifications(ctx context.Context, limit int) ([]ExpiredConnection, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	rows, err := p.pool.Query(ctx, `
+		SELECT c.id, c.creator_id, cr.email, cr.fullname, c.platform::text, c.display_name
+		FROM identity.connections c
+		JOIN identity.creators cr ON cr.id = c.creator_id
+		WHERE c.status = 'expired' AND c.expired_notified_at IS NULL
+		ORDER BY c.updated_at
+		LIMIT $1`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("pending expiry notifications: %w", err)
+	}
+	defer rows.Close()
+
+	var out []ExpiredConnection
+	for rows.Next() {
+		var e ExpiredConnection
+		if err := rows.Scan(&e.ID, &e.CreatorID, &e.Email, &e.Fullname, &e.Platform, &e.DisplayName); err != nil {
+			return nil, fmt.Errorf("pending expiry notifications: %w", err)
+		}
+		out = append(out, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("pending expiry notifications: %w", err)
+	}
+	return out, nil
+}
+
+// MarkExpiryNotified stamps the row. The IS NULL guard makes concurrent
+// replicas idempotent: whoever stamps first owns the send.
+func (p *Postgres) MarkExpiryNotified(ctx context.Context, id string, now time.Time) error {
+	_, err := p.pool.Exec(ctx, `
+		UPDATE identity.connections
+		SET expired_notified_at = $2
+		WHERE id = $1 AND expired_notified_at IS NULL`, id, now)
+	if err != nil {
+		return fmt.Errorf("mark expiry notified: %w", err)
+	}
+	return nil
 }

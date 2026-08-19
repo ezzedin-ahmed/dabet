@@ -1,0 +1,90 @@
+# Mail overlay for the local Dabet stack (docs §5.4, §5.5/A6, §5.8/A8).
+#
+# Email is OFF in the base stack: neither user-service nor credits-service
+# sets MAIL_SMTP_ADDR, so both keep the log-only behaviour and test/e2e's
+# DEV_EXPOSE_VERIFICATION_TOKEN path is the only way a token travels.
+# This file is what turns delivery on, and it is the only thing that
+# needs to change to do so — the services themselves are unmodified.
+#
+#   docker compose \
+#     -f deploy/compose/docker-compose.yml \
+#     -f deploy/compose/fragments/mail.yml \
+#     up -d
+#
+# Then open http://localhost:8025 and watch mail arrive:
+#
+#   POST /v1/auth/register            -> "Confirm your Dabet email address"
+#   a platform revokes a connection   -> "Dabet lost access to your
+#                                         connected channel" (within one
+#                                         CONNECTION_EXPIRY_SWEEP_INTERVAL
+#                                         of provider-adapter marking the
+#                                         connection 'expired')
+#   balance crosses 20% of last topup -> "Your Dabet credits are running low"
+#   balance crosses zero              -> "Your Dabet credits have run out"
+#
+# Mailpit accepts anything, stores it in memory, and never relays, so no
+# message can escape the machine.
+#
+# Validate:
+#   docker compose -f deploy/compose/docker-compose.yml \
+#                  -f deploy/compose/fragments/mail.yml config
+
+# What the two mailer-bearing services need to start sending. MAIL_TLS is
+# none because Mailpit is a local plaintext sink on a private network;
+# any real deployment sets starttls or tls, and the mailer refuses to
+# send credentials without one of them.
+x-mail-env: &mail-env
+  MAIL_SMTP_ADDR: mailpit:1025
+  MAIL_FROM: ${MAIL_FROM:-Dabet <no-reply@dabet.local>}
+  MAIL_TLS: none
+  # Everything below is optional; the defaults are the documented ones
+  # (§4.4) and are stated here so the tunables are discoverable.
+  MAIL_TIMEOUT: ${MAIL_TIMEOUT:-10s}
+  MAIL_QUEUE_SIZE: ${MAIL_QUEUE_SIZE:-256}
+  MAIL_WORKERS: ${MAIL_WORKERS:-2}
+  MAIL_MAX_ATTEMPTS: ${MAIL_MAX_ATTEMPTS:-3}
+  MAIL_RETRY_BASE: ${MAIL_RETRY_BASE:-1s}
+
+services:
+  # SMTP sink with a web UI. In-memory storage, so mail vanishes on
+  # restart — which is exactly what you want locally.
+  mailpit:
+    image: axllent/mailpit:v1.21
+    restart: unless-stopped
+    environment:
+      MP_MAX_MESSAGES: "500"
+      MP_SMTP_AUTH_ACCEPT_ANY: "1"
+      MP_SMTP_AUTH_ALLOW_INSECURE: "1"
+    ports:
+      - "8025:8025" # web UI
+      - "1025:1025" # SMTP, for a service run on the host
+    healthcheck:
+      test: ["CMD", "/mailpit", "readyz"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  # --- the two services that send mail: env only, nothing else changes --
+
+  user-service:
+    environment:
+      <<: *mail-env
+      # Where the verification link points. Followed by a browser on the
+      # host, so it is host-addressed like the OAuth URLs in the base file.
+      APP_VERIFY_URL: ${APP_VERIFY_URL:-http://localhost:3000/verify}
+      # A6: how often user-service looks for connections provider-adapter
+      # has moved to 'expired' and not yet notified. A minute in the
+      # default; shortened here so a local demo does not have to wait.
+      CONNECTION_EXPIRY_SWEEP_INTERVAL: ${CONNECTION_EXPIRY_SWEEP_INTERVAL:-15s}
+    depends_on:
+      mailpit:
+        condition: service_healthy
+
+  credits-service:
+    environment:
+      <<: *mail-env
+      APP_BILLING_URL: ${APP_BILLING_URL:-http://localhost:3000/billing}
+    depends_on:
+      mailpit:
+        condition: service_healthy

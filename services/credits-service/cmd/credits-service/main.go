@@ -22,6 +22,8 @@ import (
 	"dabet/pkg/service"
 
 	"dabet/services/credits-service/internal/api"
+	"dabet/services/credits-service/internal/identity"
+	"dabet/services/credits-service/internal/mail"
 	"dabet/services/credits-service/internal/metrics"
 	"dabet/services/credits-service/internal/migrate"
 	"dabet/services/credits-service/internal/notify"
@@ -97,7 +99,33 @@ func run(ctx context.Context, svc *service.Service) error {
 
 	met := metrics.New(svc.Registry)
 	ledgerRepo := repo.NewPostgres(pool)
+
+	// A8 balance notifications (§5.8). Without MAIL_SMTP_ADDR this is v1
+	// behaviour exactly: the notification goes to the log. With a mail
+	// server configured, the same transitions render the two balance
+	// templates and are queued for asynchronous delivery — never on the
+	// ledger's goroutine, never able to fail a webhook or a usage batch
+	// (§4.7).
+	mailCfg, err := mail.ConfigFromEnv(os.Getenv)
+	if err != nil {
+		return err
+	}
+	mailer, err := mail.New(mailCfg, identity.NewPostgres(pool), svc.Registry, log)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := mailer.Close(shutdownCtx); err != nil {
+			log.Warn("mail queue did not drain before shutdown", "error", err.Error())
+		}
+	}()
 	notifier := notify.New(ledgerRepo, notify.LogMailer{Logger: log}, log)
+	if mailCfg.Enabled() {
+		notifier = notify.NewTemplated(ledgerRepo, mailer, log)
+	}
+	log.Info("outbound email configured", "enabled", mailCfg.Enabled(), "tls", string(mailCfg.TLS))
 
 	stripeClient := stripe.NewClient(
 		config.GetDefault(envStripeAPIBase, "https://api.stripe.com"), stripeKey)
