@@ -2,6 +2,10 @@
 /bin/
 *.test
 
+# Workspace checksum file: derived from the modules' own go.sum files, and
+# regenerated on demand. Committing it only creates merge conflicts.
+/go.work.sum
+
 # built service binaries at module roots
 services/*/*-service
 services/*/provider-adapter

@@ -11,7 +11,10 @@ require (
 	google.golang.org/protobuf v1.36.12
 )
 
+require github.com/oklog/ulid/v2 v2.1.2 // indirect
+
 require (
+	dabet/pkg v0.0.0
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/jackc/pgpassfile v1.0.0 // indirect
@@ -28,3 +31,5 @@ require (
 	golang.org/x/text v0.40.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260526163538-3dc84a4a5aaa // indirect
 )
+
+replace dabet/pkg => ../../pkg
