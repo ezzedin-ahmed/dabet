@@ -45,6 +45,17 @@ type Handler struct {
 	// carries no redirect_after (APP_REDIRECT_URL).
 	AppRedirectURL string
 
+	// EchoVerificationToken puts the raw email-verification token in the
+	// registration response. There is no mailer in v1, so without it the
+	// token is only reachable through a debug log line and an automated
+	// end-to-end run cannot verify an address at all.
+	//
+	// DEVIATION (documented, test-only): this hands an unauthenticated
+	// caller a token that grants email verification, so it is gated on
+	// DEV_EXPOSE_VERIFICATION_TOKEN and defaults OFF. It must never be
+	// set outside local Compose.
+	EchoVerificationToken bool
+
 	// Now, NewToken, and NewVerifier are injection points for tests.
 	Now         func() time.Time
 	NewToken    func() (raw, hash string, err error)
@@ -159,7 +170,12 @@ func (h *Handler) handleRegister(w http.ResponseWriter, r *http.Request) {
 	h.Logger.Debug("email verification token issued (dev-mode delivery channel)",
 		"creator_id", creatorID, "verification_token", raw)
 
-	httpx.WriteJSON(w, http.StatusCreated, map[string]any{"creator_id": creatorID})
+	body := map[string]any{"creator_id": creatorID}
+	if h.EchoVerificationToken {
+		// Test-only, DEV_EXPOSE_VERIFICATION_TOKEN — see the field comment.
+		body["verification_token"] = raw
+	}
+	httpx.WriteJSON(w, http.StatusCreated, body)
 }
 
 func validateRegister(req registerRequest) (field, msg string) {

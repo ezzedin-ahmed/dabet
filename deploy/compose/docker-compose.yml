@@ -1,8 +1,48 @@
-# Dabet local infrastructure (docs §3): single-instance everything, plus
-# deterministic mock LLM and embedding servers. The 9 dabet services are
-# NOT here yet — a later phase wires them; run them on the host against
-# these ports (see .env.example).
+# Dabet local stack (docs §3): single-instance infrastructure, the
+# deterministic mocks that stand in for the third parties (LLM, embedder,
+# OAuth provider, Stripe), and all nine dabet services.
+#
+# Two profiles:
+#
+#   (default)     everything except Milvus — the whole moderation path,
+#                 credits, review, and insights' embed → parquet → MinIO
+#                 leg. This is what `make up` and `make e2e` use.
+#   clustering    adds etcd + Milvus + clustering-service + clusters-job,
+#                 i.e. live centroid assignment and batch topic discovery
+#                 (§8.5, §8.6). Milvus wants several GB on its own, so it
+#                 is opt-in: `make up-full`.
+#
+# Every service reads the §4.4 canonical variable names. Inside this
+# network they point at compose service names; the OAuth *authorize* URL
+# and redirect URI are the exceptions — a browser (or the e2e test)
+# follows those from the host, so they must be host-reachable.
 name: dabet
+
+x-service-common: &service-common
+  restart: unless-stopped
+  healthcheck:
+    test: ["CMD-SHELL", "wget -qO- http://localhost:8080/healthz >/dev/null 2>&1"]
+    interval: 5s
+    timeout: 3s
+    retries: 20
+    start_period: 10s
+
+# The shared infrastructure coordinates every service reads (§4.4).
+x-infra-env: &infra-env
+  KAFKA_BROKERS: kafka:29092
+  REDIS_ADDR: redis:6379
+  POSTGRES_DSN: postgres://${POSTGRES_USER:-dabet}:${POSTGRES_PASSWORD:-dabet}@postgres:5432/${POSTGRES_DB:-dabet}?sslmode=disable
+  MEMCACHED_ADDRS: memcached:11211
+  VLLM_ENDPOINT: http://mockllm:8089
+  EMBEDDING_ENDPOINT: http://mockembed:8091
+  MILVUS_ADDR: milvus:19530
+  # Native protocol port; 9002 in .env.example is only the host mapping.
+  CLICKHOUSE_DSN: clickhouse://${CLICKHOUSE_USER:-dabet}:${CLICKHOUSE_PASSWORD:-dabet}@clickhouse:9000/${CLICKHOUSE_DB:-dabet}
+  S3_ENDPOINT: http://minio:9000
+  S3_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+  S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+  S3_BUCKET: embeddings
+  JWT_SECRET: ${JWT_SECRET:-dev-secret-change-me}
 
 services:
   postgres:
@@ -91,7 +131,13 @@ services:
   clickhouse:
     image: clickhouse/clickhouse-server:24.8
     environment:
-      CLICKHOUSE_DB: dabet
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB:-dabet}
+      # Both must be set: the image's entrypoint disables network access
+      # for `default` when neither is present, and /ping needs no auth, so
+      # the container looks healthy while every client is rejected with
+      # AUTHENTICATION_FAILED.
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-dabet}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-dabet}
     ports:
       - "8123:8123"   # HTTP
       - "9002:9000"   # native (9000 on the host is MinIO)
@@ -141,6 +187,7 @@ services:
 
   etcd:
     image: quay.io/coreos/etcd:v3.5.16
+    profiles: ["clustering"]
     environment:
       ETCD_AUTO_COMPACTION_MODE: revision
       ETCD_AUTO_COMPACTION_RETENTION: "1000"
@@ -161,6 +208,7 @@ services:
 
   milvus:
     image: milvusdb/milvus:v2.4.15
+    profiles: ["clustering"]
     command: ["milvus", "run", "standalone"]
     environment:
       ETCD_ENDPOINTS: etcd:2379
@@ -209,6 +257,257 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+
+  # OAuth 2.0 authorization-code + PKCE stub standing in for YouTube /
+  # Twitch / Discord, so the `mock` platform of §5.5 can be connected end
+  # to end. PKCE is verified for real.
+  mockoauth:
+    build:
+      context: ../../tools
+      dockerfile: mockoauth/Dockerfile
+    ports:
+      - "9099:9099"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:9099/healthz >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Stripe stub: creates PaymentIntents and, on /internal/confirm, delivers
+  # the signed payment_intent.succeeded webhook that actually grants the
+  # credits (§5.7). The signature is real HMAC-SHA256, so credits-service's
+  # verifier is exercised rather than bypassed.
+  mockstripe:
+    build:
+      context: ../../tools
+      dockerfile: mockstripe/Dockerfile
+    environment:
+      STRIPE_WEBHOOK_URL: http://credits-service:8080/v1/webhooks/stripe
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-whsec_local_dev}
+    ports:
+      - "9098:9098"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:9098/healthz >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ---------------------------------------------------------------------
+  # Area A — identity, connections, credits (§5)
+  # ---------------------------------------------------------------------
+
+  user-service:
+    <<: *service-common
+    build:
+      context: ../..
+      dockerfile: services/user-service/Dockerfile
+    environment:
+      <<: *infra-env
+      OAUTH_MOCK_ENABLED: "1"
+      # Test-only: no mailer exists in v1, so registration echoes the raw
+      # verification token. Local Compose only — see the README.
+      DEV_EXPOSE_VERIFICATION_TOKEN: "1"
+      # The authorize URL and the redirect URI are followed by a browser
+      # (or the e2e test) on the host, so they are host-addressed; the
+      # token/userinfo/revoke calls are made by this container, so they
+      # use the compose service name.
+      OAUTH_MOCK_AUTH_URL: http://localhost:9099/oauth/authorize
+      OAUTH_MOCK_TOKEN_URL: http://mockoauth:9099/oauth/token
+      OAUTH_MOCK_USERINFO_URL: http://mockoauth:9099/oauth/userinfo
+      OAUTH_MOCK_REVOKE_URL: http://mockoauth:9099/oauth/revoke
+      OAUTH_MOCK_CLIENT_ID: dabet-local
+      OAUTH_MOCK_CLIENT_SECRET: dabet-local-secret
+      OAUTH_MOCK_REDIRECT_URI: http://localhost:8081/v1/connections/callback
+      APP_REDIRECT_URL: http://localhost:3000/connections
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mockoauth:
+        condition: service_healthy
+    ports:
+      - "8081:8080"
+      - "9081:9090"
+
+  credits-service:
+    <<: *service-common
+    build:
+      context: ../..
+      dockerfile: services/credits-service/Dockerfile
+    environment:
+      <<: *infra-env
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-sk_test_local}
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-whsec_local_dev}
+      STRIPE_API_BASE: http://mockstripe:9098
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+      mockstripe:
+        condition: service_healthy
+    ports:
+      - "8082:8080"
+      - "9082:9090"
+
+  # ---------------------------------------------------------------------
+  # Area B — policy (§6)
+  # ---------------------------------------------------------------------
+
+  policy-service:
+    <<: *service-common
+    build:
+      context: ../..
+      dockerfile: services/policy-service/Dockerfile
+    environment:
+      <<: *infra-env
+      GRPC_ADDR: ":7101"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      memcached:
+        condition: service_healthy
+    ports:
+      - "8083:8080"
+      - "9083:9090"
+      - "7101:7101"
+
+  # ---------------------------------------------------------------------
+  # Area C — moderation (§7)
+  # ---------------------------------------------------------------------
+
+  provider-adapter:
+    <<: *service-common
+    build:
+      context: ../..
+      dockerfile: services/provider-adapter/Dockerfile
+    environment:
+      <<: *infra-env
+      OAUTH_MOCK_TOKEN_URL: http://mockoauth:9099/oauth/token
+      OAUTH_MOCK_CLIENT_ID: dabet-local
+      OAUTH_MOCK_CLIENT_SECRET: dabet-local-secret
+      # Pick up a freshly-connected platform quickly so an e2e run does not
+      # wait out the 15s default.
+      ADAPTER_CONNSOURCE_POLL: 3s
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      # identity.connections must exist before the poller reads it.
+      user-service:
+        condition: service_healthy
+    ports:
+      - "8084:8080"
+      - "9084:9090"
+
+  moderation-service:
+    <<: *service-common
+    build:
+      context: ../..
+      dockerfile: services/moderation-service/Dockerfile
+    environment:
+      <<: *infra-env
+      POLICY_ENDPOINT: policy-service:7101
+      CREDITS_ENDPOINT: http://credits-service:8080
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      policy-service:
+        condition: service_healthy
+      credits-service:
+        condition: service_healthy
+      mockllm:
+        condition: service_healthy
+      mockembed:
+        condition: service_healthy
+    ports:
+      - "8085:8080"
+      - "9085:9090"
+
+  review-service:
+    <<: *service-common
+    build:
+      context: ../..
+      dockerfile: services/review-service/Dockerfile
+    environment:
+      <<: *infra-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    ports:
+      - "8086:8080"
+      - "9086:9090"
+
+  # ---------------------------------------------------------------------
+  # Area D — insights (§8)
+  # ---------------------------------------------------------------------
+
+  insights-service:
+    <<: *service-common
+    build:
+      context: ../..
+      dockerfile: services/insights-service/Dockerfile
+    environment:
+      <<: *infra-env
+      # Empty unless the clustering profile is up (`make up-full` exports
+      # it). clustering-service is opt-in, and posting embeddings at a
+      # service that is not deployed would climb
+      # fail_open_total{component="clustering"} forever, which would make
+      # the §4.5 alert worthless.
+      CLUSTERING_ENDPOINT: ${CLUSTERING_ENDPOINT-}
+      # Roll parquet to MinIO on a short clock so a smoke test does not
+      # wait a full minute for the first object (§8.4).
+      INSIGHTS_S3_ROLL_SECONDS: ${INSIGHTS_S3_ROLL_SECONDS:-10}
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      minio-init:
+        condition: service_completed_successfully
+      mockembed:
+        condition: service_healthy
+    ports:
+      - "8087:8080"
+      - "9087:9090"
+
+  clustering-service:
+    <<: *service-common
+    profiles: ["clustering"]
+    build:
+      context: ../..
+      dockerfile: services/clustering-service/Dockerfile
+    environment:
+      <<: *infra-env
+    depends_on:
+      milvus:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    ports:
+      - "8088:8080"
+      - "9088:9090"
+
+  clusters-job:
+    <<: *service-common
+    profiles: ["clustering"]
+    build:
+      context: ../..
+      dockerfile: services/clusters-job/Dockerfile
+    environment:
+      <<: *infra-env
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      minio-init:
+        condition: service_completed_successfully
+      milvus:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    ports:
+      - "8090:8080"
+      - "9089:9090"
 
 volumes:
   postgres-data:

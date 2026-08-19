@@ -17,15 +17,27 @@ import (
 const PlatformName = "mock"
 
 // DeletionRecord is one recorded Delete call, exposed on /mock/deletions.
+//
+// NativeMessageID is the platform-native id the message was injected
+// with, recovered through the Resolver exactly as the real drivers
+// recover it before calling a provider API. It is what lets a caller
+// correlate a deletion back to its injection: message_id is opaque and
+// must not be parsed outside this service (P5), and the injection
+// endpoint only ever saw the native id.
 type DeletionRecord struct {
-	ConnectionID string    `json:"connection_id"`
-	ContentID    string    `json:"content_id"`
-	MessageID    string    `json:"message_id"`
-	DeletedAt    time.Time `json:"deleted_at"`
+	ConnectionID    string    `json:"connection_id"`
+	ContentID       string    `json:"content_id"`
+	MessageID       string    `json:"message_id"`
+	NativeMessageID string    `json:"native_message_id,omitempty"`
+	DeletedAt       time.Time `json:"deleted_at"`
 }
 
 // Driver implements driver.Driver for the mock platform.
 type Driver struct {
+	// Resolver maps opaque message ids back to native ones, like every
+	// real driver. Optional: nil leaves NativeMessageID empty.
+	Resolver driver.Resolver
+
 	mu        sync.Mutex
 	queues    map[string]chan driver.Message // per connection ID
 	deletions []DeletionRecord
@@ -89,13 +101,18 @@ func (d *Driver) Watch(ctx context.Context, conn driver.Connection, out chan<- d
 
 // Delete implements driver.Driver: it records the call and succeeds.
 func (d *Driver) Delete(_ context.Context, conn driver.Connection, contentID, messageID string) error {
+	var native string
+	if d.Resolver != nil {
+		native, _ = d.Resolver.NativeMessageID(messageID)
+	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.deletions = append(d.deletions, DeletionRecord{
-		ConnectionID: conn.ID,
-		ContentID:    contentID,
-		MessageID:    messageID,
-		DeletedAt:    d.now().UTC(),
+		ConnectionID:    conn.ID,
+		ContentID:       contentID,
+		MessageID:       messageID,
+		NativeMessageID: native,
+		DeletedAt:       d.now().UTC(),
 	})
 	return nil
 }
