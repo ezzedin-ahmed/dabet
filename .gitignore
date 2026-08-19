@@ -1,0 +1,9 @@
+/deploy/compose/.env
+/bin/
+*.test
+
+# built service binaries at module roots
+services/*/*-service
+services/*/provider-adapter
+services/*/clusters-job
+/.claude/

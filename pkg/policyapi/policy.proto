@@ -1,0 +1,67 @@
+// GetPolicy internal API (docs §6.7). gRPC because it sits on the hot
+// path: moderation-service calls it on every local-cache miss. A negative
+// result (found=false) is a valid, cacheable answer.
+syntax = "proto3";
+
+package dabet.policy.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "dabet/pkg/policyapi";
+
+service PolicyService {
+  // GetPolicy resolves the effective policy for (creator, platform,
+  // content): first match of content > platform > creator scope, whole
+  // document, no field merge (§6.2). found=false means no policy at any
+  // scope — the message is not moderated.
+  rpc GetPolicy(GetPolicyRequest) returns (GetPolicyResponse);
+}
+
+message GetPolicyRequest {
+  string creator_id = 1;
+  string platform = 2;
+  string content_id = 3;
+}
+
+message GetPolicyResponse {
+  bool found = 1;
+  // Set only when found is true.
+  ResolvedPolicy policy = 2;
+}
+
+enum SpamMode {
+  SPAM_MODE_UNSPECIFIED = 0;
+  SPAM_MODE_NONE = 1;
+  SPAM_MODE_IDENTICAL = 2;
+  SPAM_MODE_SEMANTIC = 3;
+}
+
+enum RestrictedContentAction {
+  RESTRICTED_CONTENT_ACTION_UNSPECIFIED = 0;
+  RESTRICTED_CONTENT_ACTION_AUTO = 1;
+  RESTRICTED_CONTENT_ACTION_REVIEW = 2;
+}
+
+// One restricted_content rubric entry (§6.3): title and description are
+// what the LLM judges against; examples are few-shot anchors.
+message RestrictedContentEntry {
+  string title = 1;
+  string description = 2;
+  repeated string examples = 3;
+}
+
+message ResolvedPolicy {
+  // policy_id and resolved_at ride along so flagged events can record
+  // which policy produced the verdict.
+  string policy_id = 1;
+  google.protobuf.Timestamp resolved_at = 2;
+
+  // Rate limit: both set or both absent (absent = no rate limiting).
+  optional int32 rate_limit_messages = 3;
+  optional int32 rate_limit_seconds = 4;
+
+  SpamMode spam = 5;
+  repeated string restricted_words = 6;
+  repeated RestrictedContentEntry restricted_content = 7;
+  RestrictedContentAction restricted_content_action = 8;
+}
