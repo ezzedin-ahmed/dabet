@@ -1,0 +1,15 @@
+go 1.26
+
+use (
+	./pkg
+	./services/clustering-service
+	./services/clusters-job
+	./services/credits-service
+	./services/insights-service
+	./services/moderation-service
+	./services/policy-service
+	./services/provider-adapter
+	./services/review-service
+	./services/user-service
+	./tools
+)
