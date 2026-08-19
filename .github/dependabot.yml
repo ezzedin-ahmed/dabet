@@ -1,0 +1,37 @@
+version: 2
+
+updates:
+  # One gomod ecosystem entry covering every go.work member. `directories`
+  # takes globs, so services/* keeps working when a tenth service lands.
+  # `dabet/pkg` is a local `replace`, so Dependabot never touches it.
+  - package-ecosystem: gomod
+    directories:
+      - /pkg
+      - /services/*
+      - /test/e2e
+      - /tools
+    schedule:
+      interval: weekly
+      day: monday
+      time: "05:00"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: chore
+      include: scope
+    groups:
+      # The nine services share most of their dependency set; grouping keeps
+      # a single patch bump from opening nine near-identical PRs.
+      go-minor-and-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "05:00"
+    commit-message:
+      prefix: ci
+    groups:
+      actions:
+        patterns: ["*"]
