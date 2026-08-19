@@ -37,14 +37,23 @@ type Budget struct {
 	daily  float64
 	tokens float64
 	last   time.Time
+
+	// queue serialises waiting reservations. Without it a cheap, frequent
+	// caller starves an expensive, patient one: discovery asking for 1 unit
+	// every minute would take every unit the bucket accrued while the
+	// poller waited for its 5, and chat ingestion would stop entirely while
+	// the budget looked healthy. Channel receivers are served in arrival
+	// order, so the queue is FIFO.
+	queue chan struct{}
 }
 
 // New returns a Budget of daily units, starting full. daily <= 0 means an
 // unlimited budget (Pace returns 0 and Reserve never blocks), which is what
 // tests and self-hosted quota-exempt deployments want.
 func New(daily int) *Budget {
-	b := &Budget{Now: time.Now, daily: float64(daily)}
+	b := &Budget{Now: time.Now, daily: float64(daily), queue: make(chan struct{}, 1)}
 	b.tokens = b.daily
+	b.queue <- struct{}{}
 	return b
 }
 
@@ -102,10 +111,20 @@ func (b *Budget) Pace(cost, streams int) time.Duration {
 // returning ctx.Err() if the context is cancelled first. A cost larger than
 // the whole daily allowance is spent immediately rather than deadlocking;
 // the caller has already lost that argument.
+//
+// Reservations are served in arrival order, so a caller asking for a lot
+// makes progress even while cheaper callers keep arriving.
 func (b *Budget) Reserve(ctx context.Context, cost int) error {
 	if b.unlimited() || cost <= 0 {
 		return ctx.Err()
 	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-b.queue:
+	}
+	defer func() { b.queue <- struct{}{} }()
+
 	for {
 		wait := b.reserveOrWait(cost)
 		if wait <= 0 {

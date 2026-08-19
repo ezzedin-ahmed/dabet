@@ -9,6 +9,7 @@ require (
 	github.com/prometheus/client_golang v1.24.1
 	github.com/twmb/franz-go v1.21.6
 	go.opentelemetry.io/otel/trace v1.45.0
+	go.uber.org/goleak v1.3.0
 )
 
 require (
