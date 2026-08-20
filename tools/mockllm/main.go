@@ -2,6 +2,10 @@
 // local development. It is deterministic: within the prompt's numbered
 // "Messages:" list (docs §7.9), any message containing the literal string
 // "FLAGME" violates rule 1; everything else violates nothing.
+//
+// It also answers the other prompt the fleet serves — naming a cluster for
+// clusters-job (§8.6), recognised by a "Sample messages:" line and answered
+// with {"label","description"}. See label.go.
 package main
 
 import (
@@ -89,7 +93,15 @@ func completions(w http.ResponseWriter, r *http.Request) {
 		prompt.WriteString(m.Content)
 		prompt.WriteString("\n")
 	}
-	content, _ := json.Marshal(verdictBody{Results: classify(prompt.String())})
+	// Two prompt kinds share this endpoint: the §7.9 moderation verdict and
+	// the §8.6 cluster label. They are told apart by the prompt itself, so
+	// neither caller needs configuring.
+	var content []byte
+	if isLabelRequest(prompt.String()) {
+		content, _ = json.Marshal(label(prompt.String()))
+	} else {
+		content, _ = json.Marshal(verdictBody{Results: classify(prompt.String())})
+	}
 
 	resp := map[string]any{
 		"id":      "chatcmpl-mock",
