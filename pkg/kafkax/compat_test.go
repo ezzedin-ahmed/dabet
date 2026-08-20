@@ -114,6 +114,10 @@ func TestDefaultsAreDocumented(t *testing.T) {
 		want any
 	}{
 		{kafkax.EnvConsumerPartitionConcurrency, cfg.PartitionConcurrency, 64},
+		// 1 is the compatibility contract, not a tuning choice: per-key
+		// concurrency must stay off until an operator opts in.
+		{kafkax.EnvConsumerKeyConcurrency, cfg.KeyConcurrency, 1},
+		{kafkax.EnvConsumerKeyQueueDepth, cfg.KeyQueueDepth, 64},
 		{kafkax.EnvConsumerQueueDepth, cfg.QueueDepth, 2},
 		{kafkax.EnvConsumerMaxPollRecords, cfg.MaxPollRecords, 1000},
 		{kafkax.EnvConsumerDrainTimeout, cfg.DrainTimeout, 30 * time.Second},
@@ -134,6 +138,8 @@ func TestDefaultsAreDocumented(t *testing.T) {
 // fallback to the default.
 func TestEnvironmentOverrides(t *testing.T) {
 	t.Setenv(kafkax.EnvConsumerPartitionConcurrency, "8")
+	t.Setenv(kafkax.EnvConsumerKeyConcurrency, "16")
+	t.Setenv(kafkax.EnvConsumerKeyQueueDepth, "12")
 	t.Setenv(kafkax.EnvConsumerQueueDepth, "5")
 	t.Setenv(kafkax.EnvConsumerMaxPollRecords, "250")
 	t.Setenv(kafkax.EnvConsumerDrainTimeout, "3s")
@@ -148,6 +154,9 @@ func TestEnvironmentOverrides(t *testing.T) {
 	}
 	if cfg.PartitionConcurrency != 8 || cfg.QueueDepth != 5 || cfg.MaxPollRecords != 250 {
 		t.Errorf("counts not overridden: %+v", cfg)
+	}
+	if cfg.KeyConcurrency != 16 || cfg.KeyQueueDepth != 12 {
+		t.Errorf("key concurrency not overridden: %+v", cfg)
 	}
 	if cfg.DrainTimeout != 3*time.Second || cfg.CommitInterval != 2*time.Second ||
 		cfg.LagInterval != time.Second || cfg.LagTimeout != 250*time.Millisecond {

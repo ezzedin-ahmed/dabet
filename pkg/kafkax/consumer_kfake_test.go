@@ -65,6 +65,34 @@ func produceTo(t *testing.T, addrs []string, topic string, partition int32, n in
 	}
 }
 
+// produceKeyed writes one record per key to an explicit partition, so a
+// test can decide exactly which per-key worker each offset lands on.
+func produceKeyed(t *testing.T, addrs []string, topic string, partition int32, keys []string) {
+	t.Helper()
+	cl, err := kgo.NewClient(
+		kgo.SeedBrokers(addrs...),
+		kgo.RecordPartitioner(kgo.ManualPartitioner()),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cl.Close()
+	recs := make([]*kgo.Record, len(keys))
+	for i, k := range keys {
+		recs[i] = &kgo.Record{
+			Topic:     topic,
+			Partition: partition,
+			Key:       []byte(k),
+			Value:     []byte(fmt.Sprintf("v%d", i)),
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := cl.ProduceSync(ctx, recs...).FirstErr(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func fetchedOffsets(t *testing.T, addrs []string, group string) kadm.OffsetResponses {
 	t.Helper()
 	cl, err := kgo.NewClient(kgo.SeedBrokers(addrs...))
@@ -438,12 +466,21 @@ func TestConsumerLagGaugeReportsBacklog(t *testing.T) {
 	go func() { runErr <- c.Run(ctx) }()
 
 	waitClosed(t, stalled, 60*time.Second)
+	// Wait for the gauge to settle on the read position rather than
+	// asserting on whichever sample happens to land first: the handler
+	// parks at offset 10, but records 0..9 may still be finishing when the
+	// sampler ticks, and a sample of 195 mid-way there is correct at the
+	// moment it was taken. The claim under test — lag is the high
+	// watermark minus the member's true position, not its fetch position —
+	// is unchanged, and a consumer that never reaches position 10 still
+	// fails here.
+	want := float64(total - 10)
 	waitFor(t, 30*time.Second, func() bool {
 		v, ok := gauge.get(lagKey{topic, 0, group})
-		return ok && v > 0
+		return ok && v == want
 	})
 	v, _ := gauge.get(lagKey{topic, 0, group})
-	if want := float64(total - 10); v != want {
+	if v != want {
 		t.Fatalf("lag = %v, want %v (high watermark %d minus position 10)", v, want, total)
 	}
 
@@ -640,4 +677,258 @@ func TestRebalanceMovesPartitionsWithoutLossOrLeak(t *testing.T) {
 	}
 
 	goleak.VerifyNone(t, leaks...)
+}
+
+// TestConsumerKeyConcurrencyEndToEnd runs the opt-in fan-out against the
+// real wire protocol: every record consumed as many times as it was
+// produced, every key strictly in offset order and never in two handlers
+// at once, and the committed offset the true end of each partition once
+// the backlog drains.
+func TestConsumerKeyConcurrencyEndToEnd(t *testing.T) {
+	const (
+		topic      = "messages.v1"
+		group      = "moderation"
+		partitions = 2
+		nKeys      = 40
+		perKey     = 6
+		perPart    = nKeys * perKey
+		total      = partitions * perPart
+		fanOut     = 8
+	)
+	addrs := newFakeCluster(t, partitions, topic)
+
+	keys := make([]string, perPart)
+	for i := range keys {
+		keys[i] = fmt.Sprintf("hash(sd_%d, ct_%d)", i%nKeys, i%nKeys)
+	}
+	for p := int32(0); p < partitions; p++ {
+		produceKeyed(t, addrs, topic, p, keys)
+	}
+
+	type seenKey struct {
+		topic     string
+		partition int32
+		key       string
+	}
+	var (
+		mu     sync.Mutex
+		seen   = make(map[seenKey][]int64)
+		active = make(map[seenKey]bool)
+		bad    []string
+		got    atomic.Int64
+		done   = make(chan struct{})
+		once   sync.Once
+	)
+
+	c, err := NewConsumer(addrs, group, []string{topic},
+		func(_ context.Context, rec *kgo.Record) error {
+			k := seenKey{rec.Topic, rec.Partition, string(rec.Key)}
+			mu.Lock()
+			if active[k] {
+				bad = append(bad, fmt.Sprintf("key %q of partition %d entered twice at once", k.key, k.partition))
+			}
+			active[k] = true
+			prev := seen[k]
+			if n := len(prev); n > 0 && rec.Offset <= prev[n-1] {
+				bad = append(bad, fmt.Sprintf("key %q of partition %d: offset %d after %d",
+					k.key, k.partition, rec.Offset, prev[n-1]))
+			}
+			seen[k] = append(seen[k], rec.Offset)
+			active[k] = false
+			mu.Unlock()
+			if got.Add(1) == total {
+				once.Do(func() { close(done) })
+			}
+			return nil
+		},
+		WithLogger(discardLogger()),
+		WithLagSampling(0),
+		WithKeyConcurrency(fanOut),
+		WithCommitInterval(MinCommitInterval),
+		WithCommitRecords(25),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runErr := make(chan error, 1)
+	go func() { runErr <- c.Run(ctx) }()
+
+	waitClosed(t, done, 60*time.Second)
+	cancel()
+	select {
+	case err := <-runErr:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("Run returned %v", err)
+		}
+	case <-time.After(60 * time.Second):
+		t.Fatal("Run did not return after the context was cancelled")
+	}
+
+	mu.Lock()
+	for _, b := range bad {
+		t.Error(b)
+	}
+	if n := len(seen); n != partitions*nKeys {
+		t.Errorf("saw %d distinct (partition, key) pairs, want %d", n, partitions*nKeys)
+	}
+	for k, offs := range seen {
+		if len(offs) != perKey {
+			t.Errorf("key %q of partition %d: %d records, want %d", k.key, k.partition, len(offs), perKey)
+		}
+	}
+	mu.Unlock()
+
+	// Everything succeeded, so the low-water mark is the end of the log:
+	// the prefix logic must not have stranded a record.
+	os := fetchedOffsets(t, addrs, group)
+	for p := int32(0); p < partitions; p++ {
+		o, ok := os.Lookup(topic, p)
+		if !ok || o.Err != nil {
+			t.Errorf("partition %d: no committed offset (%v)", p, o.Err)
+			continue
+		}
+		if o.At != perPart {
+			t.Errorf("partition %d: committed offset %d, want %d", p, o.At, perPart)
+		}
+	}
+}
+
+// TestConsumerKeyConcurrencyCommitsTheLowWaterMark is the crash story
+// against a real broker. One key's record fails only after many records
+// above it have already succeeded out of order; the committed offset must
+// still be the failed record, and a fresh member must resume there.
+// Anything higher would be silent data loss.
+func TestConsumerKeyConcurrencyCommitsTheLowWaterMark(t *testing.T) {
+	const (
+		topic  = "messages.v1"
+		group  = "moderation"
+		total  = 60
+		failAt = int64(12)
+		fanOut = 8
+	)
+	addrs := newFakeCluster(t, 1, topic)
+
+	// The failing record owns a worker of its own; nothing else routes
+	// there, so every other record is free to run ahead of it.
+	blocker := keysOnDistinctWorkers(t, fanOut)[2]
+	others := keysAvoidingWorker(t, fanOut, workerFor([]byte(blocker), fanOut), total-1)
+	keys := make([]string, total)
+	oi := 0
+	for i := range keys {
+		if int64(i) == failAt {
+			keys[i] = blocker
+			continue
+		}
+		keys[i] = others[oi]
+		oi++
+	}
+	produceKeyed(t, addrs, topic, 0, keys)
+
+	boom := errors.New("handler exploded")
+	const wantAbove = 20
+	var below, above atomic.Int64
+	enough := make(chan struct{})
+	var once sync.Once
+
+	first, err := NewConsumer(addrs, group, []string{topic},
+		func(_ context.Context, rec *kgo.Record) error {
+			if rec.Offset == failAt {
+				select {
+				case <-enough:
+				case <-time.After(30 * time.Second):
+				}
+				return boom
+			}
+			if rec.Offset < failAt {
+				below.Add(1)
+			} else {
+				above.Add(1)
+			}
+			if below.Load() == failAt && above.Load() >= wantAbove {
+				once.Do(func() { close(enough) })
+			}
+			return nil
+		},
+		WithLogger(discardLogger()),
+		WithLagSampling(0),
+		WithKeyConcurrency(fanOut),
+		WithCommitInterval(MinCommitInterval),
+		WithCommitRecords(5),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	if err := first.Run(ctx); !errors.Is(err, boom) {
+		t.Fatalf("Run returned %v, want %v", err, boom)
+	}
+	first.Close()
+
+	if n := above.Load(); n < wantAbove {
+		t.Fatalf("only %d records above the failure completed: this is not the out-of-order case", n)
+	}
+
+	os := fetchedOffsets(t, addrs, group)
+	o, ok := os.Lookup(topic, 0)
+	if !ok || o.Err != nil {
+		t.Fatalf("no committed offset after the failure (%v)", o.Err)
+	}
+	if o.At != failAt {
+		t.Fatalf("committed offset %d, want the low-water mark %d: %d records above it finished but must not be committed",
+			o.At, failAt, above.Load())
+	}
+	committed := o.At
+
+	// The restarted member resumes at the mark and re-reads the tail
+	// contiguously: nothing between the mark and the end is skipped.
+	var (
+		mu    sync.Mutex
+		seen  = make(map[int64]bool)
+		got   atomic.Int64
+		done  = make(chan struct{})
+		once2 sync.Once
+	)
+	second, err := NewConsumer(addrs, group, []string{topic},
+		func(_ context.Context, rec *kgo.Record) error {
+			mu.Lock()
+			seen[rec.Offset] = true
+			mu.Unlock()
+			if got.Add(1) >= total-committed {
+				once2.Do(func() { close(done) })
+			}
+			return nil
+		},
+		WithLogger(discardLogger()),
+		WithLagSampling(0),
+		WithKeyConcurrency(fanOut),
+		WithCommitInterval(MinCommitInterval),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	runErr := make(chan error, 1)
+	go func() { runErr <- second.Run(ctx2) }()
+	waitClosed(t, done, 90*time.Second)
+	cancel2()
+	select {
+	case <-runErr:
+	case <-time.After(60 * time.Second):
+		t.Fatal("second Run did not return")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	for off := committed; off < total; off++ {
+		if !seen[off] {
+			t.Fatalf("offset %d was neither committed nor redelivered: it is lost", off)
+		}
+	}
 }
