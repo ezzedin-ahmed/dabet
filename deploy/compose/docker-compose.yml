@@ -407,6 +407,11 @@ services:
       <<: *infra-env
       POLICY_ENDPOINT: policy-service:7101
       CREDITS_ENDPOINT: http://credits-service:8080
+      # A18's 32-message trigger is unreachable under A17's sampler, so the
+      # linger is what actually sets batch size — and batch size is what
+      # amortises the policy rubric, the bulk of every prompt.
+      MOD_LLM_LINGER: ${MOD_LLM_LINGER:-250ms}
+      MOD_LLM_TIMEOUT: ${MOD_LLM_TIMEOUT:-3s}
     depends_on:
       kafka-init:
         condition: service_completed_successfully

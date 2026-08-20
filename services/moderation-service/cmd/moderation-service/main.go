@@ -119,11 +119,17 @@ func run(svc *service.Service) error {
 		return err
 	}
 	// A18 documents 1 s, which is also the whole LLM allowance in §4.6's
-	// indicative budget. Load runs showed 42% of batches timing out at
-	// that value, every one of them a fail-open. The product target is
-	// 2 s end to end and is a target, not a boundary, so the model is
-	// given room to answer instead of being cut off into a fail-open.
-	llmTimeout, err := config.GetDuration(envLLMTimeout, 1500*time.Millisecond)
+	// indicative budget. Every batch cut off at that mark is a fail-open,
+	// i.e. unmoderated messages, so the timeout must clear the model's
+	// slow tail rather than sit inside it.
+	//
+	// Measured against a stand-in whose p99 is 2.5 s: 1 s left 42% of
+	// batches timing out, 1.5 s left 3 757 fail-opens in a 90 s run, 3 s
+	// left 91. Cost is nil at the SLI: only ~1.7% of messages reach this
+	// stage, so p95 end to end stayed at 30 ms throughout — well inside
+	// the 2 s target, which is a p95 target and not a per-message cap.
+	// Retune against the real model's tail, not this number.
+	llmTimeout, err := config.GetDuration(envLLMTimeout, 3*time.Second)
 	if err != nil {
 		return err
 	}
