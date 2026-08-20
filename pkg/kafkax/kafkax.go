@@ -45,6 +45,16 @@
 // signal. Sampling is entirely off the per-message path and, per P2, a
 // broker failure while sampling is logged and counted, never propagated.
 //
+// # Transport security
+//
+// Producers and consumers can speak TLS and SASL (SCRAM-SHA-512,
+// SCRAM-SHA-256, PLAIN, AWS_MSK_IAM) to a managed broker — §3's
+// three-broker MSK row. It is entirely opt-in through the KAFKA_TLS_* and
+// KAFKA_SASL_* variables in security.go; with none of them set the clients
+// built here are byte-identical to the plaintext ones, so the Compose
+// profile is untouched and the topology difference really is configuration
+// only.
+//
 // # Configuration
 //
 // Every number above is an environment-overridable default in the §4.4
@@ -67,12 +77,35 @@ type Producer struct {
 }
 
 // NewProducer connects a producer to brokers.
+//
+// Transport security comes from the environment (see security.go). With
+// none of the KAFKA_TLS_*/KAFKA_SASL_* variables set — the Compose profile
+// — no extra options are added and the client is byte-identical to the
+// plaintext one this function has always built.
 func NewProducer(brokers []string) (*Producer, error) {
-	cl, err := kgo.NewClient(
+	sec, err := DefaultSecurityConfig()
+	if err != nil {
+		return nil, fmt.Errorf("kafka producer: %w", err)
+	}
+	return NewProducerWithSecurity(brokers, sec)
+}
+
+// NewProducerWithSecurity is NewProducer with an explicit SecurityConfig,
+// bypassing the environment. Used by tests and by callers that resolve
+// their credentials themselves.
+func NewProducerWithSecurity(brokers []string, sec SecurityConfig) (*Producer, error) {
+	opts := []kgo.Opt{
 		kgo.SeedBrokers(brokers...),
 		kgo.RequiredAcks(kgo.AllISRAcks()),
 		kgo.ProducerBatchCompression(kgo.ZstdCompression()),
-	)
+	}
+	secOpts, err := sec.Options()
+	if err != nil {
+		return nil, fmt.Errorf("kafka producer: %w", err)
+	}
+	opts = append(opts, secOpts...)
+
+	cl, err := kgo.NewClient(opts...)
 	if err != nil {
 		return nil, fmt.Errorf("kafka producer: %w", err)
 	}

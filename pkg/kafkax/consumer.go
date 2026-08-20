@@ -92,6 +92,29 @@ func NewConsumer(brokers []string, group string, topics []string, h Handler, opt
 		lagGauge: cfg.LagGauge,
 	}
 
+	// Broker transport security (TLS/SASL) from the environment or an
+	// explicit WithSecurity. Unset — the Compose profile — contributes no
+	// options at all, so the client below is byte-identical to the
+	// plaintext one this constructor has always built.
+	secOpts, err := cfg.Security.Options()
+	if err != nil {
+		return nil, fmt.Errorf("kafka consumer: %w", err)
+	}
+	kopts := c.clientOptions(brokers, group, topics, secOpts)
+
+	cl, err := kgo.NewClient(kopts...)
+	if err != nil {
+		return nil, fmt.Errorf("kafka consumer: %w", err)
+	}
+	c.cl = cl
+	c.adm = kadm.NewClient(cl)
+	return c, nil
+}
+
+// clientOptions is the franz-go option list, in order: the options this
+// package requires, then transport security, then the caller's escape
+// hatch (which therefore still wins over both).
+func (c *Consumer) clientOptions(brokers []string, group string, topics []string, secOpts []kgo.Opt) []kgo.Opt {
 	kopts := []kgo.Opt{
 		kgo.SeedBrokers(brokers...),
 		kgo.ConsumerGroup(group),
@@ -100,7 +123,7 @@ func NewConsumer(brokers []string, group string, topics []string, h Handler, opt
 		// handler returns nil and never rewind, so no autocommit tick can
 		// move an offset past an unprocessed record.
 		kgo.AutoCommitMarks(),
-		kgo.AutoCommitInterval(cfg.CommitInterval),
+		kgo.AutoCommitInterval(c.cfg.CommitInterval),
 		// Rebalances are gated on the poll loop, so a partition can never
 		// be revoked while its records are being handed to a worker. This
 		// is what keeps §7.3's single-owner property true during a
@@ -111,15 +134,9 @@ func NewConsumer(brokers []string, group string, topics []string, h Handler, opt
 		kgo.OnPartitionsLost(c.onLost),
 		kgo.OnPartitionsCallbackBlocked(c.onRebalanceBlocked),
 	}
-	kopts = append(kopts, cfg.KgoOpts...)
-
-	cl, err := kgo.NewClient(kopts...)
-	if err != nil {
-		return nil, fmt.Errorf("kafka consumer: %w", err)
-	}
-	c.cl = cl
-	c.adm = kadm.NewClient(cl)
-	return c, nil
+	kopts = append(kopts, secOpts...)
+	kopts = append(kopts, c.cfg.KgoOpts...)
+	return kopts
 }
 
 // Run consumes until ctx is cancelled, the client is closed, a fetch fails,

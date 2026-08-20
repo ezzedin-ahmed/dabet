@@ -86,6 +86,11 @@ type ConsumerConfig struct {
 	LagInterval time.Duration
 	// LagTimeout bounds one lag sample.
 	LagTimeout time.Duration
+	// Security is the broker transport security (TLS/SASL) of §3's
+	// managed-cloud row. Its zero value is plaintext with no SASL, which
+	// is what the Compose profile uses and what DefaultConsumerConfig
+	// returns when no KAFKA_TLS_*/KAFKA_SASL_* variable is set.
+	Security SecurityConfig
 	// Logger receives the consumer's own warnings. Never nil after
 	// DefaultConsumerConfig; per P4 nothing here logs message text or ids.
 	Logger *slog.Logger
@@ -144,6 +149,9 @@ func DefaultConsumerConfig() (ConsumerConfig, error) {
 		return cfg, err
 	}
 	if cfg.LagTimeout, err = config.GetDuration(EnvLagTimeout, cfg.LagTimeout); err != nil {
+		return cfg, err
+	}
+	if cfg.Security, err = DefaultSecurityConfig(); err != nil {
 		return cfg, err
 	}
 	return cfg, nil
@@ -228,6 +236,10 @@ func WithLagGauge(g LagGauge) Option {
 func WithPrometheusLagGauge(vec *prometheus.GaugeVec) Option {
 	return WithLagGauge(PrometheusLagGauge(vec))
 }
+
+// WithSecurity sets the broker transport security explicitly, overriding
+// whatever the KAFKA_TLS_*/KAFKA_SASL_* variables said.
+func WithSecurity(s SecurityConfig) Option { return func(c *ConsumerConfig) { c.Security = s } }
 
 // WithLogger sets the logger for the consumer's own warnings.
 func WithLogger(l *slog.Logger) Option { return func(c *ConsumerConfig) { c.Logger = l } }
