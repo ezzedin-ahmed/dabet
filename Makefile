@@ -14,7 +14,7 @@ RATE     ?= 400
 GOBIN   := $(shell go env GOPATH)/bin
 MODULES := $(shell go work edit -json | grep DiskPath | cut -d'"' -f4)
 
-.PHONY: build test vet proto k8s-lint k8s-template up up-full up-traced up-mail up-load up-sharded up-full-e2e e2e-full load load-selfbench load-drills down logs ps e2e
+.PHONY: build test vet proto k8s-lint k8s-template tf-check up up-full up-traced up-mail up-load up-sharded up-full-e2e e2e-full load load-selfbench load-drills down logs ps e2e
 
 build:
 	@for m in $(MODULES); do (cd $$m && go build ./...) || exit 1; done
@@ -105,6 +105,14 @@ k8s-lint:
 	helm lint $(K8S_APP) -f $(K8S_APP)/values-aws.yaml
 	helm lint $(K8S_DEPS)
 	bash $(K8S_DEPS)/hack/render-matrix.sh
+
+# Terraform/OpenTofu checks. Needs no AWS credentials and touches no state.
+TF := deploy/terraform
+tf-check:
+	cd $(TF) && tofu fmt -check -recursive .
+	cd $(TF) && tofu init -backend=false -input=false >/dev/null && tofu validate
+	cd $(TF)/examples/dev  && tofu init -backend=false -input=false >/dev/null && tofu validate
+	cd $(TF)/examples/prod && tofu init -backend=false -input=false >/dev/null && tofu validate
 
 # Render one profile to stdout: make k8s-template ENV=aws
 ENV ?= local
