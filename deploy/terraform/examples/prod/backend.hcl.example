@@ -1,0 +1,8 @@
+# Copy to backend.hcl and fill in, then:
+#
+#   tofu init -backend-config=backend.hcl
+#
+# The bucket comes from deploy/terraform/bootstrap. Do not commit backend.hcl.
+
+bucket = "dabet-tfstate-000000000000"
+region = "eu-west-1"

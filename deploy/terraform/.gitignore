@@ -1,0 +1,28 @@
+# Terraform / OpenTofu working files
+.terraform/
+
+# The dependency lock file is normally committed, and a team adopting this
+# should commit theirs. It is ignored here because the only lock files this
+# repository could produce were generated from a local single-platform provider
+# mirror (no AWS credentials, so nothing was ever applied), and a lock file
+# carrying hashes for linux_amd64 alone breaks every other platform on init.
+# Generate yours with `tofu providers lock -platform=...` for the platforms your
+# team and your CI actually use, then remove this line.
+.terraform.lock.hcl
+
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+
+# Backend configuration names an account-specific bucket.
+backend.hcl
+
+# Variable files may carry account ids, role ARNs and email addresses.
+*.tfvars
+*.tfvars.json
+!*.tfvars.example
+
+# Downloaded binaries, if anyone drops one here.
+tofu
+terraform

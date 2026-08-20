@@ -1,0 +1,109 @@
+# Prometheus rules installed into the Amazon Managed Prometheus workspace.
+#
+# These are the §4.5 signals that no CloudWatch alarm can see, because they are
+# counters exposed by the services on :9090/metrics rather than AWS metrics. The
+# in-cluster Prometheus remote-writes to AMP; these rules evaluate there.
+#
+# Two of them encode findings from test/load/README.md rather than from the
+# spec, and are marked as such.
+
+groups:
+  - name: dabet-failopen
+    rules:
+      # §4.5: "the single most important metric in the system ... must be
+      # alerted on, and it must be zero in steady state."
+      - alert: DabetFailOpen
+        expr: sum by (component, reason) (rate(fail_open_total[5m])) > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Messages are going unmoderated ({{ $labels.component }}/{{ $labels.reason }})"
+          description: >-
+            fail_open_total is climbing, which per §4.5 means messages reached
+            viewers without being evaluated. §4.7 makes this the intended
+            behaviour of a broken dependency, so the alert is on the dependency,
+            not on the pipeline.
+
+      # F2: a degraded Redis costs ~97% of throughput where an LLM or policy
+      # outage costs nothing, because Pipeline.Process marks Redis down for one
+      # message rather than for a window. Separate severity so the on-call
+      # knows which failure they have.
+      - alert: DabetRedisFailOpen
+        expr: sum(rate(fail_open_total{component="redis"}[5m])) > 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Redis fail-open: expect throughput collapse, not just degraded detection"
+
+  - name: dabet-latency
+    rules:
+      # N1: p95 end to end under 1.5 s, measured as flagged_at - ingested_at
+      # inside moderation-service (§4.6).
+      - alert: DabetE2ELatencyOverBudget
+        expr: >-
+          histogram_quantile(0.95, sum by (le) (rate(moderation_e2e_latency_seconds_bucket[10m]))) > 1.5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "p95 verdict latency is over the N1 budget"
+          description: >-
+            Note the caveat recorded in test/load/README.md: the histogram's
+            buckets straddle 1.5 s, so a p95 near the target is decided by
+            interpolation. Confirm against the fraction of verdicts under 1.5 s
+            before treating a marginal breach as real.
+
+  - name: dabet-llm
+    rules:
+      # F4: A18's 1000 ms timeout equals §4.6's 1000 ms budget for the same hop,
+      # so a large fraction of batches fails open by construction. §7.9 fails
+      # the WHOLE batch, so the cost is multiplied by the batch size.
+      - alert: DabetLLMBatchTimeouts
+        expr: >-
+          sum(rate(llm_requests_total{outcome!="ok"}[10m]))
+            / clamp_min(sum(rate(llm_requests_total[10m])), 0.001) > 0.05
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Over 5% of LLM batches are failing or timing out"
+          description: >-
+            Raise MOD_LLM_TIMEOUT (spending latency budget §4.6 does not have),
+            make the LLM faster, or lower the §7.5 sampler ceiling so it is not
+            queueing.
+
+      # F5: the 32-message trigger never fires at realistic rates, so the policy
+      # rubric is re-sent every one to four messages. A direct multiplier on GPU
+      # spend rather than a correctness problem.
+      - alert: DabetLLMBatchesTooSmall
+        expr: >-
+          sum(rate(llm_batch_size_sum[30m])) / clamp_min(sum(rate(llm_batch_size_count[30m])), 0.001) < 8
+        for: 30m
+        labels:
+          severity: info
+        annotations:
+          summary: "Mean LLM batch size is far below MOD_LLM_BATCH_SIZE"
+          description: >-
+            The linger timer is the binding trigger, so §7.9's whole reason for
+            batching by policy (sending the rubric once per batch) is not being
+            realised. Raise MOD_LLM_LINGER or lower MOD_LLM_BATCH_SIZE.
+
+  - name: dabet-kafka
+    rules:
+      # §4.7: "Accept the lag. Do not shed, do not skip." Lag is therefore not a
+      # failure by itself; unbounded growth is.
+      #
+      # F1: kafka_consumer_lag_messages is declared in pkg/obs and set by no
+      # service, so this rule evaluates to nothing today. It is here because the
+      # gauge is mandated by §4.5 and this is where the alert belongs once
+      # something writes to it. Until then, MSK's own broker metrics and a
+      # kafka-exporter are the fallback.
+      - alert: DabetConsumerLagGrowing
+        expr: sum by (topic, group) (kafka_consumer_lag_messages) > 100000
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Consumer lag on {{ $labels.topic }}/{{ $labels.group }} is large and sustained"
