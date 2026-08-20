@@ -14,6 +14,19 @@
 // keeps the e2e honest about the CSRF/PKCE half of §5.5 rather than
 // rubber-stamping it.
 //
+// Three further endpoints exist purely so a test can drive §5.6 — lazy
+// refresh on 401 — instead of waiting an hour for a token to age out:
+//
+//	GET  /admin/tokens?user_id= -> the tokens currently valid for that user
+//	POST /admin/invalidate      -> forget tokens, so the next use is rejected
+//	POST /admin/reset           -> forget everything
+//
+// `/admin/invalidate` takes {"user_id", "scope"} where scope is `access`
+// (the access token starts returning 401, refresh still works — the
+// positive branch of §5.6), `refresh` (the refresh grant starts returning
+// 400 invalid_grant, which is the auth error that moves the connection to
+// `expired` — the negative branch), or `all`.
+//
 // Every authorization mints a fresh provider user id, so repeated e2e
 // runs do not collide on identity's `connections_active_uniq` partial
 // unique index (§5.2).
@@ -32,6 +45,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -256,12 +270,119 @@ func writeJSON(w http.ResponseWriter, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
+// ---------------------------------------------------------------------
+// Admin — failure injection for §5.6
+// ---------------------------------------------------------------------
+
+// tokenState is what a test can see of one user's credentials. The values are
+// the tokens themselves: this is a fixture, and a test that wants to prove
+// "the connection ended up with a *new* access token" needs to compare them.
+type tokenState struct {
+	AccessTokens  []string `json:"access_tokens"`
+	RefreshTokens []string `json:"refresh_tokens"`
+}
+
+// tokensFor collects every live token belonging to userID.
+func (s *server) tokensFor(userID string) tokenState {
+	out := tokenState{AccessTokens: []string{}, RefreshTokens: []string{}}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for tok, g := range s.access {
+		if g.userID == userID {
+			out.AccessTokens = append(out.AccessTokens, tok)
+		}
+	}
+	for tok, g := range s.refresh {
+		if g.userID == userID {
+			out.RefreshTokens = append(out.RefreshTokens, tok)
+		}
+	}
+	sort.Strings(out.AccessTokens)
+	sort.Strings(out.RefreshTokens)
+	return out
+}
+
+func (s *server) handleAdminTokens(w http.ResponseWriter, r *http.Request) {
+	userID := r.URL.Query().Get("user_id")
+	if userID == "" {
+		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "user_id is required")
+		return
+	}
+	writeJSON(w, s.tokensFor(userID))
+}
+
+type invalidateRequest struct {
+	UserID string `json:"user_id"`
+	Scope  string `json:"scope"` // access | refresh | all (default: access)
+}
+
+type invalidateResponse struct {
+	Access  int `json:"access_revoked"`
+	Refresh int `json:"refresh_revoked"`
+}
+
+// handleAdminInvalidate forgets tokens so their next use is rejected. It is
+// the whole point of the admin surface: nothing else can make a live token
+// stop working without waiting out its hour.
+func (s *server) handleAdminInvalidate(w http.ResponseWriter, r *http.Request) {
+	var req invalidateRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "unparseable JSON body")
+		return
+	}
+	if req.UserID == "" {
+		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "user_id is required")
+		return
+	}
+	if req.Scope == "" {
+		req.Scope = "access"
+	}
+	if req.Scope != "access" && req.Scope != "refresh" && req.Scope != "all" {
+		writeOAuthError(w, http.StatusBadRequest, "invalid_request",
+			"scope must be one of access, refresh, all")
+		return
+	}
+
+	var out invalidateResponse
+	s.mu.Lock()
+	if req.Scope == "access" || req.Scope == "all" {
+		for tok, g := range s.access {
+			if g.userID == req.UserID {
+				delete(s.access, tok)
+				out.Access++
+			}
+		}
+	}
+	if req.Scope == "refresh" || req.Scope == "all" {
+		for tok, g := range s.refresh {
+			if g.userID == req.UserID {
+				delete(s.refresh, tok)
+				out.Refresh++
+			}
+		}
+	}
+	s.mu.Unlock()
+	writeJSON(w, out)
+}
+
+func (s *server) handleAdminReset(w http.ResponseWriter, _ *http.Request) {
+	s.mu.Lock()
+	s.codes = make(map[string]authorization)
+	s.access = make(map[string]grant)
+	s.refresh = make(map[string]grant)
+	s.mu.Unlock()
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (s *server) routes() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /oauth/authorize", s.handleAuthorize)
 	mux.HandleFunc("POST /oauth/token", s.handleToken)
 	mux.HandleFunc("GET /oauth/userinfo", s.handleUserinfo)
 	mux.HandleFunc("POST /oauth/revoke", s.handleRevoke)
+	mux.HandleFunc("GET /admin/tokens", s.handleAdminTokens)
+	mux.HandleFunc("POST /admin/invalidate", s.handleAdminInvalidate)
+	mux.HandleFunc("POST /admin/reset", s.handleAdminReset)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
