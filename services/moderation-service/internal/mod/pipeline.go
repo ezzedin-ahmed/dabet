@@ -42,6 +42,13 @@ type Config struct {
 	SamplerTTL        time.Duration
 	LLMBatchSize      int           // A18
 	LLMLinger         time.Duration // A18
+
+	// Redis circuit breaker (§4.7 "skip", not "try and fail"). Not a
+	// number the spec assigns, so these are ours; all three are env
+	// overridable per §4.4. See Breaker for the rationale.
+	RedisBreakerThreshold   int           // consecutive failures that trip it
+	RedisBreakerCooldown    time.Duration // open window before the first probe
+	RedisBreakerMaxCooldown time.Duration // cap on the backed-off open window
 }
 
 // DefaultConfig returns the documented defaults.
@@ -58,17 +65,34 @@ func DefaultConfig() Config {
 		SamplerTTL:        5 * time.Minute,
 		LLMBatchSize:      32,
 		LLMLinger:         50 * time.Millisecond,
+
+		// Five consecutive failures is short enough that an outage costs
+		// well under a second of wasted work per instance, and long enough
+		// that a single dropped connection does not disable the Redis
+		// stages. The 500 ms floor bounds the probe cost to one failed
+		// call per half second; the 5 s cap keeps a long outage at roughly
+		// one wasted call per five seconds per instance.
+		RedisBreakerThreshold:   5,
+		RedisBreakerCooldown:    500 * time.Millisecond,
+		RedisBreakerMaxCooldown: 5 * time.Second,
 	}
 }
 
-// Pipeline is the §7.3 cascade. One instance serves the whole consumer;
-// Process is invoked per record by the (single-goroutine) consumer loop,
-// while LLM dispatch and background flushing run on their own goroutines.
+// Pipeline is the §7.3 cascade. One instance serves the whole consumer.
+//
+// CONCURRENCY. Process is safe to call from several goroutines at once —
+// kafkax may drive one pipeline from several partition workers — and LLM
+// dispatch and background flushing already run on their own goroutines.
+// Every piece of shared state is either immutable after construction
+// (cfg, matchers, the clock) or internally locked (batcher, memSamp,
+// usage, policies, breaker); Prometheus collectors are safe by contract.
+// Per-message state lives in locals only.
 type Pipeline struct {
 	cfg      Config
 	policies PolicyGetter
 	credits  CreditsChecker
 	state    *RedisState
+	breaker  *Breaker
 	embed    Embedder
 	llm      Classifier
 	batcher  *LLMBatcher
@@ -78,17 +102,20 @@ type Pipeline struct {
 	met      *Metrics
 	now      func() time.Time
 
-	wg sync.WaitGroup // in-flight LLM dispatches
+	mu     sync.Mutex     // guards closed; serialises wg.Add against Shutdown
+	closed bool           // Shutdown has begun: no new tracked dispatches
+	wg     sync.WaitGroup // in-flight LLM dispatches
 }
 
 // NewPipeline wires the cascade. state may be nil only in tests; a broken
-// Redis is handled per message, not at construction.
+// Redis is handled by the shared breaker, not at construction.
 func NewPipeline(cfg Config, policies PolicyGetter, credits CreditsChecker, state *RedisState, embed Embedder, llm Classifier, pub *Publisher, usage *UsageAggregator, met *Metrics, now func() time.Time) *Pipeline {
 	return &Pipeline{
 		cfg:      cfg,
 		policies: policies,
 		credits:  credits,
 		state:    state,
+		breaker:  NewBreaker(cfg.RedisBreakerThreshold, cfg.RedisBreakerCooldown, cfg.RedisBreakerMaxCooldown),
 		embed:    embed,
 		llm:      llm,
 		batcher:  NewLLMBatcher(cfg.LLMBatchSize, cfg.LLMLinger),
@@ -98,6 +125,76 @@ func NewPipeline(cfg Config, policies PolicyGetter, credits CreditsChecker, stat
 		met:      met,
 		now:      now,
 	}
+}
+
+// redisGate is one message's view of the shared Redis breaker.
+//
+// It decides ONCE per message whether Redis may be touched at all. When
+// the breaker is open no call is attempted — that, and not the counting,
+// is the fix for the measured collapse (see Breaker): the previous code
+// marked Redis down only for the current message, so every subsequent
+// message re-paid the client's failure latency on the consumer goroutine.
+//
+// Accounting is honest in both directions: a message that skipped or
+// failed any Redis-backed stage counts exactly one
+// fail_open_total{component="redis"}, no matter how many of stages
+// 1/4/5/6/8 it went on to skip, and a message that never reached a
+// Redis-backed stage counts none.
+type redisGate struct {
+	p       *Pipeline
+	decided bool // the breaker has been consulted for this message
+	allowed bool // calls may still be attempted
+	probe   bool // this message holds the half-open probe token
+	counted bool // the fail-open for this message has been counted
+}
+
+// use reports whether the Redis-backed stage about to run may issue a
+// call. It is deliberately lazy: a message whose policy enables no
+// Redis-backed stage never consults the breaker and never counts.
+func (g *redisGate) use() bool {
+	if g.p.state == nil {
+		g.skipped()
+		return false
+	}
+	if !g.decided {
+		g.decided = true
+		g.allowed, g.probe = g.p.breaker.Allow(g.p.now())
+		if !g.allowed {
+			g.p.met.DependencyUp.WithLabelValues("redis").Set(0)
+		}
+	}
+	if !g.allowed {
+		g.skipped()
+		return false
+	}
+	return true
+}
+
+// ok reports a successful Redis call, closing the breaker when this
+// message carried the probe.
+func (g *redisGate) ok() {
+	g.p.breaker.Succeed(g.p.now(), g.probe)
+	g.probe = false
+	g.p.met.DependencyUp.WithLabelValues("redis").Set(1)
+}
+
+// fail reports a failed Redis call. The remaining stages of this message
+// are skipped without a further attempt.
+func (g *redisGate) fail() {
+	g.p.breaker.Fail(g.p.now(), g.probe)
+	g.probe = false
+	g.allowed = false
+	g.p.met.DependencyUp.WithLabelValues("redis").Set(0)
+	g.skipped()
+}
+
+// skipped counts this message's single Redis fail-open, once.
+func (g *redisGate) skipped() {
+	if g.counted {
+		return
+	}
+	g.counted = true
+	g.p.met.FailOpen.WithLabelValues("redis", "").Inc()
 }
 
 // Handler adapts the pipeline to the kafkax consumer. It never returns an
@@ -137,29 +234,21 @@ func (p *Pipeline) Process(ctx context.Context, value []byte) {
 		tracing.CreatorID(msg.CreatorID),
 	)
 
-	// Redis availability is decided per message: the first failing Redis
-	// operation marks it down for the remaining stages and counts ONE
-	// fail_open_total{component="redis"} for this message.
-	redisDown := p.state == nil
-	redisCounted := false
-	redisFail := func() {
-		redisDown = true
-		if !redisCounted {
-			redisCounted = true
-			p.met.FailOpen.WithLabelValues("redis", "").Inc()
-			p.met.DependencyUp.WithLabelValues("redis").Set(0)
-		}
-	}
+	// Redis availability comes from the SHARED breaker, not from this
+	// message: while it is open the Redis-backed stages are skipped
+	// outright, with no call attempted (§4.7 says "skip"). The gate counts
+	// one fail_open_total{component="redis"} per affected message.
+	rg := redisGate{p: p}
 
 	// Stage 1 — redelivery guard (§7.4). Redis down: skip, fail open.
-	if !redisDown {
+	if rg.use() {
 		t0 := p.now()
 		already, err := p.state.Seen(ctx, msg.MessageID, p.cfg.SeenTTL)
 		p.observeStage("seen", t0)
 		if err != nil {
-			redisFail()
+			rg.fail()
 		} else {
-			p.met.DependencyUp.WithLabelValues("redis").Set(1)
+			rg.ok()
 			if already {
 				p.met.MessagesTotal.WithLabelValues("skipped").Inc()
 				return
@@ -207,7 +296,7 @@ func (p *Pipeline) Process(ctx context.Context, value []byte) {
 	norm := Normalize(msg.Text)
 
 	// Stage 4 — rate limit, only when the policy sets one.
-	if pol.RateLimitMessages != nil && pol.RateLimitSeconds != nil && !redisDown {
+	if pol.RateLimitMessages != nil && pol.RateLimitSeconds != nil && rg.use() {
 		capacity := float64(pol.GetRateLimitMessages())
 		window := time.Duration(pol.GetRateLimitSeconds()) * time.Second
 		t0 = p.now()
@@ -215,10 +304,13 @@ func (p *Pipeline) Process(ctx context.Context, value []byte) {
 			capacity, capacity/window.Seconds(), p.now(), 2*window)
 		p.observeStage("rate_limit", t0)
 		if err != nil {
-			redisFail()
-		} else if !allowed {
-			p.flag(ctx, msg, contracts.DetectorRateLimit, contracts.ActionAutoDelete, pol.GetPolicyId())
-			return
+			rg.fail()
+		} else {
+			rg.ok()
+			if !allowed {
+				p.flag(ctx, msg, contracts.DetectorRateLimit, contracts.ActionAutoDelete, pol.GetPolicyId())
+				return
+			}
 		}
 	}
 
@@ -226,21 +318,28 @@ func (p *Pipeline) Process(ctx context.Context, value []byte) {
 	// implies the identical check as its cheap first line).
 	spam := pol.GetSpam()
 	spamOn := spam == policyapi.SpamMode_SPAM_MODE_IDENTICAL || spam == policyapi.SpamMode_SPAM_MODE_SEMANTIC
-	if spamOn && !redisDown {
+	if spamOn && rg.use() {
 		t0 = p.now()
 		hit, err := p.state.DupCheck(ctx, rediskeys.Dup(msg.ContentID, msg.AuthorID),
 			HashText(norm), p.cfg.DupDepth, p.cfg.DupTTL)
 		p.observeStage("duplicate", t0)
 		if err != nil {
-			redisFail()
-		} else if hit {
-			p.flag(ctx, msg, contracts.DetectorDuplicate, contracts.ActionAutoDelete, pol.GetPolicyId())
-			return
+			rg.fail()
+		} else {
+			rg.ok()
+			if hit {
+				p.flag(ctx, msg, contracts.DetectorDuplicate, contracts.ActionAutoDelete, pol.GetPolicyId())
+				return
+			}
 		}
 	}
 
 	// Stage 6 — semantic spam. Embedding down: skip the stage, continue.
-	if spam == policyapi.SpamMode_SPAM_MODE_SEMANTIC && !redisDown {
+	// The gate is consulted BEFORE the embedding call: with Redis out
+	// there is nothing to compare against, so paying for an embedding
+	// would be waste, and the stage counts as a Redis skip rather than an
+	// embedding one.
+	if spam == policyapi.SpamMode_SPAM_MODE_SEMANTIC && rg.use() {
 		t0 = p.now()
 		vecs, err := p.embed.Embed(ctx, []string{norm})
 		if err != nil || len(vecs) != 1 {
@@ -253,10 +352,13 @@ func (p *Pipeline) Process(ctx context.Context, value []byte) {
 				vecs[0], p.cfg.EmbDepth, p.cfg.EmbTTL)
 			p.observeStage("semantic", t0)
 			if err != nil {
-				redisFail()
-			} else if sim >= p.cfg.SemanticThreshold {
-				p.flag(ctx, msg, contracts.DetectorSemanticSpam, contracts.ActionAutoDelete, pol.GetPolicyId())
-				return
+				rg.fail()
+			} else {
+				rg.ok()
+				if sim >= p.cfg.SemanticThreshold {
+					p.flag(ctx, msg, contracts.DetectorSemanticSpam, contracts.ActionAutoDelete, pol.GetPolicyId())
+					return
+				}
 			}
 		}
 	}
@@ -280,19 +382,22 @@ func (p *Pipeline) Process(ctx context.Context, value []byte) {
 	}
 
 	// Stage 8 — sampler. Redis down: per-instance in-memory fallback
-	// bucket (see MemSampler for the documented deviation).
+	// bucket (see MemSampler for the documented deviation). "Down" now
+	// includes "breaker open", which is the same situation reached without
+	// paying for the call.
 	t0 = p.now()
-	sampled := false
-	if !redisDown {
+	sampled, decided := false, false
+	if rg.use() {
 		a, err := p.state.TakeToken(ctx, rediskeys.Samp(msg.ContentID),
 			p.cfg.SamplerCapacity, p.cfg.SamplerPerMin/60, p.now(), p.cfg.SamplerTTL)
 		if err != nil {
-			redisFail()
+			rg.fail()
 		} else {
-			sampled = a
+			rg.ok()
+			sampled, decided = a, true
 		}
 	}
-	if redisDown {
+	if !decided {
 		sampled = p.memSamp.Allow(msg.ContentID, p.now())
 	}
 	p.observeStage("sampler", t0)
@@ -312,8 +417,22 @@ func (p *Pipeline) Process(ctx context.Context, value []byte) {
 
 // dispatchAsync runs one LLM batch on its own goroutine so a full batch
 // never stalls the consumer loop for the LLM timeout.
+//
+// The closed flag exists because Process may run on several partition
+// workers: without it a straggling worker could call wg.Add concurrently
+// with Shutdown's wg.Wait, which is documented WaitGroup misuse and is
+// reported by -race. After Shutdown has begun, a late batch is dispatched
+// inline instead — it still reaches the LLM and is still accounted, it
+// just blocks its own caller rather than escaping the drain.
 func (p *Pipeline) dispatchAsync(ctx context.Context, batch *LLMBatch) {
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		p.dispatch(ctx, batch)
+		return
+	}
 	p.wg.Add(1)
+	p.mu.Unlock()
 	go func() {
 		defer p.wg.Done()
 		p.dispatch(ctx, batch)
@@ -431,11 +550,23 @@ func (p *Pipeline) RunBackground(ctx context.Context) {
 }
 
 // Shutdown drains pending LLM batches, waits for in-flight dispatches,
-// and flushes the remaining usage windows (§7.10).
+// and flushes the remaining usage windows (§7.10). The final flush runs
+// on its own WaitGroup so nothing Adds to p.wg while it is being waited
+// on (see dispatchAsync).
 func (p *Pipeline) Shutdown(ctx context.Context) {
+	p.mu.Lock()
+	p.closed = true
+	p.mu.Unlock()
+
+	var last sync.WaitGroup
 	for _, b := range p.batcher.FlushAll() {
-		p.dispatchAsync(ctx, b)
+		last.Add(1)
+		go func() {
+			defer last.Done()
+			p.dispatch(ctx, b)
+		}()
 	}
+	last.Wait()
 	p.wg.Wait()
 	p.usage.FlushAll(ctx)
 }
