@@ -1,0 +1,314 @@
+{{/*
+The nine workloads. One loop, so the probe wiring, security context, grace
+period and env plumbing cannot drift between services.
+
+Two shapes:
+  Deployment   eight of the nine. Pod identity does not matter to them; the
+               only identity-sensitive one, moderation-service, needs its
+               INSTANCE_ID to be UNIQUE (§7.10 usage idempotency), which a
+               Deployment's random pod names already guarantee.
+  StatefulSet  provider-adapter. §7.2/A13 hashes connections onto a ring of
+               ADAPTER_INSTANCE_IDs; those must be STABLE across restarts or
+               every rollout reshuffles the ring. See the comment in values.
+*/}}
+{{- $root := . -}}
+{{- range $name, $svc := .Values.services }}
+{{- if $svc.enabled }}
+{{- $fullName := include "dabet.svcName" (dict "root" $root "name" $name) }}
+{{- $mode := include "dabet.autoscalingMode" (dict "root" $root "svc" $svc) }}
+{{- $rs256 := eq (include "dabet.rs256" $root) "true" }}
+{{- $usesJWT := eq (include "dabet.usesJWT" (dict "root" $root "svc" $svc)) "true" }}
+{{- $mountJWT := and $rs256 $usesJWT }}
+{{- $isIssuer := eq (default "none" $svc.jwt) "issue" }}
+---
+apiVersion: apps/v1
+kind: {{ $svc.kind }}
+metadata:
+  name: {{ $fullName }}
+  labels:
+    {{- include "dabet.labels" (dict "root" $root "name" $name) | nindent 4 }}
+  {{- with $root.Values.global.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- if eq $mode "none" }}
+  replicas: {{ $svc.replicas }}
+  {{- else }}
+  {{- /* Under an autoscaler the replica count is not ours to state: setting it
+       here makes every `helm upgrade` reset the workload to the chart's
+       number and then hand it back to the HPA, which for a lag-scaled
+       consumer means dropping capacity in the middle of a backlog. */}}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "dabet.selectorLabels" (dict "root" $root "name" $name) | nindent 6 }}
+  {{- if eq $svc.kind "StatefulSet" }}
+  serviceName: {{ $fullName }}-headless
+  {{- /* Parallel, and this was changed after watching OrderedReady behave on
+       a real cluster.
+
+       podManagementPolicy governs CREATE and SCALE ordering only; it does
+       not affect updates, which always roll one pod at a time in reverse
+       ordinal order waiting for Ready. So Parallel costs nothing on a
+       rollout and buys the thing that matters: with OrderedReady, an
+       adapter-0 that cannot start (a Postgres outage at boot, say) means
+       adapter-1..N are never created at all, and the entire ingestion tier
+       stays down because one member is unhealthy. That is head-of-line
+       blocking on the fail-open path, which N2 and P2 both forbid.
+
+       Parallel also suits A13 better than it first appears: a fleet restart
+       reshuffles the ring once, as the members leave and rejoin together,
+       rather than N times as they trickle in one by one. */}}
+  podManagementPolicy: Parallel
+  updateStrategy:
+    type: RollingUpdate
+  {{- else }}
+  strategy:
+    {{- if $svc.strategy }}
+    {{- toYaml $svc.strategy | nindent 4 }}
+    {{- else }}
+    type: RollingUpdate
+    rollingUpdate:
+      {{- /* maxUnavailable 0: never lose consumer-group capacity during a
+           rollout. maxSurge 1 keeps the number of extra rebalances down —
+           each surge/retire pair costs the group one. */}}
+      maxUnavailable: 0
+      maxSurge: 1
+    {{- end }}
+  {{- end }}
+  template:
+    metadata:
+      labels:
+        {{- include "dabet.labels" (dict "root" $root "name" $name) | nindent 8 }}
+      annotations:
+        {{- /* Roll the pods when this service's configuration changes. The
+             hash covers the shared coordinates, the Kafka tunables, tracing
+             and this service's own env — never any secret VALUE. */}}
+        checksum/config: {{ toYaml (dict "config" $root.Values.config "kafka" $root.Values.kafka "tracing" $root.Values.tracing "jwt" (omit $root.Values.jwt "kid") "env" (default (dict) $svc.env)) | sha256sum }}
+        {{- if $root.Values.secrets.create }}
+        checksum/secret: {{ toYaml $root.Values.secrets.data | sha256sum }}
+        {{- end }}
+        {{- with $root.Values.global.commonAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- with (default (dict) $svc.podAnnotations) }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "dabet.serviceAccountName" (dict "root" $root "name" $name "svc" $svc) }}
+      automountServiceAccountToken: {{ $root.Values.serviceAccount.automountServiceAccountToken }}
+      {{- with $root.Values.global.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml $root.Values.podSecurityContext | nindent 8 }}
+      {{- /* Must exceed KAFKA_CONSUMER_DRAIN_TIMEOUT plus the runner's 10s
+           HTTP shutdown for any consumer; _helpers.tpl fails the render
+           rather than let a rollout kill handlers mid-record. */}}
+      terminationGracePeriodSeconds: {{ include "dabet.gracePeriod" (dict "root" $root "name" $name "svc" $svc) }}
+      {{- with $root.Values.scheduling.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      {{- with (default $root.Values.scheduling.nodeSelector $svc.nodeSelector) }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with (default $root.Values.scheduling.tolerations $svc.tolerations) }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if $svc.affinity }}
+      affinity:
+        {{- toYaml $svc.affinity | nindent 8 }}
+      {{- else if $root.Values.scheduling.affinity }}
+      affinity:
+        {{- toYaml $root.Values.scheduling.affinity | nindent 8 }}
+      {{- else if $root.Values.scheduling.podAntiAffinity.enabled }}
+      affinity:
+        podAntiAffinity:
+          {{- if eq $root.Values.scheduling.podAntiAffinity.type "hard" }}
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  {{- include "dabet.selectorLabels" (dict "root" $root "name" $name) | nindent 18 }}
+              topologyKey: {{ $root.Values.scheduling.topologySpreadConstraints.nodeKey }}
+          {{- else }}
+          {{- /* Soft by default. A hard rule on a single-node kind cluster
+               leaves every replica after the first Pending forever, and per
+               P2 an unschedulable moderation replica is worse than a badly
+               spread one. */}}
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    {{- include "dabet.selectorLabels" (dict "root" $root "name" $name) | nindent 20 }}
+                topologyKey: {{ $root.Values.scheduling.topologySpreadConstraints.nodeKey }}
+          {{- end }}
+      {{- end }}
+      {{- if $root.Values.scheduling.topologySpreadConstraints.enabled }}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: {{ $root.Values.scheduling.topologySpreadConstraints.zoneKey }}
+          whenUnsatisfiable: {{ $root.Values.scheduling.topologySpreadConstraints.zoneWhenUnsatisfiable }}
+          labelSelector:
+            matchLabels:
+              {{- include "dabet.selectorLabels" (dict "root" $root "name" $name) | nindent 14 }}
+        - maxSkew: 1
+          topologyKey: {{ $root.Values.scheduling.topologySpreadConstraints.nodeKey }}
+          whenUnsatisfiable: {{ $root.Values.scheduling.topologySpreadConstraints.nodeWhenUnsatisfiable }}
+          labelSelector:
+            matchLabels:
+              {{- include "dabet.selectorLabels" (dict "root" $root "name" $name) | nindent 14 }}
+      {{- end }}
+      containers:
+        - name: {{ $name }}
+          image: {{ include "dabet.image" (dict "root" $root "name" $name "svc" $svc) | quote }}
+          imagePullPolicy: {{ include "dabet.imagePullPolicy" (dict "root" $root "svc" $svc) }}
+          securityContext:
+            {{- toYaml $root.Values.containerSecurityContext | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: {{ $svc.ports.http }}
+              protocol: TCP
+            - name: metrics
+              containerPort: {{ $svc.ports.metrics }}
+              protocol: TCP
+            {{- range $svc.ports.extra }}
+            - name: {{ .name }}
+              containerPort: {{ .containerPort }}
+              protocol: {{ default "TCP" .protocol }}
+            {{- end }}
+          envFrom:
+            - configMapRef:
+                name: {{ include "dabet.sharedConfigName" $root }}
+            - configMapRef:
+                name: {{ include "dabet.svcConfigName" (dict "root" $root "name" $name) }}
+          env:
+            {{- /* Secrets are referenced key by key, never with an
+                   envFrom secretRef: that would inject the Stripe key and
+                   every OAuth client secret into all nine pods. */}}
+            {{- range $envName, $secretKey := (default (dict) $svc.secretEnv) }}
+            - name: {{ $envName }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "dabet.secretName" $root }}
+                  key: {{ $secretKey }}
+            {{- end }}
+            {{- if and $usesJWT (not $rs256) }}
+            {{- /* §5.4 HS256: the shared secret. httpx.VerifierFromEnv
+                   treats JWT_SECRET as REQUIRED under HS256 and the process
+                   exits without it. */}}
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "dabet.secretName" $root }}
+                  key: JWT_SECRET
+            {{- end }}
+            {{- with (default (list) $svc.envRaw) }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- /* ################################################################
+                 PROBES — §4.5. Do not "improve" these. Read this first.
+
+                 /healthz  process is alive   -> liveness
+                 /readyz   process can serve  -> readiness
+
+                 pkg/obs/health.go starts READY and never flips on a
+                 dependency failure, on purpose. Per P2 and §4.7, a
+                 moderation-path service that has lost Redis, the LLM or
+                 policy-service KEEPS CONSUMING and fails open. §4.5 states
+                 the consequence outright: "/readyz returning 503 would
+                 remove it from service and stop chat, which is exactly the
+                 wrong outcome."
+
+                 So the failure mode this configuration must avoid is not a
+                 slow rollout, it is an OUTAGE AMPLIFIER: a probe that
+                 notices the dependency outage, marks pods unready or
+                 restarts them, and turns a degraded-but-serving pipeline
+                 into a stopped one. Concretely, do NOT:
+
+                   * point readiness at a dependency-aware endpoint, or add
+                     an exec probe that checks Redis/Kafka/Postgres;
+                   * lower failureThreshold or periodSeconds to make an
+                     outage "visible" — fail_open_total (§4.5) and
+                     kafka_consumer_lag_messages (§4.7) are the signals for
+                     that, and they are already scraped;
+                   * add a startupProbe. It is the one probe that can kill a
+                     pod that is up and correctly failing open, and no
+                     service here has a start slow enough to need one.
+
+                 The liveness budget is deliberately slack — 10s x 6 = 60s of
+                 continuous unresponsiveness before a restart. Under the
+                 congestion collapse measured in test/load/README.md the
+                 service is minutes behind on Kafka but still answers
+                 /healthz instantly off a separate goroutine, so it does not
+                 trip; only a genuinely wedged process does.
+                 ################################################################ */}}
+          {{- if $root.Values.probes.liveness.enabled }}
+          livenessProbe:
+            httpGet:
+              path: {{ $root.Values.probes.liveness.path }}
+              port: http
+            initialDelaySeconds: {{ $root.Values.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ $root.Values.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ $root.Values.probes.liveness.timeoutSeconds }}
+            successThreshold: {{ $root.Values.probes.liveness.successThreshold }}
+            failureThreshold: {{ $root.Values.probes.liveness.failureThreshold }}
+          {{- end }}
+          {{- if $root.Values.probes.readiness.enabled }}
+          readinessProbe:
+            httpGet:
+              path: {{ $root.Values.probes.readiness.path }}
+              port: http
+            initialDelaySeconds: {{ $root.Values.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ $root.Values.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ $root.Values.probes.readiness.timeoutSeconds }}
+            successThreshold: {{ $root.Values.probes.readiness.successThreshold }}
+            failureThreshold: {{ $root.Values.probes.readiness.failureThreshold }}
+          {{- end }}
+          resources:
+            {{- toYaml $svc.resources | nindent 12 }}
+          volumeMounts:
+            {{- /* readOnlyRootFilesystem is on, and the Go runtime and the
+                   HTTP/TLS stacks want a writable temp dir. */}}
+            - name: tmp
+              mountPath: /tmp
+            {{- if $mountJWT }}
+            - name: jwt
+              mountPath: {{ $root.Values.jwt.mountPath }}
+              readOnly: true
+            {{- end }}
+            {{- with (default (list) $svc.extraVolumeMounts) }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        {{- if $mountJWT }}
+        {{- /* §5.4 RS256. The PEM is mounted as a FILE and read through
+               JWT_PRIVATE_KEY_FILE / JWT_PUBLIC_KEY_FILE rather than passed
+               as an env var, so it never shows up in `kubectl describe pod`
+               or in the process environment of a compromised container.
+               user-service gets the private key (it issues); every other
+               verifying service gets only the public half. */}}
+        - name: jwt
+          secret:
+            secretName: {{ include "dabet.secretName" $root }}
+            defaultMode: 0400
+            items:
+              {{- if $isIssuer }}
+              - key: JWT_PRIVATE_KEY
+                path: {{ $root.Values.jwt.privateKeyFilename }}
+              {{- else }}
+              - key: JWT_PUBLIC_KEY
+                path: {{ $root.Values.jwt.publicKeyFilename }}
+              {{- end }}
+        {{- end }}
+        {{- with (default (list) $svc.extraVolumes) }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+{{- end }}
+{{- end }}

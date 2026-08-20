@@ -1,0 +1,67 @@
+Dabet {{ .Chart.AppVersion }} installed as {{ .Release.Name }} in {{ .Release.Namespace }}.
+
+Workloads
+{{- range $name, $svc := .Values.services }}
+{{- if $svc.enabled }}
+  {{ printf "%-20s" $name }} {{ $svc.kind }}{{ if eq (include "dabet.autoscalingMode" (dict "root" $ "svc" $svc)) "none" }}  replicas={{ $svc.replicas }}{{ else }}  autoscaled ({{ include "dabet.autoscalingMode" (dict "root" $ "svc" $svc) }}) max={{ include "dabet.maxReplicas" (dict "root" $ "name" $name "svc" $svc) }}{{ end }}
+{{- end }}
+{{- end }}
+
+Health (docs §4.5)
+  /healthz  process alive   -> liveness probe
+  /readyz   can serve       -> readiness probe
+
+  A moderation-path service that has lost a dependency STAYS READY. It fails
+  open and keeps consuming (P2). If you are here because a dependency is down
+  and the pods still show Ready, that is the design working, not a bug — look
+  at fail_open_total and kafka_consumer_lag_messages instead.
+
+Tokens: JWT_ALG={{ .Values.jwt.alg }}
+{{- if eq (include "dabet.rs256" .) "true" }}
+  RS256 (§5.4 target). user-service mounts the private key at
+  {{ .Values.jwt.mountPath }}/{{ .Values.jwt.privateKeyFilename }} and issues; every verifying service mounts
+  the public key at {{ .Values.jwt.mountPath }}/{{ .Values.jwt.publicKeyFilename }}.
+{{- else }}
+  HS256 (§5.4 local). Every verifying service reads JWT_SECRET from the
+  Secret. Move to RS256 before this is real: --set jwt.alg=RS256 plus
+  secrets.data.JWT_PRIVATE_KEY / JWT_PUBLIC_KEY.
+{{- end }}
+
+Secrets: {{ include "dabet.secretName" . }}
+{{- if .Values.secrets.create }}
+  Rendered from values (the bare-cluster fallback). THE DEFAULTS ARE DEV
+  PLACEHOLDERS. Set externalSecrets.enabled=true with secrets.create=false
+  to pull them from a secret manager instead (§4.4).
+{{- else if .Values.externalSecrets.enabled }}
+  Synced by the External Secrets Operator from {{ .Values.externalSecrets.secretStoreRef.name }}.
+  Check it landed:  kubectl get externalsecret {{ include "dabet.secretName" . }}
+{{- else if .Values.secretsStoreCSI.enabled }}
+  Provided by the Secrets Store CSI driver ({{ .Values.secretsStoreCSI.provider }}).
+{{- else }}
+  NOT MANAGED BY THIS CHART. Create it yourself with the keys listed in
+  values.yaml under secrets.data, or no pod will start.
+{{- end }}
+
+{{- if .Values.ingress.enabled }}
+
+Public API: http{{ if .Values.ingress.tls.enabled }}s{{ end }}://{{ .Values.ingress.host }}
+{{- range $name, $svc := .Values.services }}
+{{- if and $svc.enabled (default (dict) $svc.ingress).enabled }}
+{{- range (default (list) $svc.ingress.paths) }}
+  {{ printf "%-24s" .path }} -> {{ $name }}
+{{- end }}
+{{- end }}
+{{- end }}
+
+  moderation-service, provider-adapter and clustering-service are absent by
+  design: the first has no API, and the other two expose unauthenticated
+  internal surfaces that must stay inside the cluster.
+{{- end }}
+
+Quick checks
+  kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/instance={{ .Release.Name }}
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "dabet.fullname" . }}-moderation-service 9090:9090
+  curl -s localhost:9090/metrics | grep -E 'fail_open_total|kafka_consumer_lag_messages'
+
+  fail_open_total is the single most important metric in the system (§4.5).
+  It must be zero in steady state.

@@ -1,0 +1,1120 @@
+# Dabet — application layer values.
+#
+# Everything here is CONFIGURATION. docs §3 is explicit: "All services must run
+# against the Compose profile with no code changes — topology differences are
+# configuration only." Nothing in this chart requires a Go change, and nothing
+# in it may become a reason to make one.
+#
+# The three files to read together:
+#   values.yaml        this file — the defaults, and every knob with its meaning
+#   values-local.yaml  a laptop kind/k3d cluster with in-cluster dependencies
+#   values-aws.yaml    managed dependencies (RDS/MSK/ElastiCache/S3), IRSA, ECR
+#
+# Layout:
+#   global.*            image coordinates, labels, scheduling defaults
+#   config.*            §4.4 NON-SECRET env, rendered into one shared ConfigMap
+#   secrets.* / externalSecrets.* / secretsStoreCSI.*   the §4.4 secret story
+#   kafka.*             consumer tunables + the §4.2 topic registry (partition
+#                       counts are the autoscaling ceiling — see autoscaling)
+#   jwt.*               §5.4 HS256 local / RS256 target
+#   tracing.*           §4.5 OTel, off unless an endpoint is set
+#   probes.*            §4.5 health semantics. READ THE COMMENT THERE.
+#   autoscaling.*       §4.7 lag as the overload signal (KEDA / HPA / none)
+#   services.*          the nine workloads
+
+# ---------------------------------------------------------------------------
+# global
+# ---------------------------------------------------------------------------
+global:
+  image:
+    # Final image ref is: registry/repository/<service>:tag
+    # e.g. 1234.dkr.ecr.eu-west-1.amazonaws.com/dabet/user-service:0.1.0
+    registry: ""
+    repository: dabet
+    # Empty means Chart.appVersion. Pin this in any real environment.
+    tag: ""
+    pullPolicy: IfNotPresent
+    pullSecrets: []
+
+  # Extra labels/annotations stamped on every object this chart creates.
+  commonLabels: {}
+  commonAnnotations: {}
+
+nameOverride: ""
+fullnameOverride: ""
+
+# ---------------------------------------------------------------------------
+# ServiceAccounts — one per service, so the Terraform agent can attach a
+# distinct IAM role to each (IRSA / EKS Pod Identity) without granting one
+# service another's permissions. Per-service annotations live under
+# services.<name>.serviceAccount.annotations.
+# ---------------------------------------------------------------------------
+serviceAccount:
+  create: true
+  # Annotations merged into EVERY service account.
+  annotations: {}
+  # No service in Dabet talks to the Kubernetes API. IRSA works through a
+  # projected token volume that the webhook adds regardless of this flag, so
+  # leaving it false costs nothing and removes a credential from every pod.
+  automountServiceAccountToken: false
+
+# ---------------------------------------------------------------------------
+# Pod / container security. Every image already runs as uid 65532 ("dabet",
+# see services/*/Dockerfile); this makes it enforced rather than incidental.
+# readOnlyRootFilesystem is safe because no service writes to disk — a
+# writable emptyDir is mounted at /tmp for the Go runtime and TLS caches.
+# ---------------------------------------------------------------------------
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  privileged: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+# ---------------------------------------------------------------------------
+# config — the §4.4 non-secret environment. These names are canonical and
+# identical across services by design ("prefixed by concern, not by service"),
+# so they live in ONE ConfigMap that every pod consumes with envFrom.
+#
+# Anything carrying a credential (POSTGRES_DSN, CLICKHOUSE_DSN, S3 keys) is
+# NOT here — see secrets. A DSN with a password in a ConfigMap is the single
+# most common way a chart leaks a database.
+# ---------------------------------------------------------------------------
+config:
+  kafkaBrokers: "dabet-kafka:9092"
+  redisAddr: "dabet-redis-master:6379"
+  memcachedAddrs: "dabet-memcached:11211"
+  vllmEndpoint: "http://dabet-vllm:8000"
+  embeddingEndpoint: "http://dabet-embedding:8091"
+  milvusAddr: "dabet-milvus:19530"
+  s3Endpoint: "http://dabet-minio:9000"
+  s3Bucket: "embeddings"
+  logLevel: "info"
+  # Free-form additions to the shared ConfigMap. Strings only.
+  extra: {}
+
+# ---------------------------------------------------------------------------
+# kafka — consumer tunables (pkg/kafkax/options.go) and the §4.2 registry.
+#
+# drainTimeoutSeconds is load-bearing beyond Kafka: terminationGracePeriod
+# MUST exceed it or a rolling update kills handlers mid-record. The chart
+# refuses to render if any workload violates that (see _helpers.tpl).
+# ---------------------------------------------------------------------------
+kafka:
+  consumer:
+    partitionConcurrency: 64   # KAFKA_CONSUMER_PARTITION_CONCURRENCY (0 = unlimited, 1 = serial)
+    queueDepth: 2              # KAFKA_CONSUMER_QUEUE_DEPTH
+    maxPollRecords: 1000       # KAFKA_CONSUMER_MAX_POLL_RECORDS
+    drainTimeoutSeconds: 30    # KAFKA_CONSUMER_DRAIN_TIMEOUT
+  commit:
+    intervalSeconds: 1         # KAFKA_COMMIT_INTERVAL
+    records: 1000              # KAFKA_COMMIT_RECORDS (0 disables the record trigger)
+  lag:
+    intervalSeconds: 15        # KAFKA_LAG_INTERVAL (0 disables sampling — do not)
+    timeoutSeconds: 5          # KAFKA_LAG_TIMEOUT
+  # §4.2 partition counts (target column). These are the AUTOSCALING CEILING:
+  # a consumer group cannot usefully exceed its topic's partition count, so
+  # maxReplicas is clamped to the partition count of the service's topic.
+  topics:
+    messages:
+      name: messages.v1
+      partitions: 512
+    flagged:
+      name: flagged.v1
+      partitions: 128
+    deletions:
+      name: deletions.v1
+      partitions: 128
+    usage:
+      name: usage.v1
+      partitions: 32
+
+# ---------------------------------------------------------------------------
+# jwt — §5.4: "HS256 in local / RS256 in target".
+#
+# alg: HS256  every service shares JWT_SECRET from the Secret. Bare-install
+#             default so the chart works with nothing but `helm install`.
+# alg: RS256  user-service mounts the PRIVATE key and issues; every other
+#             service that verifies mounts the PUBLIC key. Keys are mounted as
+#             files (JWT_PRIVATE_KEY_FILE / JWT_PUBLIC_KEY_FILE) rather than
+#             inlined into env, so the PEM never appears in `kubectl describe
+#             pod` or in a process listing.
+#
+# The three services that never verify a token (moderation-service,
+# provider-adapter, clustering-service) are given neither key: they call
+# httpx.VerifierFromEnv nowhere, so a key would be dead weight.
+# ---------------------------------------------------------------------------
+jwt:
+  alg: HS256
+  # `kid` header override for the issuer. Empty = thumbprint of the key.
+  kid: ""
+  # Where the PEMs land when alg is RS256.
+  mountPath: /etc/dabet/jwt
+  privateKeyFilename: tls.key
+  publicKeyFilename: tls.pub
+
+# ---------------------------------------------------------------------------
+# secrets — §4.4: "Secrets ... come from the environment in v1, from a secret
+# manager in the k8s target."
+#
+# Three interchangeable sources, one contract: a Kubernetes Secret named
+# `secrets.name` (default <release>-dabet) holding the keys listed under
+# `secrets.data`. Workloads only ever reference that Secret by name and key,
+# so switching sources changes nothing about the pods.
+#
+#   secrets.create=true          plain Secret from the values below. The
+#                                fallback that makes a bare-cluster install
+#                                work. Values here are DEV PLACEHOLDERS.
+#   externalSecrets.enabled=true External Secrets Operator syncs the same
+#                                Secret from AWS Secrets Manager / Vault /
+#                                GCP SM. Set secrets.create=false.
+#   secretsStoreCSI.enabled=true Secrets Store CSI driver, with
+#                                secretObjects syncing to the same Secret.
+#
+# Per-service key mapping is in services.<name>.secretEnv, which maps an ENV
+# VAR NAME to a KEY IN THE SECRET. That indirection is what lets §3's
+# "separate clusters for identity/policy" work: user-service can read
+# POSTGRES_DSN from key POSTGRES_DSN_IDENTITY while policy-service reads it
+# from POSTGRES_DSN_POLICY, with no template change.
+# ---------------------------------------------------------------------------
+secrets:
+  create: true
+  # Empty = <fullname>. Whatever provider fills it, this is the name the
+  # workloads reference.
+  name: ""
+  annotations: {}
+  # DEV PLACEHOLDERS mirroring deploy/compose/.env defaults. They exist so
+  # `helm install dabet .` produces running pods on a bare cluster. Override
+  # every one of them, or switch to externalSecrets, before this is real.
+  data:
+    POSTGRES_DSN: "postgres://dabet:dabet@dabet-postgresql:5432/dabet?sslmode=disable"
+    # Optional per-domain DSNs (§3 target: separate identity/policy clusters).
+    # Leave empty to fall back to POSTGRES_DSN — services.<name>.secretEnv
+    # decides which key each service actually reads.
+    POSTGRES_DSN_IDENTITY: ""
+    POSTGRES_DSN_POLICY: ""
+    POSTGRES_DSN_BILLING: ""
+    POSTGRES_DSN_REVIEW: ""
+    CLICKHOUSE_DSN: "clickhouse://dabet:dabet@dabet-clickhouse:9000/dabet"
+    S3_ACCESS_KEY: "minioadmin"
+    S3_SECRET_KEY: "minioadmin"
+    # HS256 shared secret. Required by every verifying service while
+    # jwt.alg is HS256; ignored under RS256.
+    JWT_SECRET: "dev-secret-change-me"
+    # RS256 PEMs. Only rendered into the Secret when jwt.alg is RS256 and
+    # these are non-empty. Generate with:
+    #   openssl genrsa -out jwt.key 2048
+    #   openssl rsa -in jwt.key -pubout -out jwt.pub
+    JWT_PRIVATE_KEY: ""
+    JWT_PUBLIC_KEY: ""
+    # credits-service treats both as REQUIRED at startup — it exits without
+    # them, so they cannot be left unset even in a stack with no Stripe.
+    STRIPE_SECRET_KEY: "sk_test_local"
+    STRIPE_WEBHOOK_SECRET: "whsec_local_dev"
+    # OAUTH_<PLATFORM>_CLIENT_ID / _CLIENT_SECRET for the platforms of §5.5.
+    # Empty is valid: user-service still serves the provider list, and a
+    # connect attempt for an unconfigured platform fails at the provider.
+    OAUTH_YOUTUBE_CLIENT_ID: ""
+    OAUTH_YOUTUBE_CLIENT_SECRET: ""
+    OAUTH_TWITCH_CLIENT_ID: ""
+    OAUTH_TWITCH_CLIENT_SECRET: ""
+    OAUTH_DISCORD_CLIENT_ID: ""
+    OAUTH_DISCORD_CLIENT_SECRET: ""
+    OAUTH_MOCK_CLIENT_ID: ""
+    OAUTH_MOCK_CLIENT_SECRET: ""
+    # SMTP credentials (§5.4 verification mail, A6, A8). Empty = anonymous.
+    MAIL_SMTP_USERNAME: ""
+    MAIL_SMTP_PASSWORD: ""
+
+# External Secrets Operator. Set secrets.create=false alongside.
+externalSecrets:
+  enabled: false
+  secretStoreRef:
+    name: ""
+    kind: ClusterSecretStore    # or SecretStore
+  refreshInterval: 1h
+  # creationPolicy Owner means ESO owns the target Secret's lifecycle.
+  creationPolicy: Owner
+  # Pull the whole remote secret as a key/value map. This is the terse path:
+  # one AWS Secrets Manager JSON document whose keys are exactly the keys
+  # under secrets.data.
+  dataFrom:
+    - extract:
+        key: ""                 # e.g. dabet/prod/app
+  # Or map individual keys. Entries here are appended to dataFrom.
+  #   - secretKey: POSTGRES_DSN_IDENTITY
+  #     remoteRef:
+  #       key: dabet/prod/rds-identity
+  #       property: dsn
+  data: []
+  # apiVersion of the ExternalSecret CRD. v1 since ESO 0.10; older clusters
+  # need v1beta1.
+  apiVersion: external-secrets.io/v1
+
+# Secrets Store CSI driver — the alternative to ESO. Mounts the provider's
+# secret and (with syncSecret) materialises the same Kubernetes Secret.
+secretsStoreCSI:
+  enabled: false
+  provider: aws
+  # Verbatim `parameters:` block for the SecretProviderClass.
+  parameters: {}
+  # secretObjects entry that produces the Secret the workloads reference.
+  syncSecret: true
+
+# ---------------------------------------------------------------------------
+# tracing — §4.5. Off unless endpoint is set: pkg/tracing installs the no-op
+# provider and exports nothing, which is exactly what a bare install wants.
+# ---------------------------------------------------------------------------
+tracing:
+  enabled: false
+  endpoint: ""                          # OTEL_EXPORTER_OTLP_ENDPOINT
+  protocol: grpc                        # OTEL_EXPORTER_OTLP_PROTOCOL
+  sampler: parentbased_traceidratio     # OTEL_TRACES_SAMPLER
+  # 1% head sampling. At N6's 500K msg/s, sampling everything is neither
+  # affordable nor useful. The compose observability overlay raises this to
+  # 1.0 for a laptop; do not copy that number here.
+  samplerArg: "0.01"
+  resourceAttributes: ""                # e.g. deployment.environment=prod
+
+# ---------------------------------------------------------------------------
+# probes — §4.5 health semantics.
+#
+# ############ READ THIS BEFORE CHANGING ANY NUMBER BELOW ############
+#
+# /healthz  = the process is alive.        -> livenessProbe
+# /readyz   = the process can serve.       -> readinessProbe
+#
+# Per P2 and §4.5, a moderation-path service that has LOST A DEPENDENCY IS
+# STILL READY. It fails open and keeps consuming. pkg/obs/health.go starts
+# ready and never flips on a dependency error, deliberately. §4.5: "/readyz
+# returning 503 would remove it from service and stop chat, which is exactly
+# the wrong outcome."
+#
+# So:
+#   * Do NOT point the readiness probe at anything dependency-aware.
+#   * Do NOT tighten failureThreshold to make outages "visible" — the metric
+#     for that is fail_open_total (§4.5), not a probe.
+#   * There is deliberately NO startupProbe. Nothing here has a slow start
+#     that liveness cannot absorb, and a startup probe is the one probe that
+#     can kill a pod that is up and failing open during a Redis outage.
+#
+# The liveness numbers are deliberately slack: 10s period x 6 failures = 60s
+# of continuous unresponsiveness before a restart. A service under the
+# congestion collapse measured in test/load/README.md is still serving
+# /healthz off a separate goroutine, so it will not trip; only a genuinely
+# wedged process will.
+#
+# THE OTHER NUMBER THE 60s BUDGET HAS TO CLEAR: the services that bootstrap
+# Postgres do it BEFORE they start the HTTP listener, so /healthz does not
+# answer at all during that window. provider-adapter retries 10 times at 3s
+# (~30 s) and then exits; user-service, credits-service, policy-service and
+# review-service bootstrap similarly. 60 s of liveness budget is therefore
+# about 2x the worst pre-listener window. Shortening either initialDelay or
+# failureThreshold eats that margin and turns a slow-but-recovering database
+# into a crash loop — which is the failure this file exists to prevent.
+# ---------------------------------------------------------------------------
+probes:
+  liveness:
+    enabled: true
+    path: /healthz
+    initialDelaySeconds: 10
+    periodSeconds: 10
+    timeoutSeconds: 3
+    successThreshold: 1
+    failureThreshold: 6
+  readiness:
+    enabled: true
+    path: /readyz
+    initialDelaySeconds: 3
+    periodSeconds: 10
+    timeoutSeconds: 3
+    successThreshold: 1
+    failureThreshold: 3
+
+# ---------------------------------------------------------------------------
+# autoscaling — §4.7 makes consumer lag THE overload signal.
+#
+# mode:
+#   keda   ScaledObject per consumer. Preferred: KEDA reads lag directly,
+#          either from the broker (trigger: kafka — no Prometheus needed, and
+#          the broker is the authority on offsets) or from Prometheus
+#          (trigger: prometheus — reads kafka_consumer_lag_messages, the §4.5
+#          metric every consumer now publishes). Requires the KEDA operator.
+#   hpa    HPA on CPU. The fallback path: no operator, no CRDs, works on any
+#          cluster. It is a WORSE signal — CPU does not move when the
+#          bottleneck is a Redis round trip (see test/load/README.md F3: the
+#          moderation cascade is latency-bound, not CPU-bound), so an
+#          instance can be 100% behind at 20% CPU and never scale.
+#   none   fixed replicas.
+#
+# THE CEILING: a consumer group cannot usefully exceed its topic's partition
+# count. Extra members sit idle holding no partitions. maxReplicas is
+# therefore clamped to kafka.topics.<topic>.partitions for every consumer,
+# in _helpers.tpl. §4.2 sets messages.v1 at 512, so moderation-service can
+# never usefully exceed 512 pods however much lag there is.
+# ---------------------------------------------------------------------------
+autoscaling:
+  mode: none         # keda | hpa | none
+  keda:
+    # kafka | prometheus
+    trigger: kafka
+    apiVersion: keda.sh/v1alpha1
+    pollingInterval: 30
+    cooldownPeriod: 300
+    # Scaling to zero is WRONG here: a consumer at zero replicas accrues lag
+    # with nothing to drain it, and §4.7 says accept lag, never shed. Keep
+    # the floor at the service's replicas value.
+    minReplicaCountOverride: null
+    kafka:
+      # Defaults to config.kafkaBrokers when empty.
+      bootstrapServers: ""
+      # Records of lag per replica that the scaler targets.
+      lagThreshold: "1000"
+      # Lag on a partition with no committed offset yet.
+      activationLagThreshold: "0"
+      offsetResetPolicy: latest
+      # Do not let KEDA scale past the partition count itself; the chart
+      # clamps maxReplicas too, this is belt and braces.
+      allowIdleConsumers: false
+      sasl: ""       # "", plaintext, scram_sha256, scram_sha512
+      tls: "disable" # disable | enable
+      # Name of a KEDA TriggerAuthentication to attach (SASL/TLS material).
+      triggerAuthenticationRef: ""
+    prometheus:
+      serverAddress: ""
+      # Sum of the §4.5 gauge across partitions for the group. The literal
+      # tokens __GROUP__ and __TOPIC__ are substituted per service with that
+      # service's consumer group and topic.
+      query: 'sum(kafka_consumer_lag_messages{group="__GROUP__",topic="__TOPIC__"})'
+      threshold: "1000"
+      activationThreshold: "0"
+  hpa:
+    apiVersion: autoscaling/v2
+    targetCPUUtilizationPercentage: 70
+    targetMemoryUtilizationPercentage: null
+  # Applied to both KEDA's generated HPA and a direct HPA. Scale up fast
+  # (lag is already customer-visible latency), scale down slowly (a
+  # rebalance costs a drain on every member).
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 30
+    scaleDown:
+      stabilizationWindowSeconds: 600
+      policies:
+        - type: Percent
+          value: 10
+          periodSeconds: 60
+
+# ---------------------------------------------------------------------------
+# metrics — §4.5, Prometheus on :9090/metrics. Guarded: nothing renders
+# unless enabled, so the chart installs where the Prometheus CRDs are absent.
+# ---------------------------------------------------------------------------
+metrics:
+  serviceMonitor:
+    enabled: false
+    # ServiceMonitor (needs a Service) or PodMonitor (scrapes pods directly —
+    # the better fit for the headless provider-adapter StatefulSet).
+    kind: ServiceMonitor
+    interval: 30s
+    scrapeTimeout: 10s
+    # Labels the Prometheus Operator's serviceMonitorSelector matches on.
+    labels: {}
+    honorLabels: false
+    relabelings: []
+    metricRelabelings: []
+
+# ---------------------------------------------------------------------------
+# PodDisruptionBudgets. maxUnavailable rather than minAvailable so a
+# single-replica service (clusters-job) is not made undrainable.
+# ---------------------------------------------------------------------------
+podDisruptionBudget:
+  enabled: true
+  maxUnavailable: 1
+  minAvailable: null
+
+# ---------------------------------------------------------------------------
+# Scheduling. Soft anti-affinity by default: on a one-node kind cluster a
+# hard rule would leave every replica beyond the first Pending forever.
+# values-aws.yaml turns the zone spread into a real constraint.
+# ---------------------------------------------------------------------------
+scheduling:
+  topologySpreadConstraints:
+    enabled: true
+    # ScheduleAnyway, not DoNotSchedule: an unschedulable moderation replica
+    # during an AZ event is worse than an unevenly spread one (P2).
+    zoneWhenUnsatisfiable: ScheduleAnyway
+    nodeWhenUnsatisfiable: ScheduleAnyway
+    zoneKey: topology.kubernetes.io/zone
+    nodeKey: kubernetes.io/hostname
+  podAntiAffinity:
+    enabled: true
+    type: soft   # soft | hard
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  priorityClassName: ""
+
+# ---------------------------------------------------------------------------
+# Ingress — only the services with a public creator-facing API get one.
+# moderation-service (no routes at all), provider-adapter (only the test-only
+# /mock/* injection surface) and clustering-service (/internal/v1/assign)
+# have NO ingress and must not get one.
+#
+# PATH PRECEDENCE MATTERS HERE: insights-service serves GET /v1/topics* and
+# clusters-job serves POST /v1/topics/recluster. The recluster path is
+# declared Exact so it wins over the insights Prefix rule; on a controller
+# that does not implement Exact-beats-Prefix, split them onto separate hosts.
+# ---------------------------------------------------------------------------
+ingress:
+  enabled: false
+  className: ""
+  host: dabet.example.com
+  annotations: {}
+  tls:
+    enabled: true
+    # Empty = <fullname>-tls. Point cert-manager or the ALB controller at it.
+    secretName: ""
+  extraHosts: []
+
+# ---------------------------------------------------------------------------
+# NetworkPolicies. Default OFF: a default-deny policy on a cluster without a
+# policy-enforcing CNI is a silent no-op, and on one with a CNI it will break
+# a bare install that has dependencies outside the release's label scope.
+# Turn on deliberately, in an environment where you can verify it.
+# ---------------------------------------------------------------------------
+networkPolicy:
+  enabled: false
+  # Allow DNS to kube-system.
+  allowDNS: true
+  # CIDRs the pods may egress to (Kafka, Postgres, Redis, S3, the LLM ...).
+  # Empty means "all egress allowed", which is the honest default when the
+  # dependencies are managed services with rotating IPs.
+  egressCIDRs: []
+  # Namespace selector for whatever scrapes :9090 and whatever fronts the
+  # ingress. Empty = allow from any namespace.
+  monitoringNamespaceSelector: {}
+  ingressNamespaceSelector: {}
+
+# ---------------------------------------------------------------------------
+# services — the nine workloads.
+#
+# Per-service keys:
+#   kind             Deployment | StatefulSet
+#   replicas         fixed count, and the floor when autoscaling is on
+#   image            {registry,repository,tag,pullPolicy} overriding global
+#   ports.http       app + /healthz + /readyz          (8080 in every image)
+#   ports.metrics    Prometheus /metrics               (9090 in every image)
+#   ports.extra      additional named container ports (policy-service gRPC)
+#   headless         emit a headless Service (StatefulSet stable DNS)
+#   consumer         {enabled,group,topic,partitions}  drives KEDA + the cap
+#   autoscaling      {enabled,minReplicas,maxReplicas,mode} per service
+#   ingress          {enabled,paths:[{path,pathType}]}
+#   env              plain env vars -> per-service ConfigMap
+#   envRaw           verbatim env entries (fieldRef, resourceFieldRef, ...)
+#   secretEnv        ENV_NAME -> key in the Secret
+#   jwt              none | verify | issue
+#   resources        requests/limits
+#   terminationGracePeriodSeconds
+# ---------------------------------------------------------------------------
+services:
+
+  # -- Area A ---------------------------------------------------------------
+
+  user-service:
+    enabled: true
+    kind: Deployment
+    replicas: 2
+    # Stateless HTTP, no Kafka. Scales on request load, so a CPU HPA is the
+    # right signal here — there is no lag to read.
+    autoscaling:
+      enabled: false
+      mode: hpa
+      minReplicas: 2
+      maxReplicas: 10
+    ports:
+      http: 8080
+      metrics: 9090
+    ingress:
+      enabled: true
+      paths:
+        - path: /v1/auth
+          pathType: Prefix
+        - path: /v1/me
+          pathType: Prefix
+        - path: /v1/connections
+          pathType: Prefix
+    # §5.4: the ONLY service that issues. Under RS256 it mounts the private key.
+    jwt: issue
+    secretEnv:
+      POSTGRES_DSN: POSTGRES_DSN_IDENTITY
+      OAUTH_YOUTUBE_CLIENT_ID: OAUTH_YOUTUBE_CLIENT_ID
+      OAUTH_YOUTUBE_CLIENT_SECRET: OAUTH_YOUTUBE_CLIENT_SECRET
+      OAUTH_TWITCH_CLIENT_ID: OAUTH_TWITCH_CLIENT_ID
+      OAUTH_TWITCH_CLIENT_SECRET: OAUTH_TWITCH_CLIENT_SECRET
+      OAUTH_DISCORD_CLIENT_ID: OAUTH_DISCORD_CLIENT_ID
+      OAUTH_DISCORD_CLIENT_SECRET: OAUTH_DISCORD_CLIENT_SECRET
+      MAIL_SMTP_USERNAME: MAIL_SMTP_USERNAME
+      MAIL_SMTP_PASSWORD: MAIL_SMTP_PASSWORD
+    env:
+      # §5.5. OAUTH_<PLATFORM>_REDIRECT_URI defaults to
+      # <OAUTH_REDIRECT_BASE>/v1/connections/callback, so setting the base is
+      # enough for all three real platforms.
+      OAUTH_REDIRECT_BASE: "https://dabet.example.com"
+      APP_REDIRECT_URL: "https://app.dabet.example.com/connections"
+      APP_VERIFY_URL: "https://app.dabet.example.com/verify"
+      # A6 sweep for connections provider-adapter marked expired.
+      CONNECTION_EXPIRY_SWEEP_INTERVAL: "1m"
+      CONNECTIONS_GAUGE_INTERVAL: "30s"
+      # MAIL_* (§5.4/A6/A8). Empty MAIL_SMTP_ADDR = log-only, which is the
+      # v1 behaviour. MAIL_TLS must be starttls or tls anywhere real: the
+      # mailer refuses to send credentials over a plaintext connection.
+      MAIL_SMTP_ADDR: ""
+      MAIL_FROM: "Dabet <no-reply@dabet.example.com>"
+      MAIL_TLS: "starttls"
+      MAIL_TIMEOUT: "10s"
+      MAIL_QUEUE_SIZE: "256"
+      MAIL_WORKERS: "2"
+      MAIL_MAX_ATTEMPTS: "3"
+      MAIL_RETRY_BASE: "1s"
+      MAIL_HELO: ""
+      # DEV_EXPOSE_VERIFICATION_TOKEN and OAUTH_MOCK_ENABLED are deliberately
+      # ABSENT. The first hands an unauthenticated caller a token that
+      # verifies an arbitrary address; values-local.yaml sets them, nothing
+      # else may.
+    resources:
+      requests: { cpu: 100m, memory: 128Mi }
+      limits: { cpu: 1, memory: 512Mi }
+    terminationGracePeriodSeconds: 30
+
+  credits-service:
+    enabled: true
+    kind: Deployment
+    replicas: 2
+    # usage.v1 consumer group. §4.2 caps usage.v1 at 32 partitions, so 32 is
+    # the hard ceiling on this group however much lag accrues.
+    consumer:
+      enabled: true
+      group: credits-service
+      topic: usage
+    autoscaling:
+      enabled: false
+      minReplicas: 2
+      maxReplicas: 8
+    ports:
+      http: 8080
+      metrics: 9090
+    ingress:
+      enabled: true
+      paths:
+        - path: /v1/credits
+          pathType: Prefix
+        # Stripe posts here; it authenticates with its own signature, not a
+        # JWT, so it must be reachable from outside.
+        - path: /v1/webhooks/stripe
+          pathType: Exact
+        # /internal/v1/credits-ok/{id} is deliberately NOT exposed. It is the
+        # §5.8 credits_ok check that moderation-service makes in-cluster.
+    jwt: verify
+    secretEnv:
+      POSTGRES_DSN: POSTGRES_DSN_BILLING
+      STRIPE_SECRET_KEY: STRIPE_SECRET_KEY
+      STRIPE_WEBHOOK_SECRET: STRIPE_WEBHOOK_SECRET
+      MAIL_SMTP_USERNAME: MAIL_SMTP_USERNAME
+      MAIL_SMTP_PASSWORD: MAIL_SMTP_PASSWORD
+    env:
+      STRIPE_API_BASE: "https://api.stripe.com"
+      CREDITS_CONSUMER_GROUP: "credits-service"
+      CREDITS_PER_CENT: "1"
+      CREDITS_NEGATIVE_GAUGE_INTERVAL: "60s"
+      # Left unset so the service's own defaults apply; only credits-service
+      # knows what an event costs (§4.2).
+      CREDITS_COST_MESSAGES_PROCESSED: ""
+      CREDITS_COST_MESSAGES_RECLUSTERED: ""
+      APP_BILLING_URL: "https://app.dabet.example.com/billing"
+      MAIL_SMTP_ADDR: ""
+      MAIL_FROM: "Dabet <no-reply@dabet.example.com>"
+      MAIL_TLS: "starttls"
+      MAIL_TIMEOUT: "10s"
+      MAIL_QUEUE_SIZE: "256"
+      MAIL_WORKERS: "2"
+      MAIL_MAX_ATTEMPTS: "3"
+      MAIL_RETRY_BASE: "1s"
+      MAIL_HELO: ""
+    resources:
+      requests: { cpu: 100m, memory: 128Mi }
+      limits: { cpu: 1, memory: 512Mi }
+    # > kafka.consumer.drainTimeoutSeconds (30) + the runner's 10s HTTP
+    # shutdown. Below that, a rolling update kills a handler mid-record and
+    # the ledger re-processes it on redelivery.
+    terminationGracePeriodSeconds: 60
+
+  # -- Area B ---------------------------------------------------------------
+
+  policy-service:
+    enabled: true
+    kind: Deployment
+    # Every moderation cascade calls GetPolicy over gRPC (§6.7, A11). It is
+    # on the hot path for every message that misses the in-process cache, so
+    # it never runs as a single replica.
+    replicas: 3
+    autoscaling:
+      enabled: false
+      mode: hpa
+      minReplicas: 3
+      maxReplicas: 20
+    ports:
+      http: 8080
+      metrics: 9090
+      extra:
+        - name: grpc
+          containerPort: 7101
+          protocol: TCP
+    ingress:
+      enabled: true
+      paths:
+        - path: /v1/policies
+          pathType: Prefix
+        # The gRPC port is NOT ingressed. It is an in-cluster contract.
+    jwt: verify
+    secretEnv:
+      POSTGRES_DSN: POSTGRES_DSN_POLICY
+    env:
+      GRPC_ADDR: ":7101"
+      # A10: Memcached TTL 300s.
+      POLICY_MEMCACHED_TTL: "300s"
+    resources:
+      requests: { cpu: 250m, memory: 256Mi }
+      limits: { cpu: 2, memory: 1Gi }
+    terminationGracePeriodSeconds: 30
+
+  # -- Area C ---------------------------------------------------------------
+
+  provider-adapter:
+    enabled: true
+    # ###################################################################
+    # StatefulSet, NOT Deployment. This is A13, not a preference.
+    #
+    # §7.2/A13 shards connections onto a consistent-hash ring whose node
+    # names are ADAPTER_INSTANCE_ID, which defaults to the hostname. A
+    # Deployment gives every pod a fresh random name, so every rollout —
+    # and every individual pod replacement — would introduce a brand new
+    # ring member and retire an old one, reshuffling a segment and forcing
+    # those connections to reconnect for no reason. The compose fragment
+    # says the same thing: the ID "MUST be stable across restarts of the
+    # same logical instance".
+    #
+    # A StatefulSet gives dabet-provider-adapter-0..N-1: stable ordinals,
+    # so a restarted pod rejoins the ring as the same member and owns the
+    # same segment. envRaw wires ADAPTER_INSTANCE_ID to that name.
+    # ###################################################################
+    kind: StatefulSet
+    headless: true
+    # >1 by design: with a single instance the ring has one member, every
+    # connection is owned by it, and A13 is a no-op.
+    replicas: 3
+    # The adapter IS a deletions.v1 consumer, but it is deliberately NOT
+    # lag-autoscaled: adding a member reshuffles the connection ring and
+    # forces reconnects across every platform. Scale it on connection count
+    # (A13's 5 000/instance bound), by changing replicas, deliberately.
+    consumer:
+      enabled: true
+      group: provider-adapter
+      topic: deletions
+    autoscaling:
+      enabled: false
+      maxReplicas: 128
+    ports:
+      http: 8080
+      metrics: 9090
+    ingress:
+      # NEVER. The only routes are POST /mock/messages and GET
+      # /mock/deletions — an unauthenticated message-injection surface that
+      # is registered unconditionally by the binary. Exposing it lets anyone
+      # inject chat messages into any creator's pipeline.
+      enabled: false
+    jwt: none
+    secretEnv:
+      POSTGRES_DSN: POSTGRES_DSN_IDENTITY
+      OAUTH_YOUTUBE_CLIENT_ID: OAUTH_YOUTUBE_CLIENT_ID
+      OAUTH_YOUTUBE_CLIENT_SECRET: OAUTH_YOUTUBE_CLIENT_SECRET
+      OAUTH_TWITCH_CLIENT_ID: OAUTH_TWITCH_CLIENT_ID
+      OAUTH_TWITCH_CLIENT_SECRET: OAUTH_TWITCH_CLIENT_SECRET
+      OAUTH_DISCORD_CLIENT_ID: OAUTH_DISCORD_CLIENT_ID
+      OAUTH_DISCORD_CLIENT_SECRET: OAUTH_DISCORD_CLIENT_SECRET
+    envRaw:
+      # The ring node name. metadata.name on a StatefulSet is
+      # <sts>-<ordinal>: stable across restarts, unique across replicas.
+      - name: ADAPTER_INSTANCE_ID
+        valueFrom:
+          fieldRef:
+            fieldPath: metadata.name
+    env:
+      ADAPTER_SHARDING_ENABLED: "true"
+      # A13: 5 000 connections per instance.
+      ADAPTER_SHARD_MAX_CONNECTIONS: "5000"
+      # libketama's virtual-node count; more nodes, smoother segments.
+      ADAPTER_SHARD_REPLICAS: "160"
+      ADAPTER_SHARD_SESSION_TIMEOUT: "30s"
+      # The coordinator is a Kafka consumer group — no etcd, no new
+      # infrastructure. The topic carries no records and the adapter creates
+      # it on startup with broker defaults.
+      ADAPTER_SHARD_GROUP: "provider-adapter-shards"
+      ADAPTER_SHARD_TOPIC: "adapter.shards.v1"
+      ADAPTER_CONNSOURCE_POLL: "15s"
+      ADAPTER_INGEST_BUFFER: "256"
+      ADAPTER_WATCH_RETRY: "2s"
+      ADAPTER_DELETE_BACKOFF_BASE: "200ms"
+      # §7.2: YouTube's hard daily quota and its discovery cadence.
+      ADAPTER_YOUTUBE_DAILY_QUOTA: "10000"
+      ADAPTER_YOUTUBE_DISCOVERY_INTERVAL: "60s"
+      # 0 = ask GET /gateway/bot for the recommended shard count.
+      ADAPTER_DISCORD_SHARDS: "0"
+      # OAUTH_<PLATFORM>_TOKEN_URL for §5.6 refresh. Built-in defaults are
+      # the real provider endpoints; stated so they are discoverable.
+      OAUTH_YOUTUBE_TOKEN_URL: "https://oauth2.googleapis.com/token"
+      OAUTH_TWITCH_TOKEN_URL: "https://id.twitch.tv/oauth2/token"
+      OAUTH_DISCORD_TOKEN_URL: "https://discord.com/api/oauth2/token"
+      # Static seed connections (platform:conn:creator[:native]). Empty in
+      # any real deployment — connections come from Postgres.
+      ADAPTER_CONNECTIONS: ""
+    resources:
+      # The adapter holds up to ADAPTER_SHARD_MAX_CONNECTIONS long-lived
+      # websockets/pollers plus an ADAPTER_INGEST_BUFFER channel. Memory
+      # scales with connection count, CPU with message rate.
+      requests: { cpu: 250m, memory: 512Mi }
+      limits: { cpu: 2, memory: 2Gi }
+    # Longest grace period in the chart. On SIGTERM the adapter must drain
+    # the deletions.v1 consumer (30s) AND let the ring rebalance move its
+    # connections, and a half-closed platform websocket costs a reconnect.
+    terminationGracePeriodSeconds: 90
+
+  moderation-service:
+    enabled: true
+    kind: Deployment
+    # The hot path. test/load/README.md measured 170-200 msg/s per instance;
+    # N6's 50 000 msg/s baseline is ~250-300 instances. 6 is a starting
+    # point for a non-production cluster, not a capacity plan.
+    replicas: 6
+    consumer:
+      enabled: true
+      group: moderation-service
+      topic: messages
+    autoscaling:
+      enabled: false
+      minReplicas: 6
+      # Clamped to messages.v1's 512 partitions by the chart regardless.
+      maxReplicas: 512
+    ports:
+      http: 8080
+      metrics: 9090
+    ingress:
+      # No API at all — the binary registers nothing on its mux beyond
+      # /healthz and /readyz. Metrics only, per README's service map.
+      enabled: false
+    # Never verifies a token: it has no HTTP surface to protect.
+    jwt: none
+    envRaw:
+      # §7.10: the usage.v1 idempotency_key is derived from producer
+      # identity + window + creator. Two instances sharing an INSTANCE_ID
+      # would have their usage events deduplicated AGAINST EACH OTHER by the
+      # ledger's unique index, silently under-billing. The binary defaults
+      # this to the hostname, which is already the pod name; setting it
+      # explicitly makes the requirement visible instead of incidental.
+      - name: INSTANCE_ID
+        valueFrom:
+          fieldRef:
+            fieldPath: metadata.name
+    env:
+      POLICY_ENDPOINT: "dabet-policy-service:7101"
+      CREDITS_ENDPOINT: "http://dabet-credits-service:8080"
+      MOD_CONSUMER_GROUP: "moderation-service"
+      LLM_MODEL: "moderation"
+      # A18 says 1 000ms, and §4.6 gives the LLM hop 1 000ms of budget.
+      # test/load/README.md F4: with both at 1 000ms, 42% of batches timed
+      # out and failed the WHOLE batch open. 3s is what compose runs and
+      # what the "clear the LLM's slow tail" commit settled on; it spends
+      # latency budget to stop bulk under-moderation.
+      MOD_LLM_TIMEOUT: "3s"
+      # A18's 32-message trigger is unreachable under A17's sampler
+      # (measured mean batch size 1.07-4.0, F5), so the linger is what
+      # actually sets batch size, and batch size is what amortises the
+      # policy rubric across a prompt.
+      MOD_LLM_LINGER: "250ms"
+      MOD_LLM_BATCH_SIZE: "32"
+      MOD_LLM_MAX_IDLE_CONNS: "64"
+      MOD_EMBED_TIMEOUT: "1s"
+      # A15 / A16 / A17.
+      MOD_DUP_DEPTH: "20"
+      MOD_EMB_DEPTH: "20"
+      MOD_SEMANTIC_THRESHOLD: "0.95"
+      MOD_SAMPLER_CAPACITY: "30"
+      MOD_SAMPLER_REFILL_PER_MIN: "30"
+      # A10.
+      MOD_POLICY_CACHE_TTL: "60s"
+      MOD_POLICY_CACHE_SIZE: "100000"
+      # §4.7: retry the verdict publish with backoff, drop after 30s.
+      MOD_PUBLISH_RETRY_MAX: "30s"
+      # test/load/README.md F2: a Redis outage collapsed throughput ~97%
+      # because every message re-probed a dead Redis on the consumer path.
+      # The breaker marks Redis down for a cooldown instead of for one
+      # message, which is what makes the Redis failure behave like the LLM
+      # and policy failures (which cost nothing).
+      MOD_REDIS_BREAKER_THRESHOLD: "5"
+      MOD_REDIS_BREAKER_COOLDOWN: "1s"
+      MOD_REDIS_BREAKER_MAX_COOLDOWN: "30s"
+      MOD_REDIS_TIMEOUT: "500ms"
+      MOD_REDIS_MAX_RETRIES: "1"
+    resources:
+      # From test/load/README.md, not invented:
+      #  * measured ceiling 170-200 msg/s per instance, and the binding
+      #    constraint is Redis round-trip LATENCY, not CPU (F3) — the pod is
+      #    mostly waiting, so a 1-CPU request with a 2-CPU limit gives the
+      #    now-concurrent partition workers (KAFKA_CONSUMER_PARTITION_
+      #    CONCURRENCY=64) headroom without reserving cores that idle.
+      #  * memory is dominated by the A10 policy cache: MOD_POLICY_CACHE_SIZE
+      #    is 100 000 entries of a resolved policy document. 1Gi requested,
+      #    2Gi limit, which also covers MOD_EMB_DEPTH embedding buffers and
+      #    the in-flight batch.
+      requests: { cpu: 1, memory: 1Gi }
+      limits: { cpu: 2, memory: 2Gi }
+    # Must exceed KAFKA_CONSUMER_DRAIN_TIMEOUT (30s) plus the runner's 10s
+    # graceful HTTP shutdown, or a rollout kills handlers mid-cascade and
+    # the in-flight records are redelivered and re-processed.
+    terminationGracePeriodSeconds: 60
+
+  review-service:
+    enabled: true
+    kind: Deployment
+    replicas: 2
+    # NOT a consumer group. §7.6 makes a pending review a POSITION in a
+    # flagged.v1 partition, read directly per creator on GET /v1/reviews —
+    # queue.NewKafka, no group, no committed offsets. It therefore publishes
+    # review_queue_lag_seconds, NOT kafka_consumer_lag_messages, and there is
+    # no consumer lag for KEDA to read. Scale it on request load.
+    consumer:
+      enabled: false
+    autoscaling:
+      enabled: false
+      mode: hpa
+      minReplicas: 2
+      maxReplicas: 16
+    ports:
+      http: 8080
+      metrics: 9090
+    ingress:
+      enabled: true
+      paths:
+        - path: /v1/reviews
+          pathType: Prefix
+    jwt: verify
+    secretEnv:
+      POSTGRES_DSN: POSTGRES_DSN_REVIEW
+    env:
+      REVIEW_PARTITION_METADATA_TTL: "1m"
+      REVIEW_LAG_SAMPLE_INTERVAL: "1m"
+      REVIEW_LAG_ACTIVE_TTL: "1h"
+    resources:
+      requests: { cpu: 100m, memory: 256Mi }
+      limits: { cpu: 1, memory: 1Gi }
+    # Produces to deletions.v1 and reads flagged.v1 partitions directly; no
+    # consumer-group drain to wait for.
+    terminationGracePeriodSeconds: 30
+
+  # -- Area D ---------------------------------------------------------------
+
+  insights-service:
+    enabled: true
+    kind: Deployment
+    replicas: 3
+    # One group, TWO topics (messages.v1 and flagged.v1). The lag signal and
+    # the replica ceiling both come from messages.v1, which is 4x the
+    # partitions and orders of magnitude more traffic.
+    consumer:
+      enabled: true
+      group: insights-service
+      topic: messages
+    autoscaling:
+      enabled: false
+      minReplicas: 3
+      maxReplicas: 128
+    ports:
+      http: 8080
+      metrics: 9090
+    ingress:
+      enabled: true
+      paths:
+        # Prefix, so it also serves /v1/topics/{id} and /{id}/themes. See the
+        # note on ingress.* about clusters-job's Exact recluster path.
+        - path: /v1/topics
+          pathType: Prefix
+    jwt: verify
+    secretEnv:
+      CLICKHOUSE_DSN: CLICKHOUSE_DSN
+      S3_ACCESS_KEY: S3_ACCESS_KEY
+      S3_SECRET_KEY: S3_SECRET_KEY
+    env:
+      # §8.5 live centroid assignment. EMPTY STRING is meaningful and is not
+      # the same as unset: insights reads this with os.LookupEnv, so unset
+      # falls back to a localhost default while set-but-empty DISABLES the
+      # assignment hop. With clustering-service off, posting embeddings at a
+      # service that is not deployed would climb
+      # fail_open_total{component="clustering"} forever and make the §4.5
+      # alert worthless. The chart sets this key automatically when
+      # clustering-service is enabled; leave it "" here.
+      CLUSTERING_ENDPOINT: ""
+      # A20: the 2s exclusion buffer, so a late flag can still exclude its
+      # message from Insights (§8.3).
+      INSIGHTS_BUFFER_SECONDS: "2"
+      INSIGHTS_BUFFER_MAX_MESSAGES: "200000"
+      INSIGHTS_SAMPLE_PER_MINUTE: "60"
+      INSIGHTS_SAMPLE_CAPACITY: "60"
+      INSIGHTS_EMBED_BATCH_SIZE: "64"
+      INSIGHTS_EMBED_LINGER_MS: "250"
+      INSIGHTS_EMBED_TIMEOUT_MS: "5000"
+      INSIGHTS_S3_ROLL_BYTES: "8388608"
+      INSIGHTS_S3_ROLL_SECONDS: "60"
+      INSIGHTS_ASSIGN_TIMEOUT_MS: "2000"
+      INSIGHTS_ASSIGN_QUEUE_BATCHES: "256"
+    resources:
+      # INSIGHTS_BUFFER_MAX_MESSAGES (200 000) is an in-memory exclusion
+      # buffer holding message records for INSIGHTS_BUFFER_SECONDS, and the
+      # parquet writer buffers up to INSIGHTS_S3_ROLL_BYTES (8 MiB) per open
+      # creator/day file before flushing to S3. Memory, not CPU, is the
+      # binding resource.
+      requests: { cpu: 500m, memory: 512Mi }
+      limits: { cpu: 2, memory: 2Gi }
+    terminationGracePeriodSeconds: 60
+
+  clustering-service:
+    # Opt-in, exactly like the compose `clustering` profile: it needs Milvus,
+    # which wants several GB on its own. insights-service still proves its
+    # durable leg without it (§8.4) and picks the vectors up on the next
+    # clusters-job run.
+    enabled: false
+    kind: Deployment
+    replicas: 2
+    autoscaling:
+      enabled: false
+      mode: hpa
+      minReplicas: 2
+      maxReplicas: 16
+    ports:
+      http: 8080
+      metrics: 9090
+    ingress:
+      # POST /internal/v1/assign only. Service-to-service, unauthenticated by
+      # design, and must stay inside the cluster.
+      enabled: false
+    jwt: none
+    secretEnv:
+      CLICKHOUSE_DSN: CLICKHOUSE_DSN
+    env:
+      # A23: live assignment threshold 0.75 cosine.
+      CLUSTER_ASSIGN_THRESHOLD: "0.75"
+      CLUSTER_COUNTS_FLUSH_INTERVAL: "5s"
+      CLUSTER_COUNTS_FLUSH_MAX_ROWS: "10000"
+      CLUSTER_COUNTS_INSERT_TIMEOUT: "10s"
+    resources:
+      requests: { cpu: 250m, memory: 512Mi }
+      limits: { cpu: 2, memory: 2Gi }
+    terminationGracePeriodSeconds: 30
+
+  clusters-job:
+    enabled: false
+    # ###################################################################
+    # A Deployment, NOT a CronJob — despite the name.
+    #
+    # services/clusters-job/cmd/clusters-job/main.go runs
+    # trigger.Scheduler.Loop(ctx), which sweeps every
+    # CLUSTERS_TRIGGER_INTERVAL evaluating §8.6's four triggers, AND serves
+    # POST /v1/topics/recluster (JWT-authed, 202 + job_id) for the on-demand
+    # case. A CronJob would have no HTTP listener, so the on-demand trigger
+    # would simply not exist.
+    #
+    # RUN_ONCE=<creator>:<from>:<to> makes the same binary a one-shot: it
+    # runs a single window and exits WITHOUT starting the scheduler or the
+    # HTTP API. That mode is a Job, not this workload; use `helm template`
+    # output as a starting point if you need it.
+    # ###################################################################
+    kind: Deployment
+    # ONE. The scheduler has no leader election: a second replica would
+    # sweep the same triggers, start a duplicate clustering pass for the
+    # same creator, and emit a second usage.v1 messages_reclustered event
+    # with a different idempotency_key — i.e. double-charge the creator.
+    replicas: 1
+    autoscaling:
+      enabled: false
+    # Recreate, not RollingUpdate: with one replica a rolling update briefly
+    # runs two schedulers, which is exactly what replicas:1 is preventing.
+    strategy:
+      type: Recreate
+    ports:
+      http: 8080
+      metrics: 9090
+    ingress:
+      enabled: true
+      paths:
+        # Exact, so it wins over insights-service's /v1/topics Prefix rule.
+        - path: /v1/topics/recluster
+          pathType: Exact
+    jwt: verify
+    secretEnv:
+      CLICKHOUSE_DSN: CLICKHOUSE_DSN
+      S3_ACCESS_KEY: S3_ACCESS_KEY
+      S3_SECRET_KEY: S3_SECRET_KEY
+    env:
+      LLM_MODEL: "moderation"
+      # §8.6 triggers.
+      CLUSTERS_TRIGGER_INTERVAL: "5m"
+      CLUSTERS_WINDOW_DAYS: "30"
+      CLUSTERS_BOOTSTRAP_MIN: "100"
+      # A24: recluster above 30% unassigned over an hour.
+      CLUSTERS_UNASSIGNED_RATE: "0.30"
+      CLUSTERS_UNASSIGNED_MIN_POINTS: "100"
+      CLUSTERS_RUN_COOLDOWN: "30m"
+      # HDBSCAN, topics then themes.
+      CLUSTERS_MIN_CLUSTER_SIZE: "15"
+      CLUSTERS_MIN_SAMPLES: "5"
+      CLUSTERS_THEME_MIN_CLUSTER_SIZE: "5"
+      CLUSTERS_THEME_MIN_SAMPLES: "3"
+      CLUSTERS_MAX_POINTS: "200000"
+      CLUSTERS_ASSIGN_THRESHOLD: "0.75"
+      CLUSTERS_REUSE_THRESHOLD: "0.75"
+      # A25: label from the 20 points nearest the centroid.
+      CLUSTERS_LABEL_POINTS: "20"
+      CLUSTERS_TEXT_SAMPLE_MAX: "2000"
+      CLUSTERS_TEXT_SCAN_MAX: "200000"
+      CLUSTERS_TEXT_LOOKBACK: "24h"
+      CLUSTERS_TEXT_BUDGET: "20s"
+      CLUSTERS_EMBED_TIMEOUT: "10s"
+      CLUSTERS_LLM_TIMEOUT: "15s"
+      CLUSTERS_S3_BYTES_PER_RECORD: "1600"
+      # off | on_demand | always. Any other value is a startup failure.
+      CLUSTERS_BACKFILL_COUNTS: "on_demand"
+      # Keeps the counts backfill from racing clustering-service's live
+      # writer for the current hour.
+      CLUSTERS_BACKFILL_LAG: "2h"
+    resources:
+      # CLUSTERS_MAX_POINTS is 200 000 384-dimension float32 vectors = ~300
+      # MB of raw embeddings before HDBSCAN's own working set, which is why
+      # this is the largest memory limit in the chart. It is a batch job: it
+      # is idle most of the time and CPU-saturated during a pass, so the
+      # request is small and the limit is large.
+      requests: { cpu: 500m, memory: 1Gi }
+      limits: { cpu: 4, memory: 6Gi }
+    # A clustering pass can be minutes long. This does not extend it — the
+    # scheduler's context is cancelled on SIGTERM and the pass aborts — but
+    # it gives the usage.v1 producer time to flush.
+    terminationGracePeriodSeconds: 60

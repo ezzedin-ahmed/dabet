@@ -1,0 +1,27 @@
+apiVersion: v2
+name: dabet
+description: |
+  The Dabet application layer: the nine Go services of docs/implementation-reference.md.
+  Dependencies (Postgres, Kafka, Redis, Memcached, ClickHouse, Milvus, S3, vLLM) are NOT
+  in this chart — point the endpoints in values at whatever provides them (the
+  dabet-deps chart in-cluster, or managed services via values-aws.yaml).
+type: application
+version: 0.1.0
+# Tracks the image tag used when .Values.global.image.tag is empty.
+appVersion: "0.1.0"
+kubeVersion: ">=1.25.0-0"
+keywords:
+  - moderation
+  - kafka
+  - streaming
+home: https://github.com/ezzedin-ahmed/dabet
+sources:
+  - https://github.com/ezzedin-ahmed/dabet
+annotations:
+  # Optional CRDs. The chart renders these only when the values switch them on;
+  # it installs cleanly on a cluster that has none of them.
+  optionalCRDs: |
+    - monitoring.coreos.com/v1 ServiceMonitor    (metrics.serviceMonitor.enabled)
+    - keda.sh/v1alpha1 ScaledObject             (autoscaling.mode=keda)
+    - external-secrets.io/v1 ExternalSecret     (externalSecrets.enabled)
+    - secrets-store.csi.x-k8s.io/v1 SecretProviderClass (secretsStoreCSI.enabled)
