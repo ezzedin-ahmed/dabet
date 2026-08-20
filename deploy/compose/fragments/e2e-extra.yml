@@ -1,0 +1,43 @@
+# Overlay for the e2e_full suite (test/e2e/clustering_test.go, §8.5–8.8).
+#
+# clusters-job runs on wall-clock cadences chosen for production — a five
+# minute trigger sweep, a thirty minute cooldown, a two hour backfill lag.
+# A test that honoured all three would take the best part of an hour and
+# still not reach the counts backfill. This overlay compresses the cadences
+# and lifts the lag; every threshold that decides *whether* a run happens
+# (CLUSTERS_BOOTSTRAP_MIN, CLUSTERS_UNASSIGNED_RATE, CLUSTER_ASSIGN_THRESHOLD)
+# is deliberately left at its spec default, so the assertions are still about
+# the behaviour the spec describes.
+#
+# Usage (the base file must come first — build contexts are relative to it):
+#
+#   CLUSTERING_ENDPOINT=http://clustering-service:8080 \
+#   docker compose -f deploy/compose/docker-compose.yml \
+#                  -f deploy/compose/fragments/e2e-extra.yml \
+#                  --profile clustering up -d --build --wait
+
+services:
+  clusters-job:
+    environment:
+      # Sweep often enough that a test can wait out the bootstrap trigger.
+      CLUSTERS_TRIGGER_INTERVAL: 15s
+      # The cooldown gates the *periodic* triggers only; on-demand bypasses
+      # Evaluate entirely. Shortened so a bootstrap run followed by a
+      # doubling is reachable inside a test.
+      CLUSTERS_RUN_COOLDOWN: 15s
+
+      # The counts backfill clamps its upper bound to BucketHour(now - lag)
+      # so it cannot race clustering-service's live writer for the current
+      # hour. With the production default of 2h, a recluster of a window the
+      # test has just created is entirely inside the lag, the whole window is
+      # skipped, and the backfill never executes at all. Zero is the smallest
+      # value the service accepts (a negative lag is a startup config error),
+      # and it brings the clamp forward to the start of the current hour —
+      # far enough for the test to exercise the rewrite against the previous
+      # hour. It cannot be brought closer than that, which is why the test
+      # proves the rewrite on seeded history rather than on its own freshly
+      # embedded messages; see clustering_test.go.
+      CLUSTERS_BACKFILL_LAG: 0s
+      # The default already covers on-demand; stated so the overlay reads as
+      # the whole configuration of the behaviour under test.
+      CLUSTERS_BACKFILL_COUNTS: on_demand

@@ -55,6 +55,22 @@ var (
 		"insights-service":   env("E2E_INSIGHTS_METRICS_URL", "http://localhost:9087"),
 	}
 
+	// Stand-ins the tests drive directly rather than only through a service:
+	// mockembed's ledger answers "how many times was this text embedded"
+	// (§8.4) and mockoauth's admin surface breaks a token on demand (§5.6).
+	embedURL = env("E2E_EMBED_URL", "http://localhost:8091")
+	oauthURL = env("E2E_OAUTH_URL", "http://localhost:9099")
+
+	// The clustering profile (`make up-full`, §8.5/§8.6). Only the
+	// e2e_full-tagged tests touch these.
+	clusteringMetricsURL = env("E2E_CLUSTERING_METRICS_URL", "http://localhost:9088")
+	clustersJobURL       = env("E2E_CLUSTERS_JOB_URL", "http://localhost:8090")
+	clustersJobMetricsCL = env("E2E_CLUSTERS_JOB_METRICS_URL", "http://localhost:9089")
+	clickhouseURL        = env("E2E_CLICKHOUSE_URL", "http://localhost:8123")
+	clickhouseUser       = env("E2E_CLICKHOUSE_USER", "dabet")
+	clickhousePassword   = env("E2E_CLICKHOUSE_PASSWORD", "dabet")
+	clickhouseDB         = env("E2E_CLICKHOUSE_DB", "dabet")
+
 	s3Endpoint  = env("E2E_S3_ENDPOINT", "localhost:9000")
 	s3AccessKey = env("E2E_S3_ACCESS_KEY", "minioadmin")
 	s3SecretKey = env("E2E_S3_SECRET_KEY", "minioadmin")
@@ -148,9 +164,17 @@ func do(t *testing.T, hc *http.Client, method, url, token string, body any, head
 		t.Fatalf("%s %s: %v", method, url, err)
 	}
 	defer resp.Body.Close()
+	return readResponse(t, resp)
+}
+
+// readResponse drains an *http.Response into the decoded form the assertions
+// use. Split out of do so a caller that has to build its own request — an
+// OAuth form post, say — still gets the same failure reporting.
+func readResponse(t *testing.T, resp *http.Response) response {
+	t.Helper()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if err != nil {
-		t.Fatalf("%s %s: read body: %v", method, url, err)
+		t.Fatalf("%s %s: read body: %v", resp.Request.Method, resp.Request.URL, err)
 	}
 	return response{status: resp.StatusCode, body: raw, headers: resp.Header}
 }
@@ -327,6 +351,39 @@ func metricSum(samples []sample, name string, selector map[string]string) float6
 		}
 	}
 	return total
+}
+
+// metricDelta is metricSum over after minus metricSum over before. Every
+// service in the stack is long-lived and shared between tests, so a counter's
+// absolute value says nothing — only its movement across one action does.
+func metricDelta(before, after []sample, name string, selector map[string]string) float64 {
+	return metricSum(after, name, selector) - metricSum(before, name, selector)
+}
+
+// mustScrape scrapes one service's metrics or fails the test.
+func mustScrape(t *testing.T, name, base string) []sample {
+	t.Helper()
+	s, err := scrape(base)
+	if err != nil {
+		t.Fatalf("scrape %s metrics: %v", name, err)
+	}
+	return s
+}
+
+// ---------------------------------------------------------------------
+// mockembed's ledger (§8.4 — "a message is embedded at most once")
+// ---------------------------------------------------------------------
+
+// embedCount asks mockembed how many times it was handed exactly this text.
+func embedCount(t *testing.T, text string) int {
+	t.Helper()
+	var out struct {
+		Count int `json:"count"`
+	}
+	mustStatus(t, do(t, client, http.MethodGet,
+		embedURL+"/admin/embeds?text="+url.QueryEscape(text), "", nil),
+		http.StatusOK, "GET /admin/embeds").json(t, &out)
+	return out.Count
 }
 
 // ---------------------------------------------------------------------
