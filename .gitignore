@@ -11,3 +11,6 @@ services/*/*-service
 services/*/provider-adapter
 services/*/clusters-job
 /.claude/
+
+# load-run artefacts
+test/load/results/
