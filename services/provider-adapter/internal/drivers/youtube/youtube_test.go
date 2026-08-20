@@ -90,12 +90,40 @@ func TestDeleteUnresolvableMessageIsNotFound(t *testing.T) {
 	}
 }
 
-func TestWatchAndDiscoverAreNotImplemented(t *testing.T) {
-	d := New(opaque.NewMinter())
-	if err := d.Watch(context.Background(), driver.Connection{}, nil); !errors.Is(err, driver.ErrNotImplemented) {
-		t.Errorf("Watch = %v", err)
+func TestClassifyMapsDocumentedReasons(t *testing.T) {
+	cases := []struct {
+		status int
+		reason string
+		want   error
+	}{
+		{403, "quotaExceeded", driver.ErrRateLimited},
+		{403, "dailyLimitExceeded", driver.ErrRateLimited},
+		{403, "rateLimitExceeded", driver.ErrRateLimited},
+		{403, "liveChatEnded", driver.ErrGone},
+		{403, "liveChatDisabled", driver.ErrGone},
+		{404, "liveChatNotFound", driver.ErrGone},
+		{403, "forbidden", driver.ErrPermanent},
+		{403, "insufficientPermissions", driver.ErrPermanent},
+		{401, "authError", driver.ErrUnauthorized},
 	}
-	if _, err := d.DiscoverLive(context.Background(), driver.Connection{}); !errors.Is(err, driver.ErrNotImplemented) {
-		t.Errorf("DiscoverLive = %v", err)
+	for _, c := range cases {
+		err := classify("/liveChat/messages", c.status, []byte(errorJSON(c.status, c.reason)))
+		if !errors.Is(err, c.want) {
+			t.Errorf("%d %s: err = %v, want %v", c.status, c.reason, err, c.want)
+		}
+	}
+	// A bare 401 with no reason envelope is still an auth error, which is
+	// what makes the §5.6 refresh path fire.
+	if err := classify("/liveChat/messages", 401, []byte(`{}`)); !errors.Is(err, driver.ErrUnauthorized) {
+		t.Errorf("bare 401 = %v", err)
+	}
+	// quotaExceeded is distinguishable from an ordinary rate limit so the
+	// driver can drain the budget rather than retry in a few seconds.
+	err := classify("/liveChat/messages", 403, []byte(errorJSON(403, "quotaExceeded")))
+	if !errors.Is(err, errQuotaExceeded) {
+		t.Errorf("quotaExceeded should be identifiable: %v", err)
+	}
+	if errors.Is(classify("/x", 403, []byte(errorJSON(403, "rateLimitExceeded"))), errQuotaExceeded) {
+		t.Error("an ordinary rate limit must not be mistaken for quota exhaustion")
 	}
 }

@@ -33,6 +33,27 @@ type Producer interface {
 	Produce(ctx context.Context, topic string, key, value []byte) error
 }
 
+// TokenRefresher is the §5.6 lazy-refresh hook, the same contract the
+// deletion consumer uses (deletion.TokenRefresher) — refresh.Refresher
+// satisfies both.
+//
+// It is needed here because a watch is long-lived: an access token that was
+// valid when the stream opened expires while it is running, and a driver
+// that reports ErrUnauthorized would otherwise be restarted forever with
+// the same dead credentials. Refreshing here is what turns "the stream
+// died" into "the stream reconnected with a new token".
+type TokenRefresher interface {
+	Refresh(ctx context.Context, conn driver.Connection) (driver.Connection, error)
+}
+
+// NoRefresh is the no-op refresher: an auth failure is terminal.
+type NoRefresh struct{}
+
+// Refresh implements TokenRefresher.
+func (NoRefresh) Refresh(_ context.Context, conn driver.Connection) (driver.Connection, error) {
+	return conn, errors.New("ingest: no token refresher configured")
+}
+
 // Manager reconciles running watch loops against the connection source.
 type Manager struct {
 	registry *driver.Registry
@@ -41,6 +62,10 @@ type Manager struct {
 	minter   *opaque.Minter
 	metrics  *metrics.Metrics
 	log      *slog.Logger
+
+	// Refresher performs the §5.6 lazy refresh when a driver reports an
+	// auth failure mid-stream. Defaults to NoRefresh.
+	Refresher TokenRefresher
 
 	// Now stamps ingested_at; injectable for tests.
 	Now func() time.Time
@@ -59,6 +84,7 @@ func NewManager(reg *driver.Registry, src connsource.Source, prod Producer, mint
 		minter:     minter,
 		metrics:    m,
 		log:        log,
+		Refresher:  NoRefresh{},
 		Now:        time.Now,
 		Buffer:     256,
 		WatchRetry: 2 * time.Second,
@@ -133,6 +159,14 @@ func (m *Manager) reconcile(ctx context.Context, running map[string]*watcher) er
 
 // watch runs one connection's Watch loop until ctx is cancelled,
 // restarting after WatchRetry on driver failure.
+//
+// Two driver outcomes end the loop for good instead of restarting it:
+// a terminal error (the channel is gone, the bot lacks an approved intent —
+// retrying is a guaranteed-failure hot loop, P2), and an auth failure that
+// the §5.6 refresh could not rescue. An auth failure the refresh *can*
+// rescue restarts immediately with the fresh token rather than waiting out
+// WatchRetry, because a token expiring mid-stream is the routine case for a
+// stream that outlives its access token.
 func (m *Manager) watch(ctx context.Context, drv driver.Driver, conn driver.Connection) {
 	m.metrics.ConnectionsActive.WithLabelValues(conn.Platform).Inc()
 	defer m.metrics.ConnectionsActive.WithLabelValues(conn.Platform).Dec()
@@ -140,8 +174,10 @@ func (m *Manager) watch(ctx context.Context, drv driver.Driver, conn driver.Conn
 	for ctx.Err() == nil {
 		out := make(chan driver.Message, m.Buffer)
 		werr := make(chan error, 1)
+		// conn is re-read each pass so a refresh takes effect on restart.
+		watched := conn
 		go func() {
-			werr <- drv.Watch(ctx, conn, out)
+			werr <- drv.Watch(ctx, watched, out)
 			close(out)
 		}()
 		for msg := range out {
@@ -154,13 +190,28 @@ func (m *Manager) watch(ctx context.Context, drv driver.Driver, conn driver.Conn
 		if ctx.Err() != nil {
 			return
 		}
-		if errors.Is(err, driver.ErrNotImplemented) {
-			m.log.Warn("watch not implemented; connection idle", "platform", conn.Platform, "connection_id", conn.ID)
+
+		switch {
+		case errors.Is(err, driver.ErrUnauthorized):
+			fresh, rerr := m.refresher().Refresh(ctx, conn)
+			if rerr != nil {
+				// §5.6: the connection is expired and its streams are
+				// dropped. The source will stop listing it.
+				m.log.Error("watch stopped: token refresh failed",
+					"platform", conn.Platform, "connection_id", conn.ID, "error", rerr.Error())
+				return
+			}
+			m.log.Info("watch reauthorized; restarting",
+				"platform", conn.Platform, "connection_id", conn.ID)
+			conn = fresh
+			continue
+		case driver.Terminal(err):
+			m.log.Warn("watch stopped: terminal driver error",
+				"platform", conn.Platform, "connection_id", conn.ID, "error", err.Error())
 			return
-		}
-		if err == nil {
+		case err == nil:
 			m.log.Info("watch ended; restarting", "platform", conn.Platform, "connection_id", conn.ID)
-		} else {
+		default:
 			m.log.Error("watch failed; restarting", "platform", conn.Platform, "connection_id", conn.ID, "error", err.Error())
 		}
 		select {
@@ -169,6 +220,13 @@ func (m *Manager) watch(ctx context.Context, drv driver.Driver, conn driver.Conn
 		case <-time.After(m.WatchRetry):
 		}
 	}
+}
+
+func (m *Manager) refresher() TokenRefresher {
+	if m.Refresher == nil {
+		return NoRefresh{}
+	}
+	return m.Refresher
 }
 
 // emit mints opaque IDs, builds the messages.v1 event, and produces it.
@@ -200,13 +258,23 @@ func (m *Manager) emit(ctx context.Context, conn driver.Connection, msg driver.M
 	if err != nil {
 		return err
 	}
+	// ingested_at is the driver's receipt stamp when it has one, because
+	// that is the actual moment the message entered Dabet; the loop's own
+	// clock only stands in for a driver that did not stamp. Using the
+	// driver's value keeps whatever queueing happened between receipt and
+	// produce *inside* the §4.6 SLI, where it belongs — it is our delay,
+	// not the platform's.
+	ingestedAt := msg.ReceivedAt
+	if ingestedAt.IsZero() {
+		ingestedAt = m.Now()
+	}
 	event := contracts.Message{
 		MessageID:  messageID,
 		ContentID:  contentID,
 		AuthorID:   authorID,
 		CreatorID:  conn.CreatorID,
 		Text:       msg.Text,
-		IngestedAt: m.Now().UTC(),
+		IngestedAt: ingestedAt.UTC(),
 	}
 	value, err := json.Marshal(event)
 	if err != nil {
