@@ -14,7 +14,7 @@ RATE     ?= 400
 GOBIN   := $(shell go env GOPATH)/bin
 MODULES := $(shell go work edit -json | grep DiskPath | cut -d'"' -f4)
 
-.PHONY: build test vet proto up up-full up-traced up-mail up-load up-sharded up-full-e2e e2e-full load load-selfbench load-drills down logs ps e2e
+.PHONY: build test vet proto k8s-lint k8s-template up up-full up-traced up-mail up-load up-sharded up-full-e2e e2e-full load load-selfbench load-drills down logs ps e2e
 
 build:
 	@for m in $(MODULES); do (cd $$m && go build ./...) || exit 1; done
@@ -91,6 +91,25 @@ logs:
 
 ps:
 	$(COMPOSE) --profile clustering ps
+
+# ---- Kubernetes -------------------------------------------------------------
+K8S_APP  := deploy/k8s/charts/dabet
+K8S_DEPS := deploy/k8s/charts/dabet-deps
+
+# Lint both charts and render every dependency on/off combination. The render
+# matrix falls back to render-only when no cluster is reachable, so this is
+# safe in CI and on a laptop.
+k8s-lint:
+	helm lint $(K8S_APP)
+	helm lint $(K8S_APP) -f $(K8S_APP)/values-local.yaml
+	helm lint $(K8S_APP) -f $(K8S_APP)/values-aws.yaml
+	helm lint $(K8S_DEPS)
+	bash $(K8S_DEPS)/hack/render-matrix.sh
+
+# Render one profile to stdout: make k8s-template ENV=aws
+ENV ?= local
+k8s-template:
+	helm template dabet $(K8S_APP) -f $(K8S_APP)/values-$(ENV).yaml
 
 # End-to-end smoke test against the running stack (see test/e2e). It is
 # build-tagged, so `make test` never touches the network.

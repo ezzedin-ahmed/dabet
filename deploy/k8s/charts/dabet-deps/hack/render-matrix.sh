@@ -17,6 +17,18 @@ mkdir -p "${OUT}"
 FAILED=0
 PASSED=0
 
+# `kubectl apply --dry-run=client` still fetches the OpenAPI schema from the
+# API server, so it needs a reachable cluster despite the name. Probe once and
+# fall back to render-only, so this runs in CI and on a laptop with no cluster.
+KUBECTL_OK=""
+if [ -z "${NO_KUBECTL:-}" ]; then
+  if kubectl ${KUBE_CONTEXT:+--context "${KUBE_CONTEXT}"} version >/dev/null 2>&1; then
+    KUBECTL_OK=1
+  else
+    echo "note: no reachable cluster - rendering only, skipping kubectl dry-run"
+  fi
+fi
+
 run() {
   local label="$1"; shift
   local file="${OUT}/$(echo "${label}" | tr ' /=,' '____').yaml"
@@ -28,7 +40,7 @@ run() {
     return
   fi
 
-  if [ -z "${NO_KUBECTL:-}" ]; then
+  if [ -z "${NO_KUBECTL:-}" ] && [ -n "${KUBECTL_OK:-}" ]; then
     if ! kubectl ${KUBE_CONTEXT:+--context "${KUBE_CONTEXT}"} apply --dry-run=client -f "${file}" >/dev/null 2>"${file}.kerr"; then
       echo "DRYRUN FAIL  ${label}"
       sed 's/^/    /' "${file}.kerr" | head -10
