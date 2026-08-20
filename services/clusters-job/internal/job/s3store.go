@@ -4,13 +4,11 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"net/url"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/minio/minio-go/v7"
-	"github.com/minio/minio-go/v7/pkg/credentials"
 )
 
 // ObjectInfo describes one embeddings object in S3.
@@ -31,33 +29,49 @@ type ObjectStore interface {
 	Get(ctx context.Context, key string) ([]byte, error)
 }
 
-// S3Store reads insights-service's embeddings bucket over minio-go with
-// path-style addressing, so the same code runs against local MinIO
-// (S3_ENDPOINT, §3) and real S3.
+// S3Store reads insights-service's embeddings bucket over minio-go, so the
+// same code runs against local MinIO (S3_ENDPOINT, §3) and real S3.
+// Addressing style and credentials come from S3Config: path style and a
+// static key pair locally, virtual-host style and an assumed role on AWS.
 type S3Store struct {
 	cl     *minio.Client
 	bucket string
 }
 
 // NewS3Store connects to the object store at endpoint (a URL such as
-// http://localhost:9000), reading from bucket.
+// http://localhost:9000), reading from bucket, with a static key pair.
+// Kept for callers and tests that hold their own credentials; production
+// goes through NewS3StoreFromConfig.
 func NewS3Store(endpoint, accessKey, secretKey, bucket string) (*S3Store, error) {
-	u, err := url.Parse(endpoint)
-	if err != nil {
-		return nil, fmt.Errorf("s3 endpoint: %w", err)
-	}
-	if u.Host == "" {
-		return nil, fmt.Errorf("s3 endpoint %q: missing host", endpoint)
-	}
-	cl, err := minio.New(u.Host, &minio.Options{
-		Creds:        credentials.NewStaticV4(accessKey, secretKey, ""),
-		Secure:       u.Scheme == "https",
-		BucketLookup: minio.BucketLookupPath,
+	return NewS3StoreFromConfig(S3Config{
+		Endpoint:          endpoint,
+		Bucket:            bucket,
+		AccessKey:         accessKey,
+		SecretKey:         secretKey,
+		CredentialsSource: SourceStatic,
+		AddressingStyle:   AddressingPath,
 	})
+}
+
+// NewS3StoreFromConfig connects using the full configuration, including
+// the credential chain that lets a pod use IRSA instead of a static IAM
+// user key. Nothing here contacts the endpoint or the credential source: a
+// misconfiguration fails now, and credentials are fetched lazily on the
+// first signed request.
+func NewS3StoreFromConfig(cfg S3Config) (*S3Store, error) {
+	u, err := parseS3Endpoint(cfg.Endpoint)
+	if err != nil {
+		return nil, err
+	}
+	opts, err := cfg.minioOptions(u)
+	if err != nil {
+		return nil, fmt.Errorf("s3 credentials: %w", err)
+	}
+	cl, err := minio.New(u.Host, opts)
 	if err != nil {
 		return nil, fmt.Errorf("s3 client: %w", err)
 	}
-	return &S3Store{cl: cl, bucket: bucket}, nil
+	return &S3Store{cl: cl, bucket: cfg.Bucket}, nil
 }
 
 // ListCreators enumerates the creator ids present in the bucket from the

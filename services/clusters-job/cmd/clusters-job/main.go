@@ -48,7 +48,15 @@
 //	CLUSTERS_BACKFILL_LAG            newest bucket the rewrite touches (default 2h behind now)
 //	CLUSTERS_S3_BYTES_PER_RECORD     listing-size -> point estimate    (default 1600)
 //	S3_BUCKET                        embeddings bucket                 (default "embeddings")
-//	S3_ACCESS_KEY / S3_SECRET_KEY    object store credentials          (default minioadmin)
+//	S3_ACCESS_KEY / S3_SECRET_KEY    object store credentials          (default minioadmin
+//	                                 for the static source, empty otherwise)
+//	S3_SESSION_TOKEN                 static session token              (default empty)
+//	S3_REGION                        bucket region                     (default empty)
+//	S3_CREDENTIALS_SOURCE            static (default) | auto | chain | env | web-identity | iam
+//	                                 — anything but "static" lets the pod use IRSA or an
+//	                                 instance role instead of a static IAM user key
+//	S3_ADDRESSING_STYLE              auto (default) | path | virtual   — auto is path style
+//	                                 for MinIO and virtual-host style for S3
 //
 // Manual invocation: RUN_ONCE=<creator_id>:<from>:<to> (dates as
 // YYYY-MM-DD, e.g. RUN_ONCE=9d4e...:2026-07-01:2026-08-01) runs exactly
@@ -130,15 +138,18 @@ func run(svc *service.Service) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	store, err := job.NewS3Store(
-		config.GetDefault(config.EnvS3Endpoint, "http://localhost:9000"),
-		config.GetDefault("S3_ACCESS_KEY", "minioadmin"),
-		config.GetDefault("S3_SECRET_KEY", "minioadmin"),
-		config.GetDefault("S3_BUCKET", "embeddings"),
-	)
+	// Object store: static MinIO keys locally, and on AWS whatever the pod
+	// actually has — S3_CREDENTIALS_SOURCE picks the credential chain so
+	// IRSA works without a static IAM user key (§3, §8.4).
+	s3Cfg, err := job.DefaultS3Config()
 	if err != nil {
 		return err
 	}
+	store, err := job.NewS3StoreFromConfig(s3Cfg)
+	if err != nil {
+		return err
+	}
+	svc.Logger.Info("object store configured", "s3", s3Cfg)
 	ch, err := chstore.Open(config.GetDefault(config.EnvClickhouseDSN, "clickhouse://localhost:9002/dabet"))
 	if err != nil {
 		return err // malformed DSN, not ClickHouse being down — config error

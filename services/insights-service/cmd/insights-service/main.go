@@ -29,7 +29,16 @@
 //	INSIGHTS_S3_ROLL_BYTES         parquet roll size         (default 8388608)
 //	INSIGHTS_S3_ROLL_SECONDS       parquet roll age          (default 60)
 //	S3_BUCKET                      embeddings bucket         (default "embeddings")
-//	S3_ACCESS_KEY / S3_SECRET_KEY  object store credentials  (default minioadmin)
+//	S3_ACCESS_KEY / S3_SECRET_KEY  object store credentials  (default minioadmin
+//	                               for the static source, empty otherwise)
+//	S3_SESSION_TOKEN               static session token      (default empty)
+//	S3_REGION                      bucket region             (default empty)
+//	S3_CREDENTIALS_SOURCE          static (default) | auto | chain | env |
+//	                               web-identity | iam. Anything but "static"
+//	                               lets the pod use IRSA or an instance role
+//	                               instead of a static IAM user key.
+//	S3_ADDRESSING_STYLE            auto (default) | path | virtual — auto is
+//	                               path style for MinIO, virtual-host for S3
 package main
 
 import (
@@ -107,10 +116,13 @@ func run(svc *service.Service) error {
 
 	brokers := strings.Split(config.GetDefault(config.EnvKafkaBrokers, "localhost:9092"), ",")
 	embedEndpoint := config.GetDefault(config.EnvEmbeddingEndpoint, "http://localhost:8091")
-	s3Endpoint := config.GetDefault(config.EnvS3Endpoint, "http://localhost:9000")
-	s3Bucket := config.GetDefault("S3_BUCKET", "embeddings")
-	s3AccessKey := config.GetDefault("S3_ACCESS_KEY", "minioadmin")
-	s3SecretKey := config.GetDefault("S3_SECRET_KEY", "minioadmin")
+	// Object store: static MinIO keys locally, and on AWS whatever the
+	// pod actually has — S3_CREDENTIALS_SOURCE picks the credential chain
+	// so IRSA works without a static IAM user key (§3, §8.4).
+	s3Cfg, err := ingest.DefaultS3Config()
+	if err != nil {
+		return err
+	}
 	// CLUSTERING_ENDPOINT set-but-empty means "live classification (§8.5)
 	// is not part of this deployment", which is different from unset.
 	// config.GetDefault cannot express that distinction — it substitutes
@@ -128,10 +140,11 @@ func run(svc *service.Service) error {
 		return err
 	}
 
-	store, err := ingest.NewS3Store(s3Endpoint, s3AccessKey, s3SecretKey, s3Bucket)
+	store, err := ingest.NewS3StoreFromConfig(s3Cfg)
 	if err != nil {
 		return fmt.Errorf("object store: %w", err)
 	}
+	svc.Logger.Info("object store configured", "s3", s3Cfg)
 	topicStore, err := topics.OpenCH(chDSN)
 	if err != nil {
 		return fmt.Errorf("topic store: %w", err)
