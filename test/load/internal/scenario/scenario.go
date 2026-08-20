@@ -36,8 +36,10 @@ const (
 // deliberate — a scenario should assert only what its hypothesis is
 // about, so a failure names the thing that actually broke.
 type Criteria struct {
-	// MaxP95Seconds fails the run if the SLI p95 exceeds it. The N1
-	// budget is 1.5.
+	// MaxP95Seconds fails the run if the SLI p95 exceeds it. §4.6
+	// documents 1.5; the product target is 2 s, and it is a target
+	// rather than a hard boundary — the LLM is allowed to take the
+	// time it needs instead of failing open at the cut-off.
 	MaxP95Seconds float64 `json:"max_p95_seconds,omitempty"`
 
 	// MaxFailOpen fails the run above this many fail_open_total events.

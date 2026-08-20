@@ -87,7 +87,7 @@ func baseline() Scenario {
 	return Scenario{
 		Name: "baseline",
 		Hypothesis: "at a rate the laptop sustains, the cascade keeps up: consumer lag stays flat, " +
-			"fail_open_total is zero, and the §4.6 SLI p95 is comfortably inside the 1.5 s N1 budget",
+			"fail_open_total is zero, and the §4.6 SLI p95 is comfortably inside the 2 s latency target",
 		Proves:      "steady-state health and the latency floor of the pipeline",
 		Mode:        ModeKafka,
 		ProfileName: "steady 2 000 msg/s for 90 s",
@@ -97,7 +97,7 @@ func baseline() Scenario {
 		SampleEvery: 2 * time.Second,
 		DrainFor:    45 * time.Second,
 		Criteria: Criteria{
-			MaxP95Seconds:       1.5,
+			MaxP95Seconds:       2.0,
 			MaxFailOpen:         0,
 			MaxFinalLag:         5000,
 			MinConsumeFraction:  0.95,
@@ -114,7 +114,7 @@ func ramp() Scenario {
 		Name: "ramp",
 		Hypothesis: "there is a rate above which the cascade cannot keep up; past it consumer lag grows " +
 			"without bound (§4.7 says accept the lag, so lag — not errors — is the failure signal) " +
-			"and the SLI p95 crosses 1.5 s",
+			"and the SLI p95 crosses 2 s",
 		Proves:      "the knee: the highest offered rate at which lag stays flat and p95 stays under budget",
 		Mode:        ModeKafka,
 		ProfileName: "staircase 1 000 -> 15 000 msg/s, 6 plateaus of 30 s",

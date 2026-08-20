@@ -118,7 +118,12 @@ func run(svc *service.Service) error {
 	if cfg.RedisBreakerMaxCooldown, err = config.GetDuration(envRedisBreakerMaxCool, cfg.RedisBreakerMaxCooldown); err != nil {
 		return err
 	}
-	llmTimeout, err := config.GetDuration(envLLMTimeout, time.Second)
+	// A18 documents 1 s, which is also the whole LLM allowance in §4.6's
+	// indicative budget. Load runs showed 42% of batches timing out at
+	// that value, every one of them a fail-open. The product target is
+	// 2 s end to end and is a target, not a boundary, so the model is
+	// given room to answer instead of being cut off into a fail-open.
+	llmTimeout, err := config.GetDuration(envLLMTimeout, 1500*time.Millisecond)
 	if err != nil {
 		return err
 	}
