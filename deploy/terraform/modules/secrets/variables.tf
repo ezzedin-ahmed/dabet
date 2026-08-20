@@ -34,6 +34,18 @@ variable "secrets" {
   EOT
   type        = map(string)
   default = {
+    # The aggregate document the dabet chart's External Secrets Operator
+    # integration extracts wholesale (externalSecrets.dataFrom[0].extract.key).
+    # Its required key list is in deploy/k8s/charts/dabet/README.md; the root
+    # module's app_secret_document_skeleton output renders it with the
+    # endpoints already filled in.
+    #
+    # The per-concern secrets below carry the same values split up. That is not
+    # redundancy for its own sake: split secrets are what the Secrets Store CSI
+    # path and per-service IAM scoping need, and this one is what the chart's
+    # ESO path reads. Populate whichever your deployment actually uses.
+    "app" = "Aggregate application secret document consumed by External Secrets Operator. See deploy/k8s/charts/dabet/README.md for the required keys."
+
     "stripe/secret-key"     = "Stripe API secret key (§5.7). Plain string."
     "stripe/webhook-secret" = "Stripe webhook signing secret (§5.7). Plain string, whsec_..."
     "oauth/youtube"         = "YouTube OAuth client (§5.5). JSON: {client_id, client_secret}"

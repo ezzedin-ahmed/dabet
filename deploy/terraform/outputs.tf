@@ -1,12 +1,15 @@
-# The seam between this Terraform and the Helm chart.
+# The seam between this Terraform and the Helm charts.
 #
-# `helm_values_aws` at the bottom is the contract: its shape is what
-# deploy/k8s/values-aws.yaml is expected to consume, and it is generated rather
-# than transcribed so the two cannot drift.
+# The contract lives at the bottom: helm_values_dabet and helm_values_dabet_deps
+# are shaped to the key paths deploy/k8s/charts/dabet and
+# deploy/k8s/charts/dabet-deps actually read, and are generated from the
+# resources rather than transcribed, so the two sides cannot drift.
 #
-#   tofu -chdir=examples/prod output -raw helm_values_aws_yaml > values-aws.yaml
+#   tofu output -raw helm_values_dabet_yaml       > values-aws-generated.yaml
+#   tofu output -raw helm_values_dabet_deps_yaml  > deps-aws-generated.yaml
+#   tofu output -raw app_secret_document_skeleton > /tmp/app.json
 #
-# The individual outputs above it exist so a team that composes their own values
+# The individual outputs above them exist so a team that composes its own values
 # file can take one piece at a time.
 
 # ---------------------------------------------------------------------------
@@ -189,8 +192,9 @@ output "irsa_role_arns" {
 
       eks.amazonaws.com/role-arn: <this value>
 
-    and the ServiceAccount name must match var.service_account_names or the
-    trust policy will not accept the token.
+    and the ServiceAccount name must match the one the trust policy was built
+    against — "<helm_release_name>-<service>" unless overridden — or the token
+    is rejected at runtime.
   EOT
   value       = module.iam.service_role_arns
 }
@@ -238,18 +242,79 @@ output "prometheus_remote_write_url" {
 # The contract
 # ---------------------------------------------------------------------------
 
-output "helm_values_aws" {
+output "helm_values_dabet" {
   description = <<-EOT
-    Everything above, in the shape deploy/k8s/values-aws.yaml consumes.
+    Values for deploy/k8s/charts/dabet, in that chart's own key paths
+    (config.*, secrets.create, externalSecrets.*,
+    services.<name>.serviceAccount.annotations).
 
-    Only endpoints, names, ARNs and booleans. No secret VALUE ever appears here
-    — the charts resolve secrets through External Secrets Operator or the
-    Secrets Store CSI driver using the ARNs and the IRSA roles.
+    Only endpoints, names, ARNs and booleans. No secret VALUE appears here.
   EOT
-  value       = local.helm_values_aws
+  value       = local.helm_values_dabet
 }
 
-output "helm_values_aws_yaml" {
-  description = "helm_values_aws rendered as YAML, ready to redirect into values-aws.yaml."
-  value       = yamlencode(local.helm_values_aws)
+output "helm_values_dabet_yaml" {
+  description = <<-EOT
+    helm_values_dabet as YAML:
+
+      tofu output -raw helm_values_dabet_yaml > values-aws-generated.yaml
+      helm upgrade --install dabet deploy/k8s/charts/dabet \
+        --namespace dabet \
+        -f deploy/k8s/charts/dabet/values-aws.yaml \
+        -f values-aws-generated.yaml
+  EOT
+  value       = yamlencode(local.helm_values_dabet)
+}
+
+output "helm_values_dabet_deps" {
+  description = <<-EOT
+    Values for deploy/k8s/charts/dabet-deps: every component AWS provides
+    switched off with its external.* address filled in, and ClickHouse, Milvus
+    and the inference workloads left running in the cluster.
+  EOT
+  value       = local.helm_values_dabet_deps
+}
+
+output "helm_values_dabet_deps_yaml" {
+  description = "helm_values_dabet_deps as YAML."
+  value       = yamlencode(local.helm_values_dabet_deps)
+}
+
+output "app_secret_document_skeleton" {
+  description = <<-EOT
+    The aggregate Secrets Manager document the chart's ExternalSecret extracts,
+    with every value Terraform legitimately knows already filled in and REPLACE
+    markers where it does not.
+
+    The Postgres DSNs are the reason this exists: the chart wants complete
+    connection strings, and the password lives in an RDS-managed secret that
+    Terraform never reads. Host, port, database, user and sslmode=require are
+    supplied; paste the password in.
+
+      tofu output -raw app_secret_document_skeleton > /tmp/app.json
+      # edit /tmp/app.json, then:
+      aws secretsmanager put-secret-value \
+        --secret-id dabet/prod/app --secret-string file:///tmp/app.json
+      shred -u /tmp/app.json
+  EOT
+  value       = jsonencode(local.app_secret_document)
+}
+
+output "postgres_password_commands" {
+  description = "How to read the RDS-generated passwords for the DSNs above."
+  value = {
+    identity = "aws secretsmanager get-secret-value --secret-id ${module.rds_identity.master_user_secret_arn} --query SecretString --output text"
+    policy   = "aws secretsmanager get-secret-value --secret-id ${local.policy_db.secret_arn} --query SecretString --output text"
+    kafka    = try("aws secretsmanager get-secret-value --secret-id ${module.msk.scram_secret_arn} --query SecretString --output text", null)
+  }
+}
+
+output "kafka_scram_secret_arn" {
+  description = "Secrets Manager ARN holding the MSK SASL/SCRAM {username, password}. Null unless SCRAM is in use."
+  value       = module.msk.scram_secret_arn
+}
+
+output "kafka_sasl_mechanism" {
+  description = "KAFKA_SASL_MECHANISM for pkg/kafkax. Empty when the cluster is unauthenticated."
+  value       = module.msk.sasl_mechanism
 }

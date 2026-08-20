@@ -11,14 +11,30 @@ tofu plan  -var 'cluster_admin_principal_arns=["arn:aws:iam::<account>:role/Your
 tofu apply
 ```
 
-Then populate the secret placeholders and hand the contract to the charts:
+Then fill in the secret document and hand the contract to the charts:
 
 ```sh
-tofu output secret_arns
-aws secretsmanager put-secret-value --secret-id dabet/dev/stripe/secret-key --secret-string sk_test_...
-tofu output -raw helm_values_aws_yaml > ../../../k8s/values-aws.yaml
+tofu output -raw app_secret_document_skeleton > /tmp/app.json
+tofu output -json postgres_password_commands
+$EDITOR /tmp/app.json
+aws secretsmanager put-secret-value --secret-id dabet/dev/app \
+  --secret-string file:///tmp/app.json
+shred -u /tmp/app.json
+
 eval "$(tofu output -raw kubeconfig_command)"
+tofu output -raw helm_values_dabet_deps_yaml > /tmp/deps.yaml
+tofu output -raw helm_values_dabet_yaml      > /tmp/values.yaml
+
+helm upgrade --install dabet-deps ../../../k8s/charts/dabet-deps \
+  --namespace dabet --create-namespace -f /tmp/deps.yaml
+helm upgrade --install dabet ../../../k8s/charts/dabet \
+  --namespace dabet \
+  -f ../../../k8s/charts/dabet/values-aws.yaml -f /tmp/values.yaml
 ```
+
+The §4.2 topics are not created by any of that — the deps chart's topics Job is
+gated on an in-cluster Kafka. Create them against the MSK bootstrap string
+before the services start.
 
 ## What is different from prod, and why
 
@@ -33,13 +49,15 @@ clusters, but §6.3's `policies.creator_id REFERENCES creators(id)` foreign key
 cannot span two RDS instances. Collapsing them in dev keeps the constraint
 enforced by the database, which is the more faithful thing to develop against.
 
-**Three settings that are not size decisions.** Redis runs in non-cluster mode,
-MSK runs unauthenticated over `TLS_PLAINTEXT`, and transit encryption is off on
-the caches — not to save money, but because the application code cannot yet talk
-to the alternatives. The details are in the root README under "Application
-changes this topology needs". Dev is configured so a first bring-up works
-against the code as it stands; prod is configured for the target and will not
-work until those three changes land.
+**Two settings that are cost decisions, not capability ones.** Redis runs in
+non-cluster mode on one `cache.t4g.micro`, and transit encryption is off on the
+caches. Neither is working around a missing feature — `moderation-service`
+builds a cluster-aware, TLS-capable client when asked — they are just what a
+development environment needs. §4.3's hash tags mean flipping to the prod shape
+is a flag.
+
+Kafka is the exception: dev uses the same SASL/SCRAM over TLS that prod does,
+because the credential path is the part worth exercising before production.
 
 **Destroyability.** `force_destroy = true` on the buckets,
 `deny_object_deletion = false`, `skip_final_snapshot = true`,

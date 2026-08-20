@@ -25,21 +25,22 @@ are:
 | `rds_identity.instance_class` | §5.2's ~25 GB at 10M creators is the storage floor, not the compute one. |
 | `create_policy_instance` | `false` collapses to one instance and keeps §6.3's foreign key. |
 
-## Before it will work
+## Two things to know before applying
 
-Two settings in this file target §3 and are **blocked on application changes**,
-both recorded in the root README:
+**Kafka authenticates with SCRAM, not IAM.** `pkg/kafkax` supports
+`AWS_MSK_IAM`, but franz-go's implementation reads AWS credentials from the
+environment and does no STS exchange, so an IRSA token cannot drive it —
+choosing IAM would mean shipping a static IAM user key. SCRAM keeps the pod on
+one Secrets Manager value it reads through its own role. The trade is where
+authorisation lives: SCRAM authorises through Kafka ACLs, which this module
+does not create, so one credential shared by nine services means every service
+can reach every topic. The root README works through the choice.
 
-- `elasticache.redis_cluster_mode = true` needs `redis.NewClusterClient` in
-  `moderation-service`; `redis_transit_encryption_enabled = true` needs a
-  `TLSConfig` alongside it.
-- `msk.client_authentication = "iam"` needs a SASL mechanism and a TLS dialer in
-  `pkg/kafkax`.
-
-Until both land, copy what `examples/dev` does for those two blocks
-(`unauthenticated` + `TLS_PLAINTEXT`, non-cluster Redis without TLS). Both are
-in-place changes afterwards, not rebuilds — the plaintext and TLS listeners are
-both open under `TLS_PLAINTEXT`, and a replication group can be migrated.
+**Nothing creates the §4.2 topics.** The deps chart's topics Job is gated on an
+in-cluster Kafka. With MSK, run that Job's script against the bootstrap string
+or create the topics by hand before the services start —
+`auto.create.topics.enable` is `false`, so a missing topic is a clear error
+rather than a silent one-partition topic.
 
 ## Alerting
 

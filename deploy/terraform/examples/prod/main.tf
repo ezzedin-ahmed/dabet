@@ -106,15 +106,16 @@ module "dabet" {
 
     storage_autoscaling_max_gb = 4000
 
-    # SASL/IAM over TLS. This is what lets a pod reach Kafka with nothing but
-    # its IRSA role — no static credential anywhere.
+    # SASL/SCRAM-SHA-512 over TLS.
     #
-    # BLOCKING on an application change: pkg/kafkax builds a plain franz-go
-    # client with no SASL mechanism and no TLS dialer. Until that is fixed, set
-    # client_authentication = "unauthenticated" and
-    # encryption_in_transit_client_broker = "TLS_PLAINTEXT" as examples/dev
-    # does, and switch back afterwards — the change is in place, not a rebuild.
-    client_authentication               = "iam"
+    # Not IAM, and the reason matters: pkg/kafkax supports AWS_MSK_IAM, but
+    # franz-go's implementation reads AWS credentials from the environment and
+    # performs no STS exchange, so an IRSA projected token cannot drive it —
+    # using IAM would mean shipping a static IAM user key. SCRAM keeps the pod
+    # on one Secrets Manager value it reads through its own role. Terraform
+    # generates the credential, associates it with the cluster, and outputs its
+    # ARN.
+    client_authentication               = "scram"
     encryption_in_transit_client_broker = "TLS"
 
     enhanced_monitoring = "PER_BROKER"
@@ -126,12 +127,10 @@ module "dabet" {
   }
 
   elasticache = {
-    # §3's target, and what §4.3's hash tags exist for.
-    #
-    # BLOCKING on the same kind of application change as MSK:
-    # moderation-service uses redis.NewClient, which does not follow cluster
-    # redirections, and passes no TLS config. Both flags below need
-    # redis.NewClusterClient with a TLSConfig on the other side.
+    # §3's target, and what §4.3's hash tags exist for. moderation-service now
+    # builds redis.NewClusterClient when REDIS_CLUSTER_ENABLED is set, and
+    # dials TLS when REDIS_TLS_ENABLED is; the generated values file sets both
+    # from these flags, so the two cannot disagree.
     redis_cluster_mode               = true
     redis_node_type                  = "cache.r7g.large"
     redis_shards                     = 3

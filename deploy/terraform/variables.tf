@@ -262,25 +262,52 @@ variable "s3" {
 # ---------------------------------------------------------------------------
 
 variable "kubernetes_namespace" {
-  description = "Namespace the dabet chart deploys into. Half of every IRSA trust condition."
+  description = <<-EOT
+    Namespace the dabet chart deploys into. Half of every IRSA trust condition.
+
+    The app chart templates no namespace of its own — every object lands in
+    whatever `helm --namespace` says — so this value has to match the namespace
+    you install into, and nothing in the chart will tell you if it does not.
+  EOT
+  type        = string
+  default     = "dabet"
+}
+
+variable "helm_release_name" {
+  description = <<-EOT
+    Helm release name the dabet chart is installed under.
+
+    The chart names each ServiceAccount "<release>-<service>", so this is what
+    service_account_names is derived from when that variable is left null. It
+    also prefixes the Secret the chart creates.
+  EOT
   type        = string
   default     = "dabet"
 }
 
 variable "service_account_names" {
-  description = "ServiceAccount name per service. Must match what the app chart creates."
+  description = <<-EOT
+    ServiceAccount name per service. Null derives "<helm_release_name>-<service>"
+    for all nine, which is what deploy/k8s/charts/dabet actually creates.
+
+    Override only if you have changed the chart's naming.
+  EOT
   type        = map(string)
-  default = {
-    user-service       = "user-service"
-    credits-service    = "credits-service"
-    policy-service     = "policy-service"
-    provider-adapter   = "provider-adapter"
-    moderation-service = "moderation-service"
-    review-service     = "review-service"
-    insights-service   = "insights-service"
-    clustering-service = "clustering-service"
-    clusters-job       = "clusters-job"
-  }
+  default     = null
+}
+
+variable "external_secrets_store_ref" {
+  description = <<-EOT
+    The ClusterSecretStore (or SecretStore) the chart's ExternalSecret points
+    at. Terraform does not create it: it is a Kubernetes object, and creating
+    Kubernetes objects from Terraform would put the cluster's own bootstrap
+    inside the same state as the cluster.
+  EOT
+  type = object({
+    name = optional(string, "aws-secrets-manager")
+    kind = optional(string, "ClusterSecretStore")
+  })
+  default = {}
 }
 
 variable "external_secrets_namespace" {

@@ -8,8 +8,8 @@ directory is a prerequisite for them.
 What this directory is for is the other case: a team that wants AWS-managed
 services under those charts. It builds the §3 target column with EKS, RDS, MSK,
 ElastiCache and S3, wires per-service IRSA roles so pods reach AWS without static
-credentials, and emits a single `values-aws.yaml` document that the app chart
-consumes.
+credentials, and emits values documents for both charts in `deploy/k8s` in
+their own key paths, so no one has to transcribe an endpoint by hand.
 
 > **Nothing here has been applied.** There are no AWS credentials in this
 > environment and creating real infrastructure was out of scope. Every
@@ -31,7 +31,7 @@ deploy/terraform/
 ├── locals.tf                tags, per-service secret grants
 ├── kms.tf                   four customer-managed keys, all rotating
 ├── main.tf                  module composition
-├── values_contract.tf       the values-aws.yaml document, built once
+├── values_contract.tf       the two chart values documents, built once
 ├── outputs.tf               the seam with the Helm chart
 ├── bootstrap/               state bucket; run once, before anything else
 ├── modules/
@@ -65,11 +65,19 @@ convenience of having all of it wired together, not a requirement.
 ## What Terraform does not create
 
 **Kafka topics.** §4.2's four topics, their partition counts and their
-retentions are created by the charts, exactly as `kafka-init` does under
-Compose. Keeping the topic table in one place matters more than owning it here,
-and topic configuration is the kind of thing that changes with the application,
-not with the infrastructure. What Terraform does own is a cluster that can carry
-those numbers — see [Sizing](#sizing).
+retentions belong next to the code that depends on them — `kafka-init` does it
+under Compose, and `charts/dabet-deps` has a reconciling Job that carries the
+same registry. Topic configuration changes with the application, not with the
+infrastructure. What Terraform owns is a cluster that can carry those numbers;
+see [Sizing](#sizing).
+
+There is a gap in that arrangement worth knowing about before the first
+deploy: the deps chart's topics Job is gated on `kafka.enabled`, and with MSK
+that is `false`. **So on AWS, nothing creates the topics.** Run the Job's
+script against the MSK bootstrap string, or create them by hand, before the
+services start — the brokers run with `auto.create.topics.enable = false`, so a
+missing topic is an error rather than a silently mis-shaped one-partition
+topic. Which is the right failure, but only if you are expecting it.
 
 **ClickHouse and Milvus.** See the next section.
 
@@ -333,85 +341,86 @@ for. The AMI ships the NVIDIA driver but not the device plugin, so
 
 ## The outputs contract
 
-This is the seam between this directory and `deploy/k8s`. It is generated rather
-than transcribed (`values_contract.tf`), so the two cannot drift:
+This is the seam between this directory and `deploy/k8s`. Two documents, each
+shaped to the key paths its chart actually reads, both generated from the
+resources rather than transcribed (`values_contract.tf`), so the two sides
+cannot drift:
 
 ```sh
-tofu -chdir=examples/prod output -raw helm_values_aws_yaml > ../../k8s/values-aws.yaml
+tofu output -raw helm_values_dabet_yaml       > values-aws-generated.yaml
+tofu output -raw helm_values_dabet_deps_yaml  > deps-aws-generated.yaml
+
+helm upgrade --install dabet-deps deploy/k8s/charts/dabet-deps \
+  --namespace dabet --create-namespace -f deps-aws-generated.yaml
+
+helm upgrade --install dabet deploy/k8s/charts/dabet \
+  --namespace dabet \
+  -f deploy/k8s/charts/dabet/values-aws.yaml \
+  -f values-aws-generated.yaml
 ```
 
-**Rule for anything in it: endpoints, names, ARNs and booleans. Never a secret
-value.** The charts resolve secrets through External Secrets Operator or the
-Secrets Store CSI driver using the ARNs and the IRSA roles below.
+The chart's own `values-aws.yaml` stays first in the list: it carries the
+replica counts, ingress, autoscaling and topic ceilings, which are the chart
+author's decisions. The generated file carries only the coordinates that come
+out of an AWS account and could not have been written down in advance.
+
+> **Note on `charts/dabet/values-aws.yaml` as it stands today.** Its header
+> records three constraints — Kafka must be plaintext, Redis must be
+> single-shard without TLS, S3 needs static IAM user keys — that were true when
+> it was written and are no longer. `pkg/kafkax` has TLS and SASL,
+> `moderation-service` builds a cluster-aware Redis client, and the two S3
+> consumers resolve credentials through the AWS chain. The generated file
+> overrides all three, which is why it comes second on the `helm` command line.
+> The chart's own file is not mine to edit.
+
+**Rule for everything in the generated files: endpoints, names, ARNs and
+booleans. Never a secret value.**
+
+### `charts/dabet`
 
 ```yaml
-global:
-  aws:
-    region: eu-west-1
-    clusterName: dabet-prod
-  namespace: dabet
+config:
+  kafkaBrokers: "b-1...:9096,b-2...:9096,b-3...:9096"   # KAFKA_BROKERS
+  redisAddr: "clustercfg.dabet-prod-redis...:6379"      # REDIS_ADDR
+  memcachedAddrs: "node1:11211,node2:11211,node3:11211" # MEMCACHED_ADDRS
+  vllmEndpoint: "http://dabet-vllm:8000"
+  embeddingEndpoint: "http://dabet-embedding:8091"
+  milvusAddr: "dabet-milvus:19530"
+  s3Endpoint: "https://s3.eu-west-1.amazonaws.com"      # S3_ENDPOINT
+  s3Bucket: "dabet-prod-embeddings-<account>"           # S3_BUCKET
+  logLevel: info
 
-  kafka:
-    brokers: "b-1.dabet-prod...:9098,b-2...:9098,b-3...:9098"   # KAFKA_BROKERS
-    auth: iam            # "iam" | "unauthenticated"
-    tls: true
+  # config.extra is the chart's pass-through into the ConfigMap. These are the
+  # variables the managed-connectivity work added, for which the chart has no
+  # first-class key.
+  extra:
+    S3_REGION: eu-west-1
+    S3_CREDENTIALS_SOURCE: irsa        # assume the IRSA role, no static keys
+    S3_ADDRESSING_STYLE: virtual
+    REDIS_CLUSTER_ENABLED: "true"      # redis.NewClusterClient
+    REDIS_TLS_ENABLED: "true"
+    KAFKA_TLS_ENABLED: "true"
+    KAFKA_SASL_MECHANISM: SCRAM-SHA-512
 
-  postgres:
-    identity:            # identity + billing + review schemas
-      host: dabet-prod-identity.<id>.eu-west-1.rds.amazonaws.com
-      port: 5432
-      database: dabet
-      username: dabet
-      sslmode: require   # rds.force_ssl=1 is set; Compose's sslmode=disable is refused
-      secretArn: arn:aws:secretsmanager:...:secret:rds!db-...
-    policy:              # same shape; equals identity when create_policy_instance=false
-      host: ...
-      port: 5432
-      database: dabet
-      username: dabet
-      sslmode: require
-      secretArn: arn:aws:secretsmanager:...
+secrets:
+  create: false        # the chart refuses to both create it and let ESO fill it
 
-  redis:
-    addr: "clustercfg.dabet-prod-redis...:6379"   # REDIS_ADDR
-    clusterMode: true    # requires redis.NewClusterClient
-    tls: true            # requires a non-nil TLSConfig
+externalSecrets:
+  enabled: true
+  secretStoreRef:
+    name: aws-secrets-manager
+    kind: ClusterSecretStore
+  refreshInterval: 1h
+  creationPolicy: Owner
+  dataFrom:
+    - extract:
+        key: dabet/prod/app            # the aggregate Secrets Manager document
 
-  memcached:
-    addrs:               # MEMCACHED_ADDRS — node addresses, NOT the config endpoint
-      - "dabet-prod-memcached-0001...:11211"
-      - "dabet-prod-memcached-0002...:11211"
-      - "dabet-prod-memcached-0003...:11211"
-
-  s3:
-    region: eu-west-1
-    endpoint: ""         # S3_ENDPOINT; empty means real S3. Compose sets MinIO here.
-    bucket: dabet-prod-embeddings-<account>          # S3_BUCKET
-    milvusBucket: dabet-prod-milvus-<account>
-    clickhouseBucket: dabet-prod-clickhouse-<account>
-
-  secrets:               # §4.4, all ARNs
-    postgres/identity:      arn:aws:secretsmanager:...   # RDS-managed {username,password}
-    postgres/policy:        arn:aws:secretsmanager:...   # RDS-managed {username,password}
-    stripe/secret-key:      arn:aws:secretsmanager:...
-    stripe/webhook-secret:  arn:aws:secretsmanager:...
-    oauth/youtube:          arn:aws:secretsmanager:...   # {client_id, client_secret}
-    oauth/twitch:           arn:aws:secretsmanager:...
-    oauth/discord:          arn:aws:secretsmanager:...   # {client_id, client_secret, bot_token}
-    jwt/private-key:        arn:aws:secretsmanager:...   # RS256 PEM, user-service only
-    jwt/public-key:         arn:aws:secretsmanager:...   # RS256 PEM, every validator
-    clickhouse/password:    arn:aws:secretsmanager:...
-
-  observability:
-    applicationLogGroup: /aws/eks/dabet-prod/application
-    prometheusRemoteWrite: https://aps-workspaces...amazonaws.com/.../api/v1/remote_write
-    alarmTopicArn: arn:aws:sns:...
-
-serviceAccounts:         # one entry per service, all nine
+services:                              # one entry per service, all nine
   user-service:
-    name: user-service
-    annotations:
-      eks.amazonaws.com/role-arn: arn:aws:iam::<account>:role/dabet-prod-user-service
+    serviceAccount:
+      annotations:
+        eks.amazonaws.com/role-arn: arn:aws:iam::<account>:role/dabet-prod-user-service
   credits-service: { ... }
   policy-service: { ... }
   provider-adapter: { ... }
@@ -420,58 +429,140 @@ serviceAccounts:         # one entry per service, all nine
   insights-service: { ... }
   clustering-service: { ... }
   clusters-job: { ... }
+```
 
-nodePools:
-  gpu:
-    enabled: false
-    nodeSelector: { "dabet.io/workload": "vllm" }
-    tolerations:
-      - { key: nvidia.com/gpu,    operator: Equal, value: present, effect: NoSchedule }
-      - { key: dabet.io/workload, operator: Equal, value: vllm,    effect: NoSchedule }
-  stateful:
-    enabled: true
-    nodeSelector: { "dabet.io/workload": "stateful" }
-    tolerations:
-      - { key: dabet.io/workload, operator: Equal, value: stateful, effect: NoSchedule }
+### `charts/dabet-deps`
 
-externalSecrets:
-  serviceAccountRoleArn: arn:aws:iam::<account>:role/dabet-prod-external-secrets
-  namespace: external-secrets
-  serviceAccountName: external-secrets
+Everything AWS provides is switched off and replaced by an `external.*`
+address. What stays in the cluster is exactly the set AWS has no managed
+equivalent of, plus the inference workloads:
 
-milvus:
-  bucket: dabet-prod-milvus-<account>
-  serviceAccountRoleArn: arn:aws:iam::<account>:role/dabet-prod-milvus
+```yaml
+kafka:     { enabled: false }
+postgres:  { enabled: false }
+redis:     { enabled: false }
+memcached: { enabled: false }
+minio:     { enabled: false }
+
+external:
+  kafka:     { brokers: "b-1...:9096,..." }
+  postgres:  { identity: "", policy: "" }   # DSNs carry a password — see below
+  redis:     { addr: "clustercfg...:6379", cluster: true }
+  memcached: { addrs: "node1:11211,..." }
+  s3:
+    endpoint: ""                            # empty means real S3, not MinIO
+    region: eu-west-1
+    bucket: dabet-prod-embeddings-<account>
+    accessKey: ""                           # empty: IRSA, not static keys
+    secretKey: ""
 
 clickhouse:
-  bucket: dabet-prod-clickhouse-<account>
-  serviceAccountRoleArn: arn:aws:iam::<account>:role/dabet-prod-clickhouse
-  passwordSecretArn: arn:aws:secretsmanager:...
+  enabled: true
+  nodeSelector: { "dabet.io/workload": stateful }
+  tolerations: [{ key: dabet.io/workload, operator: Equal, value: stateful, effect: NoSchedule }]
+
+milvus:
+  enabled: true
+  nodeSelector: { "dabet.io/workload": stateful }
+  tolerations: [...]
+
+vllm:
+  enabled: false                            # true when the GPU pool is on
+  nodeSelector: { "dabet.io/workload": vllm }
+  tolerations:
+    - { key: nvidia.com/gpu,    operator: Equal, value: present, effect: NoSchedule }
+    - { key: dabet.io/workload, operator: Equal, value: vllm,    effect: NoSchedule }
+
+embedding: { nodeSelector: ..., tolerations: ... }
 ```
+
+Both scheduling keys are emitted empty when the corresponding pool is off. That
+is deliberate: the chart wraps them in `with`, which skips an empty map, so an
+absent pool leaves the component unconstrained rather than Pending against a
+selector that matches no node.
+
+`external.postgres.identity` and `.policy` are left **empty on purpose**: the
+deps chart publishes them into a Kubernetes Secret, and they are DSNs, so they
+carry a password. A password in a Terraform output is a password in Terraform
+state. The app chart gets its `POSTGRES_DSN_*` through External Secrets
+Operator instead, from the document below.
+
+### The Secrets Manager document
+
+The chart's ESO integration extracts one aggregate document, whose required key
+list is in `deploy/k8s/charts/dabet/README.md` — every key must be present,
+because a `secretKeyRef` to a missing key blocks the pod from starting, and
+that fail-fast is intentional. An empty string is a legitimate value; absent is
+not.
+
+`app_secret_document_skeleton` renders that document with everything Terraform
+legitimately knows already filled in:
+
+```sh
+tofu output -raw app_secret_document_skeleton > /tmp/app.json
+tofu output -json postgres_password_commands      # how to read the passwords
+$EDITOR /tmp/app.json                             # replace the REPLACE markers
+aws secretsmanager put-secret-value --secret-id dabet/prod/app \
+  --secret-string file:///tmp/app.json
+shred -u /tmp/app.json
+```
+
+The Postgres DSNs are the whole reason that output exists. The chart wants
+complete connection strings; the password lives in an RDS-managed secret that
+Terraform deliberately never reads. So host, port, database, user and
+`sslmode=require` are supplied and only the password is pasted in:
+
+```
+postgres://dabet:REPLACE_WITH_PASSWORD@dabet-prod-identity.<id>.eu-west-1.rds.amazonaws.com:5432/dabet?sslmode=require
+```
+
+`sslmode=require` is not decoration — the parameter group sets
+`rds.force_ssl = 1`, and Compose's `sslmode=disable` is refused by the server.
+
+`S3_ACCESS_KEY` and `S3_SECRET_KEY` are rendered as empty strings, because
+`S3_CREDENTIALS_SOURCE=irsa` means the pod assumes its role instead. The keys
+stay present so the pod starts. `KAFKA_SASL_USERNAME` and `KAFKA_SASL_PASSWORD`
+point at the MSK SCRAM secret Terraform generated, rather than carrying its
+value.
 
 ### What the chart has to do with it
 
 **ServiceAccount names must match.** The IRSA trust policy pins
-`system:serviceaccount:<namespace>:<serviceaccount>`, so the chart's
-ServiceAccount name has to equal `serviceAccounts.<service>.name`. The default
-is the bare service name in namespace `dabet`; if the chart prefixes with the
-Helm release, override `service_account_names` and `kubernetes_namespace` to
-match. A mismatch does not fail at apply — it fails at runtime, as an
-`AssumeRoleWithWebIdentity` denial in the pod's logs.
+`system:serviceaccount:<namespace>:<serviceaccount>`, and
+`charts/dabet/templates/serviceaccount.yaml` names each account
+`<release>-<service>` — so at release name `dabet` it is `dabet-user-service`,
+not `user-service`. `var.helm_release_name` derives that;
+`var.service_account_names` overrides it wholesale. A mismatch does not fail at
+apply; it fails at runtime, as an `AssumeRoleWithWebIdentity` denial in the
+pod's logs.
 
-**`POSTGRES_DSN` is composed, not supplied.** §4.4 wants one `POSTGRES_DSN`
-environment variable, but the password lives in Secrets Manager. The chart
-builds it from `host`, `port`, `database`, `username` and `sslmode` above plus
-the password key from the secret. `sslmode=require` is not optional: the
-parameter group sets `rds.force_ssl = 1`, and Compose's `sslmode=disable` is
-refused by the server.
+**The namespace is `helm --namespace`.** The app chart templates no namespace
+of its own, so `var.kubernetes_namespace` (default `dabet`) has to match what
+you install into, and nothing in the chart will tell you if it does not.
 
 **`MEMCACHED_ADDRS` takes the node list, not the configuration endpoint.**
 ElastiCache's auto-discovery endpoint is a protocol extension the client has to
-speak, and `policy-service` uses `gomemcache`, which does not. Pointing it at
+speak, and `policy-service` uses `gomemcache`, which does not — pointing it at
 the discovery endpoint would silently hash every key onto one "node". The
 trade-off is that adding a node changes the list and needs a re-render and a
-restart — survivable, because §6.8 reads through to Postgres on a miss.
+restart, which §6.8 makes survivable: a cache miss reads through to Postgres.
+
+**Kafka topics are the deps chart's job, and it does not do them on AWS.**
+`charts/dabet-deps` has a reconciling topics Job carrying §4.2's exact
+partition counts and retentions — but it is gated on `kafka.enabled`, which is
+`false` here. So with MSK, **nothing creates the topics**. Run that job's script
+against the MSK bootstrap string, or create them with `kafka-topics.sh`, before
+the services start: `auto.create.topics.enable` is `false` on the cluster, so a
+missing topic is an error rather than a silently mis-shaped one-partition
+topic.
+
+**Two Terraform outputs have no chart key yet.**
+`platform_role_arns["milvus"]` and `platform_role_arns["clickhouse"]` exist so
+those two can reach their S3 buckets without static keys, but `dabet-deps` has
+no ServiceAccount template at all. Until it grows one, annotate those
+ServiceAccounts by hand or fall back to static credentials for those two
+components. Recorded rather than worked around, because the fix belongs in the
+chart.
 
 ---
 
@@ -569,13 +660,26 @@ Terraform never sees the password; the ARN is an output. This is why there is no
 `postgres/*` entry in the `secrets` module and why the two `postgres/*` ARNs in
 the contract come from the `rds` module.
 
-**Both consumption paths are wired.** External Secrets Operator gets a role that
-can read the deployment's whole prefix; each service *also* gets read access to
-exactly its own secrets, which is what the Secrets Store CSI driver needs
-(there, the pod's own identity fetches the secret). Granting both costs nothing
-and lets a team pick either without a Terraform change.
+**There are two shapes of the same secrets, on purpose.**
 
-Who reads what:
+`dabet/<env>/app` is one aggregate JSON document, because that is what the
+chart's ExternalSecret extracts — a single `dataFrom.extract.key` pulling every
+key at once. `app_secret_document_skeleton` renders it with the endpoints
+already filled in.
+
+The per-concern secrets (`stripe/secret-key`, `oauth/twitch`,
+`jwt/private-key`, …) carry the same values split up. That is what the Secrets
+Store CSI path needs — there, the pod's own identity fetches the secret, so a
+per-service IAM grant is the whole authorisation — and it is what lets
+`user-service` hold the JWT signing key while nothing else can. Populate
+whichever shape your deployment actually uses; both exist so the choice is not
+a Terraform change.
+
+**Both consumption paths are wired accordingly.** External Secrets Operator
+gets a role scoped to the deployment's ARN prefix; each service *also* gets read
+access to exactly its own split secrets.
+
+Who reads what, on the split path:
 
 | Secret | Read by |
 | --- | --- |
@@ -586,6 +690,13 @@ Who reads what:
 | `jwt/private-key` | user-service only — it is the only issuer |
 | `jwt/public-key` | every service that validates a bearer token |
 | `clickhouse/password` | clustering-service, clusters-job |
+
+**Two credentials Terraform does generate**, because neither has an
+AWS-managed equivalent and both must exist for a first apply to produce a
+working system: the MSK SASL/SCRAM password (`modules/msk`) and, if you enable
+it, the ElastiCache auth token. Both land in state. Rotate them out of band
+afterwards if that matters — `ignore_changes` on the secret value means the new
+one is not reverted, and MSK reads the current version.
 
 ---
 
@@ -682,12 +793,33 @@ tofu init -backend-config=backend.hcl
 tofu plan -var 'cluster_admin_principal_arns=["arn:aws:iam::<account>:role/YourRole"]'
 tofu apply
 
-# 4. Populate the secret placeholders.
-aws secretsmanager put-secret-value --secret-id dabet/prod/stripe/secret-key --secret-string ...
+# 4. Fill in the aggregate secret document. The endpoints are already in it;
+#    the passwords and third-party credentials are not.
+tofu output -raw app_secret_document_skeleton > /tmp/app.json
+tofu output -json postgres_password_commands
+$EDITOR /tmp/app.json
+aws secretsmanager put-secret-value --secret-id dabet/prod/app \
+  --secret-string file:///tmp/app.json
+shred -u /tmp/app.json
 
-# 5. Hand the contract to the charts.
-tofu output -raw helm_values_aws_yaml > ../../k8s/values-aws.yaml
+# 5. Create the §4.2 topics. The deps chart's topics Job is gated on an
+#    in-cluster Kafka, so with MSK nothing creates them and
+#    auto.create.topics.enable is false.
+#    See deploy/k8s/charts/dabet-deps/templates/kafka/topics-job.yaml for the
+#    registry and the reconcile script.
+
+# 6. Hand the contract to the charts.
 aws eks update-kubeconfig --region eu-west-1 --name dabet-prod
+tofu output -raw helm_values_dabet_deps_yaml > /tmp/deps-aws.yaml
+tofu output -raw helm_values_dabet_yaml      > /tmp/values-aws.yaml
+
+helm upgrade --install dabet-deps ../../k8s/charts/dabet-deps \
+  --namespace dabet --create-namespace -f /tmp/deps-aws.yaml
+
+helm upgrade --install dabet ../../k8s/charts/dabet \
+  --namespace dabet \
+  -f ../../k8s/charts/dabet/values-aws.yaml \
+  -f /tmp/values-aws.yaml
 ```
 
 ### Suggested Makefile targets
@@ -709,9 +841,13 @@ tf-plan:
 tf-apply:
 	$(TF) -chdir=$(TF_DIR) apply
 
-# Regenerate the Helm values contract from live outputs.
+# Regenerate the chart values from live outputs. Both files are derived, so
+# they are written outside the tree rather than committed.
+TF_OUT ?= build/terraform
 tf-values:
-	$(TF) -chdir=$(TF_DIR) output -raw helm_values_aws_yaml > deploy/k8s/values-aws.yaml
+	@mkdir -p $(TF_OUT)
+	$(TF) -chdir=$(TF_DIR) output -raw helm_values_dabet_yaml      > $(TF_OUT)/values-aws.yaml
+	$(TF) -chdir=$(TF_DIR) output -raw helm_values_dabet_deps_yaml > $(TF_OUT)/deps-aws.yaml
 
 # What CI should run: no credentials needed, no state touched.
 tf-check:
@@ -727,41 +863,62 @@ tf-check:
 
 ---
 
-## Application changes this topology needs
+## How the application reaches the managed services
 
-Three things in the §3 target column cannot be reached from Terraform alone.
-None is a defect in the application — the code was written against the Compose
-profile, which §3 says it must run on unchanged — but all three are blocking,
-and `examples/dev` deliberately configures around them so a first bring-up
-works.
+Three things about the §3 target column are properties of the client, not of
+the infrastructure, and each of them determined a default here.
 
-1. **Redis Cluster.** §3 targets Redis Cluster and §4.3's hash tags are already
-   in the keyspace for exactly this. `moderation-service` builds
-   `redis.NewClient` — a single-node go-redis client, which does not follow the
-   `MOVED` redirections a cluster-mode configuration endpoint returns. Needs
-   `redis.NewClusterClient`. TLS needs a `TLSConfig` on the same options struct.
-   *Symptom if ignored:* every Redis call fails, and per §4.7 the pipeline fails
-   open — so it does not crash, it just stops moderating, with
-   `fail_open_total{component="redis"}` pinned at the message rate. F2 says to
-   expect a throughput collapse as well.
+**Redis Cluster and TLS — resolved.** `moderation-service` builds
+`redis.NewClusterClient` and dials TLS when asked, driven by
+`REDIS_CLUSTER_ENABLED` and `REDIS_TLS_ENABLED`. The generated values file sets
+both from `elasticache.redis_cluster_mode` and
+`elasticache.redis_transit_encryption_enabled`, so the client and the cluster
+cannot disagree about which mode they are in. §4.3's hash tags were already in
+the keyspace for exactly this, and the accompanying slot audit pins that no Lua
+script or pipeline crosses tag families.
 
-2. **MSK IAM authentication.** `pkg/kafkax` builds a plain franz-go client with
-   no SASL mechanism and no TLS dialer. SASL/IAM needs
-   `kgo.SASL(aws.ManagedStreamingIAM(...))` from the AWS MSK IAM signer plus
-   `kgo.DialTLSConfig`. Until then, set `client_authentication =
-   "unauthenticated"` and `encryption_in_transit_client_broker =
-   "TLS_PLAINTEXT"`; both ports are then open, so the switch afterwards is a
-   client change, not a cluster rebuild. *Related:* `kgo.Rack` is what makes the
-   rack-aware replica selection above actually save money.
+**Kafka authentication — resolved, but not with IAM, and the reason matters.**
+`pkg/kafkax` now takes TLS and SASL from `KAFKA_TLS_ENABLED`,
+`KAFKA_SASL_MECHANISM` and friends, and supports `AWS_MSK_IAM` among its
+mechanisms. But franz-go's MSK IAM implementation reads AWS credentials out of
+the environment and performs no STS exchange — an IRSA projected
+service-account token cannot drive it. Using IAM auth from a pod would
+therefore mean shipping a static IAM user access key, which is precisely the
+thing a managed-cloud deployment must not need.
 
-3. **Memcached TLS.** `policy-service` uses `gomemcache`, which dials plain TCP.
-   `memcached_transit_encryption_enabled` is off by default for that reason.
-   §6.8 makes an unreachable Memcached a read-through to Postgres, so it
-   degrades rather than breaks — but it degrades the hot path's cache hit rate
-   to zero.
+So the module defaults to **SASL/SCRAM-SHA-512 over TLS**. Terraform generates
+the credential, stores it in Secrets Manager under the `AmazonMSK_` name MSK
+insists on, encrypts it with the customer-managed key MSK insists on, grants
+`kafka.amazonaws.com` read through a resource policy, and associates it with
+the cluster. The pod reads one value through External Secrets Operator. The
+`iam` module still writes the per-service `kafka-cluster:*` policies, so
+switching to `client_authentication = "iam"` later is a variable change and a
+rolling broker update — no rebuild.
 
-None of these is in scope for this directory (`pkg/` and `services/` belong to
-other work), so they are recorded rather than fixed.
+The cost of SCRAM over IAM is where authorisation lives: SCRAM authorises at
+the Kafka ACL level rather than in IAM policy, and this module does not create
+ACLs. With one credential shared by all nine services, every service can reach
+every topic. If that matters more than the credential story, use IAM and give
+the pods a way to get AWS credentials.
+
+*Related:* `kgo.Rack` is what makes the rack-aware replica selection in the MSK
+configuration actually save money. Without a rack set on the client, the
+property is inert.
+
+**S3 without static keys — resolved.** `insights-service` and `clusters-job`
+build their MinIO client from a credential chain selected by
+`S3_CREDENTIALS_SOURCE`; the generated values file sets it to `irsa`, along
+with `S3_REGION` so the regional STS endpoint is used. That is what makes the
+two S3 IRSA roles in this directory do anything, and why `S3_ACCESS_KEY` and
+`S3_SECRET_KEY` are rendered as empty strings in the secret document rather
+than as an IAM user's key.
+
+**Memcached TLS — still open, and deliberately.** `policy-service` uses
+`gomemcache`, which dials plain TCP, so `memcached_transit_encryption_enabled`
+is off. §6.8 makes an unreachable Memcached a read-through to Postgres, so
+turning it on without a client change degrades rather than breaks — but it
+degrades the hot path's cache hit rate to zero, which at 500K msg/s is not a
+thing to discover in production.
 
 ---
 
@@ -816,6 +973,7 @@ Ordered by how likely each is to bite on a first apply.
 | **`cluster-enabled = yes` in a custom Redis parameter group** | The module creates a `redis7`-family group and sets `cluster-enabled` rather than using the stock `default.redis7.cluster.on`, so that `maxmemory-policy` can also be set. This is a widely used pattern but I have not applied it. | If it is rejected, set `redis_parameter_group_family` aside and point the replication group at `default.redis7.cluster.on`, losing the eviction-policy setting. |
 | **`AL2023_x86_64_NVIDIA` AMI type** | The correct AL2023 GPU AMI type for the `g6` family as far as I can tell, but AMI type names have churned. | `aws eks describe-addon-versions` is no help here; check the EKS optimised-AMI documentation, or set `gpu_node_group.ami_type` explicitly. |
 | **MSK provisioned EBS throughput** | Left `null`. AWS documents it as available only from the larger instance sizes, with a MiBps range that depends on the type. I did not want to guess a pair that fails at apply. | Check the current matrix and set `provisioned_throughput_mibps` if the baseline is not enough. |
+| **MSK SASL/SCRAM** | The credential has three MSK-specific constraints — the `AmazonMSK_` name prefix, a customer-managed KMS key (the default `aws/secretsmanager` key is rejected), and a resource policy granting `kafka.amazonaws.com`. All three are implemented from the documented requirements, and all three are apply-time failures if any is wrong. | The first apply says so. Then check that `pkg/kafkax` authenticates with the value: `KAFKA_SASL_MECHANISM=SCRAM-SHA-512` with the username and password from the secret. |
 | **The AMP log resource policy** | `aws_prometheus_workspace.logging_configuration` needs a CloudWatch Logs *resource* policy granting `aps.amazonaws.com`, which the module creates. The condition keys and the source-ARN wildcard are from the documented pattern, not from an apply. | If AMP logs nothing, check the resource policy first; the workspace itself will have been created either way. |
 | **Pre-creating the RDS and EKS CloudWatch log groups** | Both services create their own log group on first write, with no retention. Creating it first so the service adopts it is the standard workaround, but adoption is not contractual. | Confirm after the first apply that `/aws/rds/instance/<id>/postgresql` has the configured retention. |
 | **`most_recent` addon resolution** | Addon versions are not pinned, so the first apply takes the newest compatible release. That is the safer default against a stale pin, but it is not reproducible across time. | Pin via `addons.addon_version_overrides` once you have a known-good set. |

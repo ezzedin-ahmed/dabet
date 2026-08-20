@@ -3,13 +3,32 @@ output "kubeconfig_command" {
   value       = module.dabet.kubeconfig_command
 }
 
-output "helm_values_aws_yaml" {
+output "helm_values_dabet_yaml" {
   description = <<-EOT
-    The values-aws.yaml contract. Write it out with:
+    Values for the app chart:
 
-      tofu output -raw helm_values_aws_yaml > ../../../k8s/values-aws.yaml
+      tofu output -raw helm_values_dabet_yaml > values-aws-generated.yaml
+      helm upgrade --install dabet ../../../k8s/charts/dabet \
+        --namespace dabet --create-namespace \
+        -f ../../../k8s/charts/dabet/values-aws.yaml \
+        -f values-aws-generated.yaml
   EOT
-  value       = module.dabet.helm_values_aws_yaml
+  value       = module.dabet.helm_values_dabet_yaml
+}
+
+output "helm_values_dabet_deps_yaml" {
+  description = "Values for the deps chart."
+  value       = module.dabet.helm_values_dabet_deps_yaml
+}
+
+output "app_secret_document_skeleton" {
+  description = "The Secrets Manager document to populate before deploying the charts."
+  value       = module.dabet.app_secret_document_skeleton
+}
+
+output "postgres_password_commands" {
+  description = "How to read the RDS-generated passwords for the DSNs above."
+  value       = module.dabet.postgres_password_commands
 }
 
 output "irsa_role_arns" {

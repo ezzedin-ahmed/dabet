@@ -5,25 +5,21 @@
 # one — so the diff between this file and examples/prod/main.tf is a fair
 # summary of what "non-production" costs you.
 #
-# Three deliberate departures from the §3 target, each of which exists because
-# the application code is not there yet rather than because dev is small:
+# Two deliberate departures from the §3 target, both cost decisions rather than
+# capability ones — pkg/kafkax now speaks SASL and TLS, moderation-service now
+# builds a cluster-aware Redis client, and the two S3 consumers now assume an
+# IRSA role, so nothing below is working around a missing feature:
 #
-#   1. Redis runs in NON-cluster mode. §3 targets Redis Cluster and §4.3's hash
-#      tags are already in the keyspace for it, but moderation-service builds a
-#      go-redis single-node client (redis.NewClient), which does not follow the
-#      MOVED redirections a cluster-mode configuration endpoint returns. Dev
-#      runs what the code can talk to; prod turns cluster mode on and the client
-#      has to move to redis.NewClusterClient first.
+#   1. Redis runs in NON-cluster mode with one node. §3 targets Redis Cluster
+#      and prod turns it on; a single cache.t4g.micro is what a development
+#      environment needs, and §4.3's hash tags mean the difference is a flag.
 #
-#   2. MSK runs unauthenticated with TLS_PLAINTEXT. IAM authentication needs
-#      pkg/kafkax to grow a SASL mechanism and a TLS dialer; until it does, the
-#      plaintext listener is what franz-go can reach. TLS_PLAINTEXT opens both
-#      ports, so the switch is a client change and not a cluster rebuild.
+#   2. Transit encryption is off on the caches. Inside a subnet tier with no
+#      internet route, at development volumes, the TLS handshake cost buys
+#      nothing a reviewer would notice.
 #
-#   3. Transit encryption is off on the caches, for the same reason.
-#
-# None of the three is a cost decision, and all three are called out in the
-# README as the work that stands between this and the target topology.
+# Kafka still uses SASL/SCRAM here, the same as prod, because the credential
+# path is the part worth exercising before production.
 
 module "dabet" {
   source = "../.."
@@ -99,8 +95,8 @@ module "dabet" {
     instance_type     = "kafka.t3.small"
     broker_storage_gb = 100
 
-    client_authentication               = "unauthenticated"
-    encryption_in_transit_client_broker = "TLS_PLAINTEXT"
+    client_authentication               = "scram"
+    encryption_in_transit_client_broker = "TLS"
 
     # 3 partitions per topic locally (docker-compose.yml) and 512 in the target
     # (§4.2). Neither is set here: topic creation belongs to the charts. What

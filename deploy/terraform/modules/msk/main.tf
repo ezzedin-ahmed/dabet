@@ -70,6 +70,7 @@ resource "aws_security_group" "this" {
 locals {
   broker_ports = concat(
     var.client_authentication == "iam" ? [9098] : [],
+    var.client_authentication == "scram" ? [9096] : [],
     var.client_authentication == "unauthenticated" && var.encryption_in_transit_client_broker != "TLS" ? [9092] : [],
     var.client_authentication == "unauthenticated" && var.encryption_in_transit_client_broker != "PLAINTEXT" ? [9094] : [],
   )
@@ -161,10 +162,11 @@ resource "aws_msk_cluster" "this" {
     unauthenticated = var.client_authentication == "unauthenticated"
 
     dynamic "sasl" {
-      for_each = var.client_authentication == "iam" ? [1] : []
+      for_each = contains(["iam", "scram"], var.client_authentication) ? [1] : []
 
       content {
-        iam = true
+        iam   = var.client_authentication == "iam"
+        scram = var.client_authentication == "scram"
       }
     }
   }
@@ -229,10 +231,101 @@ resource "aws_msk_cluster" "this" {
     }
 
     precondition {
-      condition     = var.client_authentication != "iam" || var.encryption_in_transit_client_broker == "TLS"
-      error_message = "IAM authentication is SASL over TLS: encryption_in_transit_client_broker must be TLS."
+      condition     = var.client_authentication == "unauthenticated" || var.encryption_in_transit_client_broker == "TLS"
+      error_message = "SASL (IAM or SCRAM) runs over TLS: encryption_in_transit_client_broker must be TLS."
     }
   }
+}
+
+# ---------------------------------------------------------------------------
+# SASL/SCRAM credential
+#
+# MSK imposes three constraints on the secret, none of them obvious and all of
+# them apply-time failures:
+#
+#   1. The name must begin with "AmazonMSK_".
+#   2. It must be encrypted with a CUSTOMER-MANAGED key. The default
+#      aws/secretsmanager key is rejected outright.
+#   3. Its resource policy must let kafka.amazonaws.com read it, or the
+#      association succeeds and authentication then fails.
+#
+# The value is {"username": ..., "password": ...} — the shape MSK expects and
+# also the shape External Secrets Operator can project straight into
+# KAFKA_SASL_USERNAME and KAFKA_SASL_PASSWORD.
+# ---------------------------------------------------------------------------
+
+resource "random_password" "scram" {
+  count = var.client_authentication == "scram" ? 1 : 0
+
+  length = var.scram_password_length
+  # MSK rejects a SCRAM password containing a colon, and several of the
+  # punctuation characters make the value awkward to pass through a shell.
+  special          = true
+  override_special = "-_=+.~"
+}
+
+resource "aws_secretsmanager_secret" "scram" {
+  count = var.client_authentication == "scram" ? 1 : 0
+
+  name        = "AmazonMSK_${var.name}_${var.scram_username}"
+  description = "SASL/SCRAM credential for MSK cluster ${var.name}"
+  kms_key_id  = var.kms_key_arn
+
+  tags = merge(var.tags, { Name = "AmazonMSK_${var.name}" })
+}
+
+resource "aws_secretsmanager_secret_version" "scram" {
+  count = var.client_authentication == "scram" ? 1 : 0
+
+  secret_id = aws_secretsmanager_secret.scram[0].id
+
+  secret_string = jsonencode({
+    username = var.scram_username
+    password = random_password.scram[0].result
+  })
+
+  lifecycle {
+    # Rotating the credential out of band replaces the value; without this,
+    # every later apply would put the original back.
+    ignore_changes = [secret_string]
+  }
+}
+
+data "aws_iam_policy_document" "scram" {
+  count = var.client_authentication == "scram" ? 1 : 0
+
+  statement {
+    sid       = "AllowMSKToReadTheCredential"
+    effect    = "Allow"
+    actions   = ["secretsmanager:GetSecretValue"]
+    resources = [aws_secretsmanager_secret.scram[0].arn]
+
+    principals {
+      type        = "Service"
+      identifiers = ["kafka.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_secretsmanager_secret_policy" "scram" {
+  count = var.client_authentication == "scram" ? 1 : 0
+
+  secret_arn = aws_secretsmanager_secret.scram[0].arn
+  policy     = data.aws_iam_policy_document.scram[0].json
+}
+
+resource "aws_msk_scram_secret_association" "this" {
+  count = var.client_authentication == "scram" ? 1 : 0
+
+  cluster_arn     = aws_msk_cluster.this.arn
+  secret_arn_list = [aws_secretsmanager_secret.scram[0].arn]
+
+  # The secret needs a version to associate, and MSK needs the resource policy
+  # to read it. Neither dependency is implied by the ARN reference above.
+  depends_on = [
+    aws_secretsmanager_secret_version.scram,
+    aws_secretsmanager_secret_policy.scram,
+  ]
 }
 
 # ---------------------------------------------------------------------------

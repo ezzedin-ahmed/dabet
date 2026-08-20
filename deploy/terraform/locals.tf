@@ -10,6 +10,24 @@ locals {
 
   secrets_prefix = "dabet/${var.environment}"
 
+  services = [
+    "user-service",
+    "credits-service",
+    "policy-service",
+    "provider-adapter",
+    "moderation-service",
+    "review-service",
+    "insights-service",
+    "clustering-service",
+    "clusters-job",
+  ]
+
+  # deploy/k8s/charts/dabet names each ServiceAccount "<release>-<service>".
+  service_account_names = coalesce(
+    var.service_account_names,
+    { for s in local.services : s => "${var.helm_release_name}-${s}" },
+  )
+
   # The identity instance carries identity, billing and review — §5.2, §5.3 and
   # §7.6 all have foreign keys to creators(id). The policy instance carries
   # §6.3 only, or nothing at all when create_policy_instance is false.

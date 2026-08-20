@@ -252,7 +252,7 @@ module "iam" {
   oidc_provider_url = module.eks.oidc_provider_url
 
   namespace             = var.kubernetes_namespace
-  service_account_names = var.service_account_names
+  service_account_names = local.service_account_names
 
   msk_cluster_arn = var.msk.client_authentication == "iam" ? module.msk.cluster_arn : null
 

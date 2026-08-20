@@ -26,24 +26,28 @@ variable "namespace" {
 variable "service_account_names" {
   description = <<-EOT
     Map of dabet service to the ServiceAccount name the chart creates for it.
-    The defaults are the service names themselves; the chart annotates each
-    with eks.amazonaws.com/role-arn from this module's outputs.
 
-    If the chart prefixes ServiceAccount names with the Helm release, override
-    every entry here to match. A mismatch does not fail at apply — it fails at
-    runtime, as an AssumeRoleWithWebIdentity denial in the pod's logs.
+    The defaults match deploy/k8s/charts/dabet, whose serviceaccount.yaml names
+    each account "<release>-<service>" through the dabet.svcName helper — so at
+    the conventional release name "dabet" the account for user-service is
+    "dabet-user-service", not "user-service". Override every entry if you
+    install under a different release name.
+
+    A mismatch does not fail at apply. It fails at runtime, as an
+    AssumeRoleWithWebIdentity denial in the pod's logs, which is a much longer
+    walk back to the cause.
   EOT
   type        = map(string)
   default = {
-    user-service       = "user-service"
-    credits-service    = "credits-service"
-    policy-service     = "policy-service"
-    provider-adapter   = "provider-adapter"
-    moderation-service = "moderation-service"
-    review-service     = "review-service"
-    insights-service   = "insights-service"
-    clustering-service = "clustering-service"
-    clusters-job       = "clusters-job"
+    user-service       = "dabet-user-service"
+    credits-service    = "dabet-credits-service"
+    policy-service     = "dabet-policy-service"
+    provider-adapter   = "dabet-provider-adapter"
+    moderation-service = "dabet-moderation-service"
+    review-service     = "dabet-review-service"
+    insights-service   = "dabet-insights-service"
+    clustering-service = "dabet-clustering-service"
+    clusters-job       = "dabet-clusters-job"
   }
 }
 

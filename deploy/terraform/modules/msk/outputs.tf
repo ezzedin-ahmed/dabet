@@ -17,12 +17,43 @@ output "bootstrap_brokers" {
   value = (
     var.client_authentication == "iam"
     ? aws_msk_cluster.this.bootstrap_brokers_sasl_iam
+    : var.client_authentication == "scram"
+    ? aws_msk_cluster.this.bootstrap_brokers_sasl_scram
     : (
       var.encryption_in_transit_client_broker == "PLAINTEXT"
       ? aws_msk_cluster.this.bootstrap_brokers
       : aws_msk_cluster.this.bootstrap_brokers_tls
     )
   )
+}
+
+output "bootstrap_brokers_sasl_scram" {
+  description = "SASL/SCRAM bootstrap string, empty unless SCRAM authentication is on."
+  value       = aws_msk_cluster.this.bootstrap_brokers_sasl_scram
+}
+
+output "scram_secret_arn" {
+  description = <<-EOT
+    Secrets Manager ARN holding {username, password} for SASL/SCRAM. Null unless
+    SCRAM is in use.
+
+    This is what the charts point KAFKA_SASL_USERNAME and KAFKA_SASL_PASSWORD at.
+  EOT
+  value       = try(aws_secretsmanager_secret.scram[0].arn, null)
+}
+
+output "sasl_mechanism" {
+  description = "Value for KAFKA_SASL_MECHANISM, or empty when the cluster is unauthenticated."
+  value = (
+    var.client_authentication == "scram" ? "SCRAM-SHA-512" :
+    var.client_authentication == "iam" ? "AWS_MSK_IAM" :
+    ""
+  )
+}
+
+output "tls_enabled" {
+  description = "Value for KAFKA_TLS_ENABLED. MSK brokers present a publicly trusted certificate, so no CA file is needed."
+  value       = var.encryption_in_transit_client_broker != "PLAINTEXT"
 }
 
 output "bootstrap_brokers_sasl_iam" {
