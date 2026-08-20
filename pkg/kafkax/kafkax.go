@@ -1,6 +1,55 @@
 // Package kafkax wraps franz-go with the producer and consumer settings
 // mandated by docs §4.2: zstd compression, acks=all, idempotent producer,
-// and at-least-once consumption with commits only after handler success.
+// and at-least-once consumption.
+//
+// # Delivery guarantee
+//
+// At-least-once, unchanged from the first version of this package: an
+// offset is committed only after the handler for that record has returned
+// nil. A handler error never advances the offset past the record that
+// failed, so that record is redelivered. Effects must therefore be
+// idempotent (P3, docs §7.8); Dabet's are, via the seen:{message_id} guard
+// and deterministic usage idempotency keys.
+//
+// # Ordering guarantee
+//
+// Each assigned partition is processed by exactly one goroutine, one
+// record at a time, in the order the broker returned them. Two records
+// from the same partition are never in flight at once, and a partition is
+// never processed by this member while it is being revoked. Records from
+// different partitions are processed concurrently — that is the point.
+//
+// This is precisely the property docs §7.3 depends on: because
+// messages.v1 is keyed by hash(author_id, content_id), all state for one
+// (sender, content) pair lives on one partition and is therefore mutated
+// by one goroutine of one consumer, in order, with no distributed locking
+// anywhere in the hot path. Concurrency here is across partitions only and
+// cannot break it.
+//
+// # Commit granularity
+//
+// Offsets are committed per partition as that partition makes progress:
+// on a configurable interval (KAFKA_COMMIT_INTERVAL, default 1s) and after
+// a configurable number of processed records (KAFKA_COMMIT_RECORDS,
+// default 1000). A whole polled fetch is no longer the unit, so a crash
+// re-delivers only the uncommitted tail rather than the whole fetch, and
+// kafka_consumer_lag_messages moves smoothly instead of in fetch-sized
+// jumps. What has never changed is the invariant underneath: a commit can
+// only ever include records whose handler returned nil.
+//
+// # Lag
+//
+// The consumer samples high watermarks on an interval (KAFKA_LAG_INTERVAL,
+// default 15s) and publishes kafka_consumer_lag_messages per topic,
+// partition and group — §4.5's mandated metric and §4.7's primary overload
+// signal. Sampling is entirely off the per-message path and, per P2, a
+// broker failure while sampling is logged and counted, never propagated.
+//
+// # Configuration
+//
+// Every number above is an environment-overridable default in the §4.4
+// style; see options.go for the full list. Explicit Options passed to
+// NewConsumer take precedence over the environment.
 package kafkax
 
 import (
@@ -45,74 +94,3 @@ func (p *Producer) Produce(ctx context.Context, topic string, key, value []byte)
 
 // Close flushes and closes the client.
 func (p *Producer) Close() { p.cl.Close() }
-
-// Handler processes one record. Returning an error stops the consumer
-// without committing, so the batch is redelivered (at-least-once);
-// handlers must be idempotent (P3).
-type Handler func(ctx context.Context, rec *kgo.Record) error
-
-// Consumer is a consumer-group member that commits offsets only after the
-// handler has succeeded for every polled record.
-type Consumer struct {
-	cl      *kgo.Client
-	group   string
-	handler Handler
-}
-
-// NewConsumer joins group on topics.
-func NewConsumer(brokers []string, group string, topics []string, h Handler) (*Consumer, error) {
-	cl, err := kgo.NewClient(
-		kgo.SeedBrokers(brokers...),
-		kgo.ConsumerGroup(group),
-		kgo.ConsumeTopics(topics...),
-		kgo.DisableAutoCommit(),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("kafka consumer: %w", err)
-	}
-	return &Consumer{cl: cl, group: group, handler: h}, nil
-}
-
-// Run polls until ctx is cancelled or the handler fails.
-func (c *Consumer) Run(ctx context.Context) error {
-	for {
-		fetches := c.cl.PollFetches(ctx)
-		if fetches.IsClientClosed() {
-			return nil
-		}
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		for _, fe := range fetches.Errors() {
-			return fmt.Errorf("kafka fetch %s/%d: %w", fe.Topic, fe.Partition, fe.Err)
-		}
-		var handlerErr error
-		fetches.EachRecord(func(rec *kgo.Record) {
-			if handlerErr != nil {
-				return
-			}
-			handlerErr = c.handle(ctx, rec)
-		})
-		if handlerErr != nil {
-			return handlerErr
-		}
-		if err := c.cl.CommitUncommittedOffsets(ctx); err != nil {
-			return fmt.Errorf("kafka commit: %w", err)
-		}
-	}
-}
-
-// handle runs one record under a CONSUMER span that continues the
-// producer's trace, so the handler's own work (policy gRPC, Redis, the
-// LLM call, the verdict publish) hangs off the same trace as the ingest
-// that created the record.
-func (c *Consumer) handle(ctx context.Context, rec *kgo.Record) error {
-	ctx, span := StartConsumeSpan(ctx, rec, c.group)
-	defer span.End()
-	err := c.handler(ctx, rec)
-	recordError(span, err)
-	return err
-}
-
-// Close leaves the group and closes the client.
-func (c *Consumer) Close() { c.cl.Close() }
