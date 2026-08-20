@@ -1,8 +1,29 @@
 package obs
 
 import (
+	"sync/atomic"
+
 	"github.com/prometheus/client_golang/prometheus"
 )
+
+// defaultKafkaLag holds the kafka_consumer_lag_messages gauge of the most
+// recently constructed Metrics. §4.5 mandates the metric on every service
+// and §4.7 makes it the primary overload signal, but the value can only be
+// known by whatever is consuming — so the consumer needs a way to find the
+// gauge without every main() remembering to hand it over. A service builds
+// exactly one Metrics (pkg/service.New), so "most recent" is "the
+// process's". Tests that build several registries get the last one; they
+// can pass a gauge explicitly instead.
+var defaultKafkaLag atomic.Pointer[prometheus.GaugeVec]
+
+// DefaultKafkaConsumerLag returns the process's kafka_consumer_lag_messages
+// gauge, or nil if no Metrics has been constructed. Labels are
+// (topic, partition, group) — never an id, per the cardinality rule above.
+func DefaultKafkaConsumerLag() *prometheus.GaugeVec { return defaultKafkaLag.Load() }
+
+// SetDefaultKafkaConsumerLag overrides the process default. Intended for
+// tests and for services that register their own gauge.
+func SetDefaultKafkaConsumerLag(vec *prometheus.GaugeVec) { defaultKafkaLag.Store(vec) }
 
 // Metrics holds the standard metrics from docs §4.5 that every service
 // exposes. Area-specific metrics are registered by the service itself
@@ -53,5 +74,6 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		m.DependencyUp,
 		m.FailOpenTotal,
 	)
+	defaultKafkaLag.Store(m.KafkaConsumerLag)
 	return m
 }
