@@ -14,7 +14,7 @@ RATE     ?= 400
 GOBIN   := $(shell go env GOPATH)/bin
 MODULES := $(shell go work edit -json | grep DiskPath | cut -d'"' -f4)
 
-.PHONY: build test vet proto up up-full up-traced up-mail up-load up-sharded load load-selfbench load-drills down logs ps e2e
+.PHONY: build test vet proto up up-full up-traced up-mail up-load up-sharded up-full-e2e e2e-full load load-selfbench load-drills down logs ps e2e
 
 build:
 	@for m in $(MODULES); do (cd $$m && go build ./...) || exit 1; done
@@ -83,7 +83,8 @@ down:
 	$(COMPOSE) -f deploy/compose/fragments/observability.yml \
 		-f deploy/compose/fragments/mail.yml \
 		-f deploy/compose/fragments/load.yml \
-		-f deploy/compose/fragments/sharding.yml --profile clustering down -v
+		-f deploy/compose/fragments/sharding.yml \
+		-f deploy/compose/fragments/e2e-extra.yml --profile clustering down -v
 
 logs:
 	$(COMPOSE) logs -f
@@ -95,3 +96,13 @@ ps:
 # build-tagged, so `make test` never touches the network.
 e2e:
 	cd test/e2e && go test -tags e2e -count=1 -timeout 20m -v ./...
+
+# The clustering profile with timings tightened enough for a test to observe
+# a bootstrap run. Thresholds that decide *whether* a run happens stay at spec.
+up-full-e2e:
+	CLUSTERING_ENDPOINT=http://clustering-service:8080 \
+	$(COMPOSE) -f deploy/compose/fragments/e2e-extra.yml --profile clustering up -d --build --wait
+
+# Adds the Milvus-backed clustering suite. Needs `make up-full-e2e`.
+e2e-full:
+	cd test/e2e && go test -tags "e2e,e2e_full" -count=1 -timeout 30m -v ./...
