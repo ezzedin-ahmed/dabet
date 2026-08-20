@@ -1,0 +1,473 @@
+# Dabet on EKS with managed dependencies — the "Target" column of docs §3.
+#
+#   helm upgrade --install dabet deploy/k8s/charts/dabet \
+#     -f deploy/k8s/charts/dabet/values-aws.yaml \
+#     --set global.image.registry=111122223333.dkr.ecr.eu-west-1.amazonaws.com \
+#     --set global.image.tag=$GIT_SHA \
+#     --set ingress.host=api.dabet.example.com
+#
+# Every value below marked REPLACE is an interface with the Terraform layer.
+# The exact contract — secret names, keys, IRSA annotations, endpoints — is in
+# the chart README under "The Terraform interface". Read it before wiring the
+# two halves together; three of the items there are constraints the
+# application code imposes on the infrastructure, not preferences.
+
+global:
+  image:
+    # REPLACE: <account>.dkr.ecr.<region>.amazonaws.com
+    registry: "111122223333.dkr.ecr.eu-west-1.amazonaws.com"
+    repository: dabet
+    # REPLACE per deploy. Never "latest": a rollback needs an immutable tag,
+    # and IfNotPresent + a moving tag means two pods running different code.
+    tag: ""
+    pullPolicy: IfNotPresent
+  # REPLACE with whatever your cost-allocation / ownership labelling needs.
+  # The app.kubernetes.io/* labels are set by the chart; anything you put
+  # here that collides with one of them loses, deliberately, because the
+  # selector labels are a subset and must not drift.
+  commonLabels:
+    dabet.io/environment: prod
+  commonAnnotations: {}
+
+# ---------------------------------------------------------------------------
+# Managed dependency endpoints (§3 "Target" column).
+#
+# Only the non-secret coordinates live here. Everything carrying a credential
+# — the Postgres and ClickHouse DSNs, the S3 keys — comes from AWS Secrets
+# Manager through External Secrets, below.
+#
+# THREE CONSTRAINTS THE CODE IMPOSES. These are findings, not preferences,
+# and each one is a limit on what Terraform may provision:
+#
+#  1. KAFKA MUST BE PLAINTEXT-REACHABLE. pkg/kafkax builds its franz-go
+#     client with no SASL and no TLS options and exposes no environment
+#     variable for either. So: MSK provisioned with a PLAINTEXT in-VPC
+#     listener (port 9092), security-group-scoped to the node group. MSK
+#     Serverless, which is IAM-auth only, cannot be used without a code
+#     change.
+#  2. REDIS MUST BE SINGLE-SHARD, NO IN-TRANSIT TLS. moderation-service uses
+#     redis.NewClient, not NewClusterClient, and sets no TLSConfig. §3's
+#     target column says "Redis Cluster" and §4.3 says the hash tags exist
+#     so the migration is "a config change" — the hash tags are there, but
+#     the CLIENT is not cluster-aware. So: ElastiCache with cluster mode
+#     DISABLED (one shard, replicas for HA), encryption in transit OFF.
+#  3. S3 NEEDS STATIC KEYS, NOT IRSA. insights-service and clusters-job
+#     construct their MinIO client with credentials.NewStaticV4 from
+#     S3_ACCESS_KEY / S3_SECRET_KEY, with no session token and no fallback
+#     to the AWS credential chain. An IRSA role cannot be used for the
+#     object store; Terraform must provision an IAM user with a long-lived
+#     access key scoped to the embeddings bucket, and put it in Secrets
+#     Manager. The IRSA annotations below are still wired, so the day the
+#     client learns the credential chain nothing else has to move.
+# ---------------------------------------------------------------------------
+config:
+  # REPLACE: MSK bootstrap brokers, PLAINTEXT listener. See constraint 1.
+  kafkaBrokers: "b-1.dabet.abcdef.c2.kafka.eu-west-1.amazonaws.com:9092,b-2.dabet.abcdef.c2.kafka.eu-west-1.amazonaws.com:9092,b-3.dabet.abcdef.c2.kafka.eu-west-1.amazonaws.com:9092"
+  # REPLACE: ElastiCache primary endpoint, cluster mode disabled. Constraint 2.
+  redisAddr: "dabet-redis.abcdef.ng.0001.euw1.cache.amazonaws.com:6379"
+  # REPLACE: ElastiCache Memcached configuration endpoint (§3 "Managed pool").
+  memcachedAddrs: "dabet-memcached.abcdef.cfg.euw1.cache.amazonaws.com:11211"
+  # REPLACE: the GPU fleet's load balancer (§3 "GPU fleet behind a load
+  # balancer"). An in-cluster Service in front of a GPU node group is the
+  # usual shape; an ALB works too.
+  vllmEndpoint: "http://vllm.dabet.svc.cluster.local:8000"
+  # REPLACE: the embedding fleet. A21 shares 384-dim embeddings with the
+  # semantic-spam detector, so this is on the moderation hot path (§4.6
+  # gives it 100 ms) and belongs in-cluster, not behind an internet hop.
+  embeddingEndpoint: "http://embedding.dabet.svc.cluster.local:8091"
+  # REPLACE: distributed Milvus (§3), only needed with the clustering pair.
+  milvusAddr: "milvus.dabet.svc.cluster.local:19530"
+  # Real S3. Path-style addressing is what the MinIO client is configured
+  # for, so the regional endpoint is correct here (a virtual-hosted
+  # bucket.s3... URL is not).
+  s3Endpoint: "https://s3.eu-west-1.amazonaws.com"
+  # REPLACE: the bucket Terraform creates. Keep it versioned and lifecycled;
+  # §4.8 keeps embeddings indefinitely.
+  s3Bucket: "dabet-prod-embeddings"
+  logLevel: "info"
+
+# ---------------------------------------------------------------------------
+# §5.4 target: RS256.
+#
+# user-service mounts the private key and signs; every verifying service
+# mounts only the public half. Both PEMs come from Secrets Manager via the
+# ExternalSecret below, under the keys JWT_PRIVATE_KEY and JWT_PUBLIC_KEY.
+#
+# Rotation, since nothing here does it for you: publish the new public key to
+# every verifier FIRST (they accept one key at a time, so run the old key
+# until every verifier has the new one), then switch the issuer. jwt.kid is
+# carried in the token header to make that sequencing auditable.
+# ---------------------------------------------------------------------------
+jwt:
+  alg: RS256
+  kid: ""
+
+# ---------------------------------------------------------------------------
+# §4.4: "from a secret manager in the k8s target".
+#
+# External Secrets Operator pulls ONE AWS Secrets Manager document and
+# projects its keys into the Kubernetes Secret this chart's workloads
+# already reference. secrets.create must be false: the operator owns it.
+#
+# Terraform owes us a secret whose JSON keys are exactly the key names listed
+# under secrets.data in values.yaml. The README enumerates them.
+# ---------------------------------------------------------------------------
+secrets:
+  create: false
+  name: dabet-secrets
+
+externalSecrets:
+  enabled: true
+  secretStoreRef:
+    # REPLACE: the ClusterSecretStore Terraform creates, bound to an IRSA
+    # role with secretsmanager:GetSecretValue on the document below.
+    name: aws-secrets-manager
+    kind: ClusterSecretStore
+  # 1h is a compromise: shorter costs API calls on every refresh across every
+  # key, longer widens the window after a credential rotation. Note that ESO
+  # updating the Secret does NOT restart the pods — env vars are read at
+  # startup — so a rotation still needs a rollout. Deploy something like
+  # Reloader if that matters.
+  refreshInterval: 1h
+  creationPolicy: Owner
+  dataFrom:
+    - extract:
+        # REPLACE: the Secrets Manager document.
+        key: dabet/prod/app
+
+# ---------------------------------------------------------------------------
+# ServiceAccount annotations — IRSA. Terraform fills the role ARNs.
+#
+# Per service, so one service's role cannot be assumed by another. Today only
+# the External Secrets store role does real work (see constraint 3 about S3);
+# these are wired so that adding, say, KMS or SQS access later is a Terraform
+# change and not a chart change.
+# ---------------------------------------------------------------------------
+serviceAccount:
+  create: true
+  automountServiceAccountToken: false
+
+# ---------------------------------------------------------------------------
+# §4.5 tracing, on. 1% head sampling: at N6's 500 000 msg/s, sampling
+# everything is neither affordable nor useful.
+# ---------------------------------------------------------------------------
+tracing:
+  enabled: true
+  # REPLACE: the OTel collector (a DaemonSet or a Deployment behind a Service).
+  endpoint: "http://opentelemetry-collector.observability.svc.cluster.local:4317"
+  protocol: grpc
+  sampler: parentbased_traceidratio
+  samplerArg: "0.01"
+  resourceAttributes: "deployment.environment=prod"
+
+# ---------------------------------------------------------------------------
+# §4.2 target partition counts. These are the replica ceilings the chart
+# clamps maxReplicas to, so they must match what Terraform actually creates
+# on MSK — a topic created with 3 partitions silently caps moderation-service
+# at 3 pods no matter what this file says.
+# ---------------------------------------------------------------------------
+kafka:
+  consumer:
+    partitionConcurrency: 64
+    queueDepth: 2
+    maxPollRecords: 1000
+    drainTimeoutSeconds: 30
+  commit:
+    intervalSeconds: 1
+    records: 1000
+  lag:
+    # This gauge is what the autoscaler and the §4.7 alert both read.
+    intervalSeconds: 15
+    timeoutSeconds: 5
+  topics:
+    messages:
+      name: messages.v1
+      partitions: 512
+    flagged:
+      name: flagged.v1
+      partitions: 128
+    deletions:
+      name: deletions.v1
+      partitions: 128
+    usage:
+      name: usage.v1
+      partitions: 32
+
+# ---------------------------------------------------------------------------
+# Autoscaling on lag (§4.7). KEDA reads the broker directly, so the
+# autoscaler keeps working when Prometheus does not — which matters, because
+# the moment lag matters most is an incident.
+#
+# Switch to trigger: prometheus to scale on kafka_consumer_lag_messages
+# instead; then the autoscaler and the pager are reading the same number, at
+# the cost of a dependency on the monitoring stack.
+# ---------------------------------------------------------------------------
+autoscaling:
+  mode: keda
+  keda:
+    trigger: kafka
+    pollingInterval: 30
+    cooldownPeriod: 300
+    kafka:
+      # Empty inherits config.kafkaBrokers.
+      bootstrapServers: ""
+      # 1 000 records of lag per replica. At the measured ~200 msg/s per
+      # moderation instance (test/load/README.md) that is roughly 5 s of
+      # backlog per pod before it asks for another — well inside §4.6's
+      # budget, and slack enough that a routine rebalance does not scale.
+      lagThreshold: "1000"
+      activationLagThreshold: "0"
+      offsetResetPolicy: latest
+      allowIdleConsumers: false
+      # Constraint 1: plaintext MSK, so no SASL and no TLS on the scaler
+      # either. If MSK is ever moved to TLS, this and pkg/kafkax both change.
+      sasl: ""
+      tls: "disable"
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 30
+    scaleDown:
+      # Ten minutes. Every scale-down is a consumer-group rebalance, which
+      # costs every member a drain; flapping on a spiky workload would spend
+      # more time rebalancing than consuming.
+      stabilizationWindowSeconds: 600
+      policies:
+        - type: Percent
+          value: 10
+          periodSeconds: 60
+
+metrics:
+  serviceMonitor:
+    enabled: true
+    kind: ServiceMonitor
+    interval: 30s
+    scrapeTimeout: 10s
+    labels:
+      # REPLACE if the Prometheus Operator's serviceMonitorSelector differs.
+      release: kube-prometheus-stack
+
+podDisruptionBudget:
+  enabled: true
+  maxUnavailable: 1
+
+scheduling:
+  topologySpreadConstraints:
+    enabled: true
+    # Spread across AZs, but ScheduleAnyway: per P2 an unschedulable
+    # moderation replica during an AZ event is worse than an unevenly spread
+    # one. DoNotSchedule here would turn a capacity event into an outage.
+    zoneWhenUnsatisfiable: ScheduleAnyway
+    nodeWhenUnsatisfiable: ScheduleAnyway
+  podAntiAffinity:
+    enabled: true
+    type: soft
+
+ingress:
+  enabled: true
+  # REPLACE: alb (AWS Load Balancer Controller) or nginx.
+  className: alb
+  # REPLACE.
+  host: api.dabet.example.com
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP":80},{"HTTPS":443}]'
+    alb.ingress.kubernetes.io/ssl-redirect: "443"
+    # REPLACE: the ACM certificate ARN Terraform issues for `host`.
+    alb.ingress.kubernetes.io/certificate-arn: "arn:aws:acm:eu-west-1:111122223333:certificate/REPLACE"
+    # /healthz, not /readyz: the ALB must keep sending traffic to a pod that
+    # has lost a dependency and is failing open (§4.5). A /readyz-based
+    # target group would do the same thing the readiness probe is forbidden
+    # from doing.
+    alb.ingress.kubernetes.io/healthcheck-path: /healthz
+  tls:
+    # The ALB terminates TLS with the ACM certificate above; a tls block
+    # would make the controller look for a Secret it does not need. Set this
+    # true (and set secretName) on ingress-nginx with cert-manager.
+    enabled: false
+
+networkPolicy:
+  # Turn on once the CNI enforces policy and the dependency CIDRs below are
+  # verified. Getting egressCIDRs wrong cuts every pod off from Kafka and
+  # Postgres at once, which per §4.7 means the whole fleet fails open
+  # silently rather than crashing — so verify it in staging first.
+  enabled: false
+  allowDNS: true
+  egressCIDRs:
+    # REPLACE: the VPC CIDR (MSK, RDS, ElastiCache) — S3 goes via the gateway
+    # endpoint, which is also in-VPC routing.
+    - "10.0.0.0/16"
+
+services:
+  user-service:
+    replicas: 3
+    serviceAccount:
+      annotations:
+        # REPLACE: Terraform's IRSA role for user-service.
+        eks.amazonaws.com/role-arn: "arn:aws:iam::111122223333:role/dabet-prod-user-service"
+    autoscaling:
+      enabled: true
+      mode: hpa
+      minReplicas: 3
+      maxReplicas: 20
+    env:
+      OAUTH_REDIRECT_BASE: "https://api.dabet.example.com"
+      APP_REDIRECT_URL: "https://app.dabet.example.com/connections"
+      APP_VERIFY_URL: "https://app.dabet.example.com/verify"
+      # REPLACE: SES SMTP endpoint. MAIL_TLS must be starttls or tls — the
+      # mailer refuses to send credentials over plaintext.
+      MAIL_SMTP_ADDR: "email-smtp.eu-west-1.amazonaws.com:587"
+      MAIL_FROM: "Dabet <no-reply@dabet.example.com>"
+      MAIL_TLS: "starttls"
+      MAIL_WORKERS: "4"
+      CONNECTION_EXPIRY_SWEEP_INTERVAL: "1m"
+    resources:
+      requests: { cpu: 250m, memory: 256Mi }
+      limits: { cpu: 2, memory: 1Gi }
+
+  credits-service:
+    replicas: 3
+    serviceAccount:
+      annotations:
+        eks.amazonaws.com/role-arn: "arn:aws:iam::111122223333:role/dabet-prod-credits-service"
+    autoscaling:
+      enabled: true
+      mode: keda
+      minReplicas: 3
+      # usage.v1 has 32 partitions (§4.2), which is the real ceiling — the
+      # chart clamps to it whatever is written here.
+      maxReplicas: 32
+    env:
+      STRIPE_API_BASE: "https://api.stripe.com"
+      APP_BILLING_URL: "https://app.dabet.example.com/billing"
+      MAIL_SMTP_ADDR: "email-smtp.eu-west-1.amazonaws.com:587"
+      MAIL_FROM: "Dabet <no-reply@dabet.example.com>"
+      MAIL_TLS: "starttls"
+    resources:
+      requests: { cpu: 250m, memory: 256Mi }
+      limits: { cpu: 2, memory: 1Gi }
+
+  policy-service:
+    # Every cascade miss is a GetPolicy gRPC call (§6.7). It is on the hot
+    # path for every message, so it is sized against moderation's fleet, not
+    # against its own HTTP CRUD traffic.
+    replicas: 6
+    serviceAccount:
+      annotations:
+        eks.amazonaws.com/role-arn: "arn:aws:iam::111122223333:role/dabet-prod-policy-service"
+    autoscaling:
+      enabled: true
+      mode: hpa
+      minReplicas: 6
+      maxReplicas: 40
+    resources:
+      requests: { cpu: 500m, memory: 512Mi }
+      limits: { cpu: 2, memory: 2Gi }
+
+  provider-adapter:
+    # A13 bounds an instance at 5 000 connections, so this is a capacity
+    # decision, not a load one: replicas >= ceil(active_connections / 5000),
+    # with headroom for a rebalance. NOT autoscaled — every membership change
+    # reshuffles a ring segment and forces those connections to reconnect.
+    replicas: 6
+    serviceAccount:
+      annotations:
+        eks.amazonaws.com/role-arn: "arn:aws:iam::111122223333:role/dabet-prod-provider-adapter"
+    env:
+      ADAPTER_SHARDING_ENABLED: "true"
+      ADAPTER_SHARD_MAX_CONNECTIONS: "5000"
+      ADAPTER_YOUTUBE_DAILY_QUOTA: "10000"
+      ADAPTER_YOUTUBE_DISCOVERY_INTERVAL: "60s"
+      ADAPTER_DISCORD_SHARDS: "0"
+    resources:
+      requests: { cpu: 1, memory: 2Gi }
+      limits: { cpu: 4, memory: 4Gi }
+
+  moderation-service:
+    # test/load/README.md measured 170-200 msg/s per instance. N6's 50 000
+    # msg/s BASELINE therefore wants ~250-300 replicas and the 500 000 msg/s
+    # peak ~2 500-3 000 — the latter is above §4.2's 512-partition ceiling,
+    # which caps the consumer group at 512 members. See the README's
+    # "Capacity" section: reaching N6's peak needs more partitions on
+    # messages.v1, or a faster cascade, and neither is a chart setting.
+    replicas: 24
+    serviceAccount:
+      annotations:
+        eks.amazonaws.com/role-arn: "arn:aws:iam::111122223333:role/dabet-prod-moderation-service"
+    autoscaling:
+      enabled: true
+      mode: keda
+      minReplicas: 24
+      maxReplicas: 512
+    resources:
+      requests: { cpu: 1, memory: 1Gi }
+      limits: { cpu: 2, memory: 2Gi }
+
+  review-service:
+    replicas: 3
+    serviceAccount:
+      annotations:
+        eks.amazonaws.com/role-arn: "arn:aws:iam::111122223333:role/dabet-prod-review-service"
+    # CPU, not lag: §7.6 reads flagged.v1 partitions directly per request,
+    # joins no consumer group, and publishes review_queue_lag_seconds rather
+    # than kafka_consumer_lag_messages. There is no group lag to scale on.
+    autoscaling:
+      enabled: true
+      mode: hpa
+      minReplicas: 3
+      maxReplicas: 24
+    resources:
+      requests: { cpu: 250m, memory: 512Mi }
+      limits: { cpu: 2, memory: 2Gi }
+
+  insights-service:
+    replicas: 8
+    serviceAccount:
+      annotations:
+        # Wired for the day the S3 client learns the AWS credential chain.
+        # Today the bucket is reached with the static keys of constraint 3.
+        eks.amazonaws.com/role-arn: "arn:aws:iam::111122223333:role/dabet-prod-insights-service"
+    autoscaling:
+      enabled: true
+      mode: keda
+      minReplicas: 8
+      maxReplicas: 128
+    resources:
+      requests: { cpu: 1, memory: 1Gi }
+      limits: { cpu: 2, memory: 4Gi }
+
+  # Area D's Milvus-backed pair. Enable together with a Milvus deployment.
+  clustering-service:
+    enabled: false
+    replicas: 3
+    serviceAccount:
+      annotations:
+        eks.amazonaws.com/role-arn: "arn:aws:iam::111122223333:role/dabet-prod-clustering-service"
+    autoscaling:
+      enabled: true
+      mode: hpa
+      minReplicas: 3
+      maxReplicas: 24
+    resources:
+      requests: { cpu: 500m, memory: 1Gi }
+      limits: { cpu: 2, memory: 4Gi }
+
+  clusters-job:
+    enabled: false
+    # Still one. The scheduler has no leader election; two replicas would
+    # double-run a creator's clustering pass and emit two usage.v1
+    # messages_reclustered events with different idempotency keys, i.e.
+    # charge twice (§7.10, §5.7).
+    replicas: 1
+    serviceAccount:
+      annotations:
+        eks.amazonaws.com/role-arn: "arn:aws:iam::111122223333:role/dabet-prod-clusters-job"
+    resources:
+      # CLUSTERS_MAX_POINTS x 384 float32 is ~300 MB of vectors before
+      # HDBSCAN's working set. Idle between passes, saturated during one.
+      requests: { cpu: 1, memory: 2Gi }
+      limits: { cpu: 8, memory: 16Gi }

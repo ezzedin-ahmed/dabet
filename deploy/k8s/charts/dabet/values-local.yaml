@@ -1,0 +1,333 @@
+# Dabet on a laptop cluster (kind / k3d / minikube / Docker Desktop).
+#
+#   helm install dabet deploy/k8s/charts/dabet -f deploy/k8s/charts/dabet/values-local.yaml
+#
+# This is the Compose profile of docs §3, expressed as Kubernetes: one
+# instance of every dependency, three partitions per topic, HS256 tokens, the
+# deterministic mocks standing in for the LLM, the embedder, the OAuth
+# provider and Stripe. Per §3 the SERVICES are byte-identical to the target —
+# only this file differs.
+#
+# Dependencies are NOT in this chart. Install deploy/k8s/charts/dabet-deps
+# first (or run the compose stack and point the endpoints below at it); the
+# service names assumed here are documented in the chart README under
+# "The dependency interface". A dependency that is missing does not stop the
+# install: pods come up, fail open, and CrashLoopBackOff only where a
+# required env var (POSTGRES_DSN, KAFKA_BROKERS) points at nothing.
+
+global:
+  image:
+    # Load locally-built images into the cluster rather than pulling:
+    #   for s in user-service credits-service policy-service provider-adapter \
+    #            moderation-service review-service insights-service; do
+    #     docker build -f services/$s/Dockerfile -t dabet/$s:dev .
+    #     kind load docker-image dabet/$s:dev --name dabet
+    #   done
+    repository: dabet
+    tag: dev
+    # Never reaches a registry, so a missing image is an ImagePullBackOff
+    # rather than a silent pull of something older.
+    pullPolicy: IfNotPresent
+
+# ---------------------------------------------------------------------------
+# In-cluster dependencies. Names follow the dabet-deps chart installed as
+# release "dabet-deps" in the same namespace.
+# ---------------------------------------------------------------------------
+config:
+  kafkaBrokers: "dabet-deps-kafka:9092"
+  redisAddr: "dabet-deps-redis-master:6379"
+  memcachedAddrs: "dabet-deps-memcached:11211"
+  # tools/mockllm — deterministic OpenAI-compatible stub. "FLAGME" violates
+  # rule 1, which is what test/e2e asserts on.
+  vllmEndpoint: "http://dabet-deps-mockllm:8089"
+  # tools/mockembed — deterministic 384-dim vectors (A21).
+  embeddingEndpoint: "http://dabet-deps-mockembed:8091"
+  milvusAddr: "dabet-deps-milvus:19530"
+  s3Endpoint: "http://dabet-deps-minio:9000"
+  s3Bucket: "embeddings"
+  logLevel: "debug"
+
+secrets:
+  create: true
+  data:
+    POSTGRES_DSN: "postgres://dabet:dabet@dabet-deps-postgresql:5432/dabet?sslmode=disable"
+    CLICKHOUSE_DSN: "clickhouse://dabet:dabet@dabet-deps-clickhouse:9000/dabet"
+    S3_ACCESS_KEY: "minioadmin"
+    S3_SECRET_KEY: "minioadmin"
+    JWT_SECRET: "dev-secret-change-me"
+    # tools/mockstripe verifies a real HMAC-SHA256 signature, so this is the
+    # secret it signs with, not a bypass.
+    STRIPE_SECRET_KEY: "sk_test_local"
+    STRIPE_WEBHOOK_SECRET: "whsec_local_dev"
+    # tools/mockoauth's client. PKCE S256 is genuinely verified.
+    OAUTH_MOCK_CLIENT_ID: "dabet-local"
+    OAUTH_MOCK_CLIENT_SECRET: "dabet-local-secret"
+
+# §5.4: HS256 locally, RS256 in the target. Nothing else changes between them.
+jwt:
+  alg: HS256
+
+# ---------------------------------------------------------------------------
+# §3: "Kafka | 1 broker, 3 partitions/topic". The partition count is also the
+# replica ceiling the chart clamps to, so a laptop cannot be told to run 512
+# moderation pods.
+#
+# The drain timeout is shortened to 10s so a `helm uninstall` on a laptop does
+# not sit for a minute per pod. terminationGracePeriodSeconds below is dropped
+# to match, and the chart's render-time check (grace > drain + 10) still has
+# to pass — that check is the thing this override is most likely to trip.
+# ---------------------------------------------------------------------------
+kafka:
+  consumer:
+    partitionConcurrency: 8
+    drainTimeoutSeconds: 10
+  lag:
+    # Faster than the 15s default so the gauge moves visibly during a demo.
+    intervalSeconds: 5
+  topics:
+    messages:
+      partitions: 3
+    flagged:
+      partitions: 3
+    deletions:
+      partitions: 3
+    usage:
+      partitions: 3
+
+# No operator on a laptop, and nothing to scale.
+autoscaling:
+  mode: none
+
+# No Prometheus Operator CRDs on a bare kind cluster. Scrape by hand:
+#   kubectl port-forward svc/dabet-moderation-service 9090:9090
+metrics:
+  serviceMonitor:
+    enabled: false
+
+# Every replica lands on the same node; a PDB over one replica is noise.
+podDisruptionBudget:
+  enabled: false
+
+scheduling:
+  topologySpreadConstraints:
+    # A single-node cluster has one zone and one host, so the constraints are
+    # trivially satisfied — but ScheduleAnyway is what keeps them from
+    # blocking anything if you later add a node.
+    enabled: true
+    zoneWhenUnsatisfiable: ScheduleAnyway
+    nodeWhenUnsatisfiable: ScheduleAnyway
+  podAntiAffinity:
+    # Soft. A hard rule on one node leaves every replica after the first
+    # Pending forever.
+    enabled: true
+    type: soft
+
+# Port-forward instead. Enable and set a host if you have an ingress
+# controller (kind: `kind create cluster --config` with extraPortMappings,
+# then `helm upgrade --set ingress.enabled=true --set ingress.className=nginx
+# --set ingress.host=dabet.localtest.me --set ingress.tls.enabled=false`).
+ingress:
+  enabled: false
+  tls:
+    enabled: false
+
+networkPolicy:
+  # kind's default CNI does not enforce NetworkPolicy, so enabling it here
+  # would be theatre. See the comment in templates/networkpolicy.yaml.
+  enabled: false
+
+# ---------------------------------------------------------------------------
+# Tiny resources. ~9 pods at these requests fits in about 700m CPU and 900Mi,
+# which leaves room on an 8-core laptop for the dependency chart (Kafka,
+# Postgres, ClickHouse and MinIO are the expensive ones) and for kind itself.
+# Limits are generous relative to requests because a laptop is bursty and a
+# CPU-throttled moderation pod looks exactly like a Redis outage in the
+# metrics, which is a confusing thing to debug.
+# ---------------------------------------------------------------------------
+services:
+  user-service:
+    replicas: 1
+    resources:
+      requests: { cpu: 25m, memory: 64Mi }
+      limits: { cpu: 500m, memory: 256Mi }
+    env:
+      # Local only, both of them, and both are why this file must never be
+      # used anywhere real:
+      #  OAUTH_MOCK_ENABLED     serves the `mock` platform backed by
+      #                         tools/mockoauth, so a connection can be made
+      #                         without a real YouTube/Twitch/Discord app.
+      #  DEV_EXPOSE_VERIFICATION_TOKEN  returns the email-verification token
+      #                         in the register response. There is no mailer
+      #                         in v1, so this is how a test verifies an
+      #                         address — and it hands an unauthenticated
+      #                         caller a token that verifies any address.
+      OAUTH_MOCK_ENABLED: "1"
+      DEV_EXPOSE_VERIFICATION_TOKEN: "1"
+      OAUTH_MOCK_AUTH_URL: "http://localhost:9099/oauth/authorize"
+      OAUTH_MOCK_TOKEN_URL: "http://dabet-deps-mockoauth:9099/oauth/token"
+      OAUTH_MOCK_USERINFO_URL: "http://dabet-deps-mockoauth:9099/oauth/userinfo"
+      OAUTH_MOCK_REVOKE_URL: "http://dabet-deps-mockoauth:9099/oauth/revoke"
+      OAUTH_MOCK_REDIRECT_URI: "http://localhost:8081/v1/connections/callback"
+      # Base for the other platforms' redirect URIs. Only mock is configured
+      # locally, but leaving the target's https:// base in place here would
+      # be a confusing thing to find in a laptop's config dump.
+      OAUTH_REDIRECT_BASE: "http://localhost:8081"
+      APP_REDIRECT_URL: "http://localhost:3000/connections"
+      APP_VERIFY_URL: "http://localhost:3000/verify"
+      CONNECTION_EXPIRY_SWEEP_INTERVAL: "15s"
+      CONNECTIONS_GAUGE_INTERVAL: "30s"
+      # Mail off: no MAIL_SMTP_ADDR means the mailer logs instead of sending.
+      # Point it at a Mailpit in the deps chart to watch mail arrive.
+      MAIL_SMTP_ADDR: ""
+      MAIL_FROM: "Dabet <no-reply@dabet.local>"
+      MAIL_TLS: "none"
+    secretEnv:
+      # One Postgres for every schema (§3 local column), so all four services
+      # read the same key.
+      POSTGRES_DSN: POSTGRES_DSN
+      OAUTH_MOCK_CLIENT_ID: OAUTH_MOCK_CLIENT_ID
+      OAUTH_MOCK_CLIENT_SECRET: OAUTH_MOCK_CLIENT_SECRET
+
+  credits-service:
+    replicas: 1
+    # Below the drain timeout + 10s floor would fail the render; 30 clears
+    # the shortened 10s local drain.
+    terminationGracePeriodSeconds: 30
+    resources:
+      requests: { cpu: 25m, memory: 64Mi }
+      limits: { cpu: 500m, memory: 256Mi }
+    env:
+      STRIPE_API_BASE: "http://dabet-deps-mockstripe:9098"
+      CREDITS_CONSUMER_GROUP: "credits-service"
+      CREDITS_PER_CENT: "1"
+      APP_BILLING_URL: "http://localhost:3000/billing"
+      MAIL_SMTP_ADDR: ""
+      MAIL_FROM: "Dabet <no-reply@dabet.local>"
+      MAIL_TLS: "none"
+    secretEnv:
+      POSTGRES_DSN: POSTGRES_DSN
+      STRIPE_SECRET_KEY: STRIPE_SECRET_KEY
+      STRIPE_WEBHOOK_SECRET: STRIPE_WEBHOOK_SECRET
+
+  policy-service:
+    replicas: 1
+    resources:
+      requests: { cpu: 25m, memory: 64Mi }
+      limits: { cpu: 500m, memory: 256Mi }
+    secretEnv:
+      POSTGRES_DSN: POSTGRES_DSN
+
+  provider-adapter:
+    # Two, not one. With a single instance the A13 ring has one member and
+    # owns everything, so sharding is a no-op and the StatefulSet's whole
+    # justification is untested. Two is enough to watch
+    # adapter_shard_connections_owned move when a pod restarts.
+    replicas: 2
+    terminationGracePeriodSeconds: 30
+    resources:
+      requests: { cpu: 25m, memory: 96Mi }
+      limits: { cpu: 500m, memory: 512Mi }
+    env:
+      ADAPTER_SHARDING_ENABLED: "true"
+      # Small enough that a laptop stack could actually reach it.
+      ADAPTER_SHARD_MAX_CONNECTIONS: "50"
+      ADAPTER_SHARD_REPLICAS: "160"
+      ADAPTER_SHARD_SESSION_TIMEOUT: "30s"
+      ADAPTER_SHARD_GROUP: "provider-adapter-shards"
+      ADAPTER_SHARD_TOPIC: "adapter.shards.v1"
+      # Pick up a freshly-connected platform quickly instead of waiting out
+      # the 15s default.
+      ADAPTER_CONNSOURCE_POLL: "3s"
+      ADAPTER_INGEST_BUFFER: "256"
+      OAUTH_MOCK_TOKEN_URL: "http://dabet-deps-mockoauth:9099/oauth/token"
+    secretEnv:
+      POSTGRES_DSN: POSTGRES_DSN
+      OAUTH_MOCK_CLIENT_ID: OAUTH_MOCK_CLIENT_ID
+      OAUTH_MOCK_CLIENT_SECRET: OAUTH_MOCK_CLIENT_SECRET
+
+  moderation-service:
+    # One is enough to prove the pipeline; the load harness is what needs
+    # three, and it needs a real broker with real partitions to be worth
+    # running (test/load/README.md, "Why the overlay exists").
+    replicas: 1
+    terminationGracePeriodSeconds: 30
+    resources:
+      requests: { cpu: 50m, memory: 128Mi }
+      limits: { cpu: 1, memory: 512Mi }
+    env:
+      POLICY_ENDPOINT: "dabet-policy-service:7101"
+      CREDITS_ENDPOINT: "http://dabet-credits-service:8080"
+      MOD_CONSUMER_GROUP: "moderation-service"
+      LLM_MODEL: "moderation"
+      MOD_LLM_LINGER: "250ms"
+      MOD_LLM_TIMEOUT: "3s"
+      # A10's 100 000-entry cache is ~a laptop's worth of memory on its own.
+      MOD_POLICY_CACHE_SIZE: "1000"
+      MOD_POLICY_CACHE_TTL: "60s"
+
+  review-service:
+    replicas: 1
+    resources:
+      requests: { cpu: 25m, memory: 64Mi }
+      limits: { cpu: 500m, memory: 256Mi }
+    secretEnv:
+      POSTGRES_DSN: POSTGRES_DSN
+
+  insights-service:
+    replicas: 1
+    terminationGracePeriodSeconds: 30
+    resources:
+      requests: { cpu: 50m, memory: 128Mi }
+      limits: { cpu: 1, memory: 768Mi }
+    env:
+      # clustering-service is off below, so this stays set-but-empty: the
+      # assignment hop is disabled rather than pointed at a service that is
+      # not deployed. (Enabling clustering-service makes the chart fill this
+      # in automatically — see templates/configmap.yaml.)
+      CLUSTERING_ENDPOINT: ""
+      # Roll parquet to MinIO on a short clock so a smoke test does not wait
+      # a full minute for the first object (§8.4).
+      INSIGHTS_S3_ROLL_SECONDS: "10"
+      INSIGHTS_BUFFER_SECONDS: "2"
+      INSIGHTS_BUFFER_MAX_MESSAGES: "20000"
+    secretEnv:
+      CLICKHOUSE_DSN: CLICKHOUSE_DSN
+      S3_ACCESS_KEY: S3_ACCESS_KEY
+      S3_SECRET_KEY: S3_SECRET_KEY
+
+  # The compose `clustering` profile, off for the same reason: Milvus wants
+  # several GB on its own. Turn both on together with
+  #   --set services.clustering-service.enabled=true \
+  #   --set services.clusters-job.enabled=true
+  # once the deps chart is running Milvus and etcd. insights-service still
+  # proves its durable leg without them (§8.4).
+  clustering-service:
+    enabled: false
+    replicas: 1
+    resources:
+      requests: { cpu: 25m, memory: 128Mi }
+      limits: { cpu: 500m, memory: 512Mi }
+    secretEnv:
+      CLICKHOUSE_DSN: CLICKHOUSE_DSN
+
+  clusters-job:
+    enabled: false
+    replicas: 1
+    resources:
+      requests: { cpu: 50m, memory: 256Mi }
+      limits: { cpu: 1, memory: 1Gi }
+    env:
+      # Compressed cadences so a test can observe a bootstrap run without
+      # waiting out the production 5m sweep and 30m cooldown. Every threshold
+      # that decides WHETHER a run happens (CLUSTERS_BOOTSTRAP_MIN,
+      # CLUSTERS_UNASSIGNED_RATE) stays at its spec default.
+      CLUSTERS_TRIGGER_INTERVAL: "15s"
+      CLUSTERS_RUN_COOLDOWN: "15s"
+      CLUSTERS_BACKFILL_LAG: "0s"
+      CLUSTERS_BACKFILL_COUNTS: "on_demand"
+      CLUSTERS_MAX_POINTS: "20000"
+      LLM_MODEL: "moderation"
+    secretEnv:
+      CLICKHOUSE_DSN: CLICKHOUSE_DSN
+      S3_ACCESS_KEY: S3_ACCESS_KEY
+      S3_SECRET_KEY: S3_SECRET_KEY
