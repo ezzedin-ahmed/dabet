@@ -7,12 +7,14 @@ MAILED  := $(COMPOSE) -f deploy/compose/fragments/mail.yml
 # Load overlay: 64 partitions, a latency-injecting LLM, three moderation consumers.
 LOADC   := $(COMPOSE) -f deploy/compose/fragments/load.yml
 LOAD_METRICS := http://localhost:9085,http://localhost:9185,http://localhost:9285
+# Sharding overlay: three adapter replicas sharing the connection ring (A13).
+SHARDED := $(COMPOSE) -f deploy/compose/fragments/sharding.yml
 SCENARIO ?= baseline
 RATE     ?= 400
 GOBIN   := $(shell go env GOPATH)/bin
 MODULES := $(shell go work edit -json | grep DiskPath | cut -d'"' -f4)
 
-.PHONY: build test vet proto up up-full up-traced up-mail up-load load load-selfbench load-drills down logs ps e2e
+.PHONY: build test vet proto up up-full up-traced up-mail up-load up-sharded load load-selfbench load-drills down logs ps e2e
 
 build:
 	@for m in $(MODULES); do (cd $$m && go build ./...) || exit 1; done
@@ -57,6 +59,11 @@ up-mail:
 up-load:
 	$(LOADC) up -d --build --wait
 
+# Three adapter replicas sharing the connection ring. Note `make e2e` injects
+# through a load-balanced port, so it is not sharding-aware; see the fragment.
+up-sharded:
+	$(SHARDED) up -d --build --wait
+
 # Generator self-benchmark. Needs no stack; proves the harness is not the bottleneck.
 load-selfbench:
 	cd test/load && go run ./cmd/dabet-load -scenario selfbench
@@ -75,7 +82,8 @@ load-drills:
 down:
 	$(COMPOSE) -f deploy/compose/fragments/observability.yml \
 		-f deploy/compose/fragments/mail.yml \
-		-f deploy/compose/fragments/load.yml --profile clustering down -v
+		-f deploy/compose/fragments/load.yml \
+		-f deploy/compose/fragments/sharding.yml --profile clustering down -v
 
 logs:
 	$(COMPOSE) logs -f
