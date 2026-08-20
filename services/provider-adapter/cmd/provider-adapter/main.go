@@ -7,7 +7,9 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -31,6 +33,7 @@ import (
 	"dabet/services/provider-adapter/internal/opaque"
 	"dabet/services/provider-adapter/internal/quota"
 	"dabet/services/provider-adapter/internal/refresh"
+	"dabet/services/provider-adapter/internal/shard"
 )
 
 func main() {
@@ -158,13 +161,36 @@ func run(svc *service.Service) error {
 			m.ConnectionRefreshTotal, svc.Logger, poller.Evict, poller.Update)
 	}
 
+	// A13 sharding (§7.2). Off by default: with it off `source` reaches the
+	// ingest manager untouched and the adapter is byte-for-byte the
+	// single-instance service it was, which is what `make up`, `make e2e`
+	// and the load harness rely on. On, a shard.Filter narrows the same
+	// Source to this instance's ring segment.
+	//
+	// Only ingestion is sharded. The deletion consumer keeps the unfiltered
+	// source: deletions.v1 is partitioned by content_id and its consumer
+	// group's assignment is unrelated to the ring, so any instance can be
+	// handed a deletion for a connection another instance watches and must
+	// still be able to look up its credentials.
+	ingestSource := source
+	if sharding, err := envBool("ADAPTER_SHARDING_ENABLED", false); err != nil {
+		return err
+	} else if sharding {
+		filter, closeCoord, err := startSharding(ctx, svc, m, brokers, source)
+		if err != nil {
+			return err
+		}
+		defer closeCoord()
+		ingestSource = filter
+	}
+
 	producer, err := kafkax.NewProducer(brokers)
 	if err != nil {
 		return err
 	}
 	defer producer.Close()
 
-	manager := ingest.NewManager(registry, source, producer, minter, m, svc.Logger)
+	manager := ingest.NewManager(registry, ingestSource, producer, minter, m, svc.Logger)
 	manager.Buffer = buffer
 	manager.WatchRetry = watchRetry
 	// A watch is long-lived, so an access token can expire while a stream
@@ -205,6 +231,80 @@ func run(svc *service.Service) error {
 	err = svc.Run(ctx)
 	cancel()
 	return err
+}
+
+// startSharding wires the A13 coordinator and the segment filter, and
+// returns the filter plus a close func for the coordinator's client.
+//
+// Everything here fails fast at startup: a misconfigured shard cap or an
+// unresolvable instance ID is an operator error, and starting anyway would
+// mean an instance silently watching the wrong set of connections. That is
+// not a P2 situation — P2 governs a *running* service losing a dependency,
+// which is handled in shard.KafkaCoordinator by holding the last view.
+func startSharding(ctx context.Context, svc *service.Service, m *metrics.Metrics, brokers []string, source connsource.Source) (*shard.Filter, func(), error) {
+	self := config.GetDefault("ADAPTER_INSTANCE_ID", "")
+	if self == "" {
+		host, err := os.Hostname()
+		if err != nil {
+			return nil, nil, fmt.Errorf("adapter sharding: no ADAPTER_INSTANCE_ID and hostname unavailable: %w", err)
+		}
+		self = host
+	}
+	maxConns, err := config.GetInt("ADAPTER_SHARD_MAX_CONNECTIONS", shard.DefaultMaxConnections)
+	if err != nil {
+		return nil, nil, err
+	}
+	replicas, err := config.GetInt("ADAPTER_SHARD_REPLICAS", shard.DefaultReplicas)
+	if err != nil {
+		return nil, nil, err
+	}
+	sessionTimeout, err := config.GetDuration("ADAPTER_SHARD_SESSION_TIMEOUT", shard.DefaultSessionTimeout)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	coord, err := shard.NewKafkaCoordinator(shard.KafkaConfig{
+		Brokers:        brokers,
+		Group:          config.GetDefault("ADAPTER_SHARD_GROUP", shard.DefaultGroup),
+		Topic:          config.GetDefault("ADAPTER_SHARD_TOPIC", shard.DefaultTopic),
+		Self:           self,
+		SessionTimeout: sessionTimeout,
+		Up:             svc.Metrics.DependencyUp.WithLabelValues(shard.DependencyName),
+		Log:            svc.Logger,
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	// Report the coordinator down until the first successful sync, so
+	// dependency_up is never optimistically 1 during a cold start that
+	// never completes.
+	svc.Metrics.DependencyUp.WithLabelValues(shard.DependencyName).Set(0)
+
+	go func() {
+		if err := coord.Run(ctx); err != nil && ctx.Err() == nil {
+			svc.Logger.Error("shard coordinator exited", "error", err.Error())
+		}
+	}()
+
+	filter := shard.NewFilter(source, coord, replicas, maxConns, m, svc.Logger)
+	filter.Forward(ctx)
+	svc.Logger.Info("connection sharding enabled",
+		"instance_id", self, "max_connections", maxConns, "virtual_nodes", replicas)
+	return filter, coord.Close, nil
+}
+
+// envBool parses a boolean env var. pkg/config has no bool accessor and
+// this is the only service that needs one.
+func envBool(name string, def bool) (bool, error) {
+	raw := config.GetDefault(name, "")
+	if raw == "" {
+		return def, nil
+	}
+	v, err := strconv.ParseBool(raw)
+	if err != nil {
+		return false, fmt.Errorf("config: %s must be a boolean: %w", name, err)
+	}
+	return v, nil
 }
 
 // connectWithRetry tolerates Compose start ordering: Postgres may accept
