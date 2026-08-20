@@ -14,13 +14,22 @@ RATE     ?= 400
 GOBIN   := $(shell go env GOPATH)/bin
 MODULES := $(shell go work edit -json | grep DiskPath | cut -d'"' -f4)
 
-.PHONY: build test vet proto k8s-lint k8s-template tf-check up up-full up-traced up-mail up-load up-sharded up-full-e2e e2e-full load load-selfbench load-drills down logs ps e2e
+.PHONY: build test vet tidy proto k8s-lint k8s-template tf-check up up-full up-traced up-mail up-load up-sharded up-full-e2e e2e-full load load-selfbench load-drills down logs ps e2e
 
 build:
 	@for m in $(MODULES); do (cd $$m && go build ./...) || exit 1; done
 
 test:
 	@for m in $(MODULES); do (cd $$m && go test ./...) || exit 1; done
+
+# Container builds run with GOWORK=off, where each service resolves pkg via a
+# replace directive and needs pkg's transitive deps in its OWN go.sum. A pkg
+# change therefore breaks every image build until this is run. The workspace
+# hides it; CI's standalone-build job is the backstop.
+tidy:
+	@for m in $(MODULES); do (cd $$m && GOWORK=off go mod tidy) || exit 1; done
+	@for m in $(MODULES); do (cd $$m && GOWORK=off go build ./... >/dev/null) || exit 1; done
+	@echo "all modules tidy and standalone-buildable"
 
 vet:
 	@for m in $(MODULES); do (cd $$m && go vet ./...) || exit 1; done

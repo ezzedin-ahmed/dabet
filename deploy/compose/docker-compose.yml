@@ -410,6 +410,10 @@ services:
       # A18's 32-message trigger is unreachable under A17's sampler, so the
       # linger is what actually sets batch size — and batch size is what
       # amortises the policy rubric, the bulk of every prompt.
+      # §7.3 needs ordering per (sender, content) -- which is the record key --
+      # not per partition. Fanning a partition out to N key-routed workers keeps
+      # that guarantee and lifts the ~100 msg/s-per-partition ceiling to ~100xN.
+      KAFKA_CONSUMER_KEY_CONCURRENCY: ${KAFKA_CONSUMER_KEY_CONCURRENCY:-8}
       MOD_LLM_LINGER: ${MOD_LLM_LINGER:-250ms}
       MOD_LLM_TIMEOUT: ${MOD_LLM_TIMEOUT:-3s}
     depends_on:
