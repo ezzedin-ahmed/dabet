@@ -143,7 +143,7 @@ func writeChatResponse(w http.ResponseWriter, content string) {
 func TestLLMClientVerdictMapping(t *testing.T) {
 	srv := mockVLLM(t)
 	defer srv.Close()
-	c := NewLLMClient(srv.URL, "test-model", time.Second)
+	c := NewLLMClient(srv.URL, "test-model", time.Second, 0)
 
 	got, err := c.Classify(context.Background(),
 		rcPolicy("pol_1", policyapi.RestrictedContentAction_RESTRICTED_CONTENT_ACTION_AUTO),
@@ -187,7 +187,7 @@ func TestLLMClientPromptFormat(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := NewLLMClient(srv.URL, "m", time.Second)
+	c := NewLLMClient(srv.URL, "m", time.Second, 0)
 	if _, err := c.Classify(context.Background(),
 		rcPolicy("pol_1", policyapi.RestrictedContentAction_RESTRICTED_CONTENT_ACTION_AUTO),
 		[]string{"line one\nline two"}); err != nil {
@@ -216,7 +216,7 @@ func TestLLMClientTimeoutFailsWholeBatch(t *testing.T) {
 	defer srv.Close()
 	defer close(release)
 
-	c := NewLLMClient(srv.URL, "m", 20*time.Millisecond)
+	c := NewLLMClient(srv.URL, "m", 20*time.Millisecond, 0)
 	_, err := c.Classify(context.Background(),
 		rcPolicy("p", policyapi.RestrictedContentAction_RESTRICTED_CONTENT_ACTION_AUTO),
 		[]string{"a", "b"})
@@ -237,7 +237,7 @@ func TestLLMClientMalformedAndIncomplete(t *testing.T) {
 				writeChatResponse(w, tc.content)
 			}))
 			defer srv.Close()
-			c := NewLLMClient(srv.URL, "m", time.Second)
+			c := NewLLMClient(srv.URL, "m", time.Second, 0)
 			if _, err := c.Classify(context.Background(),
 				rcPolicy("p", policyapi.RestrictedContentAction_RESTRICTED_CONTENT_ACTION_AUTO),
 				[]string{"a", "b"}); err == nil {
@@ -251,7 +251,7 @@ func TestLLMClientTransportAndStatusErrors(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "boom", http.StatusInternalServerError)
 	}))
-	c := NewLLMClient(srv.URL, "m", time.Second)
+	c := NewLLMClient(srv.URL, "m", time.Second, 0)
 	if _, err := c.Classify(context.Background(),
 		rcPolicy("p", policyapi.RestrictedContentAction_RESTRICTED_CONTENT_ACTION_AUTO),
 		[]string{"a"}); err == nil {

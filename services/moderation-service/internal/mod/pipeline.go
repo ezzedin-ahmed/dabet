@@ -40,8 +40,8 @@ type Config struct {
 	SamplerCapacity   float64 // tokens, A17
 	SamplerPerMin     float64 // refill, A17
 	SamplerTTL        time.Duration
-	LLMBatchSize      int           // A18
-	LLMLinger         time.Duration // A18
+	LLMBatchSize      int           // A18 — size trigger; see LLMBatcher
+	LLMLinger         time.Duration // A18 — linger trigger; see LLMBatcher
 
 	// Redis circuit breaker (§4.7 "skip", not "try and fail"). Not a
 	// number the spec assigns, so these are ours; all three are env
@@ -444,11 +444,27 @@ func (p *Pipeline) dispatchAsync(ctx context.Context, batch *LLMBatch) {
 // fails open — no retry (§7.9).
 func (p *Pipeline) dispatch(ctx context.Context, batch *LLMBatch) {
 	texts := make([]string, len(batch.Messages))
+	msgChars := 0
 	for i, m := range batch.Messages {
 		texts[i] = m.Text
+		msgChars += len(m.Text)
 	}
 	p.met.LLMBatchSize.Observe(float64(len(texts)))
+	p.met.LLMBatchTrigger.WithLabelValues(string(batch.Trigger)).Inc()
+	// A18's cost model, made visible (see LLMBatcher): the rubric is sent
+	// once per BATCH and the messages once each, so
+	// llm_prompt_chars_total{part="rubric"} divided by the message part is
+	// the share of prompt spend that batching is supposed to amortise, and
+	// the rubric part divided by llm_requests_total is what one more
+	// message per batch would save.
+	p.met.LLMPromptChars.WithLabelValues("rubric").Add(float64(rubricChars(batch.Policy)))
+	p.met.LLMPromptChars.WithLabelValues("messages").Add(float64(msgChars))
 
+	// The model deadline starts HERE, at dispatch, not when the first
+	// message of the batch was enqueued: §7.9's 1 000 ms is the LLM's own
+	// share of the §4.6 budget, and charging the linger wait against it
+	// would make the linger trigger self-defeating. Linger time is still
+	// inside the SLI, which is where it belongs. No retry either way.
 	start := p.now()
 	verdicts, err := p.llm.Classify(ctx, batch.Policy, texts)
 	p.met.LLMLatency.Observe(p.now().Sub(start).Seconds())
@@ -463,6 +479,14 @@ func (p *Pipeline) dispatch(ctx context.Context, batch *LLMBatch) {
 	p.met.LLMRequests.WithLabelValues("ok").Inc()
 	p.met.DependencyUp.WithLabelValues("llm").Set(1)
 
+	// Policy vocabulary → wire vocabulary. The two names differ on
+	// purpose and neither is wrong (F7): the policy document says what the
+	// creator asked for, restricted_content_action = "auto" | "review"
+	// (§6.4, policy.RCActionAuto), while flagged.v1 says what downstream
+	// must DO, action = "auto_delete" | "review" (§4.2, frozen). The
+	// mapping is auto → auto_delete, review → review; only "auto_delete"
+	// also produces a deletions.v1 record. Do not unify the spellings —
+	// §4.2 is a frozen contract.
 	action := contracts.ActionAutoDelete
 	if batch.Policy.GetRestrictedContentAction() == policyapi.RestrictedContentAction_RESTRICTED_CONTENT_ACTION_REVIEW {
 		action = contracts.ActionReview

@@ -39,8 +39,9 @@ const (
 	envInstanceID      = "INSTANCE_ID"
 	envLLMModel        = "LLM_MODEL"
 	envLLMTimeout      = "MOD_LLM_TIMEOUT"
-	envLLMBatchSize    = "MOD_LLM_BATCH_SIZE"
-	envLLMLinger       = "MOD_LLM_LINGER"
+	envLLMBatchSize    = "MOD_LLM_BATCH_SIZE" // A18 size trigger (default 32)
+	envLLMLinger       = "MOD_LLM_LINGER"     // A18 linger trigger (default 50 ms)
+	envLLMMaxIdleConns = "MOD_LLM_MAX_IDLE_CONNS"
 	envDupDepth        = "MOD_DUP_DEPTH"
 	envEmbDepth        = "MOD_EMB_DEPTH"
 	envSemThreshold    = "MOD_SEMANTIC_THRESHOLD"
@@ -118,6 +119,10 @@ func run(svc *service.Service) error {
 		return err
 	}
 	llmTimeout, err := config.GetDuration(envLLMTimeout, time.Second)
+	if err != nil {
+		return err
+	}
+	llmMaxIdleConns, err := config.GetInt(envLLMMaxIdleConns, mod.DefaultLLMMaxIdleConns)
 	if err != nil {
 		return err
 	}
@@ -201,6 +206,7 @@ func run(svc *service.Service) error {
 		config.GetDefault(config.EnvVLLMEndpoint, "http://localhost:8089"),
 		config.GetDefault(envLLMModel, "moderation"),
 		llmTimeout,
+		llmMaxIdleConns,
 	)
 
 	producer, err := kafkax.NewProducer(brokers)
