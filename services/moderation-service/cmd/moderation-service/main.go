@@ -39,8 +39,9 @@ const (
 	envInstanceID      = "INSTANCE_ID"
 	envLLMModel        = "LLM_MODEL"
 	envLLMTimeout      = "MOD_LLM_TIMEOUT"
-	envLLMBatchSize    = "MOD_LLM_BATCH_SIZE"
-	envLLMLinger       = "MOD_LLM_LINGER"
+	envLLMBatchSize    = "MOD_LLM_BATCH_SIZE" // A18 size trigger (default 32)
+	envLLMLinger       = "MOD_LLM_LINGER"     // A18 linger trigger (default 50 ms)
+	envLLMMaxIdleConns = "MOD_LLM_MAX_IDLE_CONNS"
 	envDupDepth        = "MOD_DUP_DEPTH"
 	envEmbDepth        = "MOD_EMB_DEPTH"
 	envSemThreshold    = "MOD_SEMANTIC_THRESHOLD"
@@ -50,6 +51,14 @@ const (
 	envPolicyCacheSize = "MOD_POLICY_CACHE_SIZE"
 	envEmbedTimeout    = "MOD_EMBED_TIMEOUT"
 	envPublishRetryMax = "MOD_PUBLISH_RETRY_MAX"
+
+	// Redis degradation (§4.7). The breaker knobs are described on
+	// mod.Breaker; the client timeouts bound what one probe can cost.
+	envRedisBreakerThreshold = "MOD_REDIS_BREAKER_THRESHOLD"
+	envRedisBreakerCooldown  = "MOD_REDIS_BREAKER_COOLDOWN"
+	envRedisBreakerMaxCool   = "MOD_REDIS_BREAKER_MAX_COOLDOWN"
+	envRedisTimeout          = "MOD_REDIS_TIMEOUT"
+	envRedisMaxRetries       = "MOD_REDIS_MAX_RETRIES"
 )
 
 // getFloat parses an optional float env var, returning def when unset.
@@ -100,7 +109,33 @@ func run(svc *service.Service) error {
 	if cfg.SamplerPerMin, err = getFloat(envSamplerPerMin, cfg.SamplerPerMin); err != nil {
 		return err
 	}
+	if cfg.RedisBreakerThreshold, err = config.GetInt(envRedisBreakerThreshold, cfg.RedisBreakerThreshold); err != nil {
+		return err
+	}
+	if cfg.RedisBreakerCooldown, err = config.GetDuration(envRedisBreakerCooldown, cfg.RedisBreakerCooldown); err != nil {
+		return err
+	}
+	if cfg.RedisBreakerMaxCooldown, err = config.GetDuration(envRedisBreakerMaxCool, cfg.RedisBreakerMaxCooldown); err != nil {
+		return err
+	}
 	llmTimeout, err := config.GetDuration(envLLMTimeout, time.Second)
+	if err != nil {
+		return err
+	}
+	llmMaxIdleConns, err := config.GetInt(envLLMMaxIdleConns, mod.DefaultLLMMaxIdleConns)
+	if err != nil {
+		return err
+	}
+	// §4.6 gives the whole Redis cascade 10 ms. go-redis defaults to a 5 s
+	// dial and 3 s read with three internal retries, which is three orders
+	// of magnitude past that budget and is most of what a Redis outage
+	// used to cost the consumer goroutine. Bound it, and let the breaker
+	// (not the client) decide when to try again.
+	redisTimeout, err := config.GetDuration(envRedisTimeout, 500*time.Millisecond)
+	if err != nil {
+		return err
+	}
+	redisMaxRetries, err := config.GetInt(envRedisMaxRetries, 1)
 	if err != nil {
 		return err
 	}
@@ -133,8 +168,16 @@ func run(svc *service.Service) error {
 	met := mod.NewMetrics(svc.Registry, svc.Metrics)
 
 	// Redis (go-redis v9). Connection failures surface per operation and
-	// fail open; nothing blocks startup.
-	rdb := redis.NewClient(&redis.Options{Addr: config.GetDefault(config.EnvRedisAddr, "localhost:6379")})
+	// fail open; nothing blocks startup. The shared breaker inside the
+	// pipeline turns a sustained outage into "skip the stage" rather than
+	// "pay the failure latency again" (§4.7, and see mod.Breaker).
+	rdb := redis.NewClient(&redis.Options{
+		Addr:         config.GetDefault(config.EnvRedisAddr, "localhost:6379"),
+		DialTimeout:  redisTimeout,
+		ReadTimeout:  redisTimeout,
+		WriteTimeout: redisTimeout,
+		MaxRetries:   redisMaxRetries,
+	})
 	state := mod.NewRedisState(rdb)
 
 	// Policy gRPC client + in-process LRU (§6.8).
@@ -163,6 +206,7 @@ func run(svc *service.Service) error {
 		config.GetDefault(config.EnvVLLMEndpoint, "http://localhost:8089"),
 		config.GetDefault(envLLMModel, "moderation"),
 		llmTimeout,
+		llmMaxIdleConns,
 	)
 
 	producer, err := kafkax.NewProducer(brokers)

@@ -128,6 +128,55 @@ func (f *fakeClassifier) Classify(_ context.Context, _ *policyapi.ResolvedPolicy
 	return out, nil
 }
 
+// redisProbe is a go-redis hook that counts every command actually
+// reaching the client and can make each one slow. Counting is the point:
+// the F2 fix is that an open breaker issues NO call, which is only
+// provable by watching the client, not the metrics. The delay stands in
+// for the dial timeout and retry ladder a real outage costs.
+type redisProbe struct {
+	mu    sync.Mutex
+	calls int
+	delay time.Duration
+}
+
+func (p *redisProbe) DialHook(next redis.DialHook) redis.DialHook { return next }
+
+func (p *redisProbe) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		p.enter()
+		return next(ctx, cmd)
+	}
+}
+
+func (p *redisProbe) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return func(ctx context.Context, cmds []redis.Cmder) error {
+		p.enter()
+		return next(ctx, cmds)
+	}
+}
+
+func (p *redisProbe) enter() {
+	p.mu.Lock()
+	p.calls++
+	d := p.delay
+	p.mu.Unlock()
+	if d > 0 {
+		time.Sleep(d)
+	}
+}
+
+func (p *redisProbe) count() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.calls
+}
+
+func (p *redisProbe) setDelay(d time.Duration) {
+	p.mu.Lock()
+	p.delay = d
+	p.mu.Unlock()
+}
+
 // pipeEnv wires a pipeline over fakes + miniredis.
 type pipeEnv struct {
 	pipe    *Pipeline
@@ -136,6 +185,7 @@ type pipeEnv struct {
 	clock   *fakeClock
 	mr      *miniredis.Miniredis
 	rdb     *redis.Client
+	probe   *redisProbe
 	policy  *fakePolicyGetter
 	credits *fakeCredits
 	embed   *fakeEmbedder
@@ -146,7 +196,12 @@ type pipeEnv struct {
 func newPipeEnv(t *testing.T, cfg Config) *pipeEnv {
 	t.Helper()
 	mr := miniredis.RunT(t)
-	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	// MaxRetries: -1 disables go-redis' internal retry ladder so a test's
+	// client-call count is the number of logical operations, not a
+	// multiple of it. Production tunes the same knob via MOD_REDIS_*.
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr(), MaxRetries: -1})
+	probe := &redisProbe{}
+	rdb.AddHook(probe)
 	t.Cleanup(func() { _ = rdb.Close() })
 
 	reg := prometheus.NewRegistry()
@@ -166,6 +221,7 @@ func newPipeEnv(t *testing.T, cfg Config) *pipeEnv {
 		clock:   clock,
 		mr:      mr,
 		rdb:     rdb,
+		probe:   probe,
 		policy:  &fakePolicyGetter{},
 		credits: &fakeCredits{ok: true},
 		embed:   &fakeEmbedder{vec: []float32{1, 0, 0}},
@@ -174,6 +230,17 @@ func newPipeEnv(t *testing.T, cfg Config) *pipeEnv {
 	}
 	env.pipe = NewPipeline(cfg, env.policy, env.credits, NewRedisState(rdb), env.embed, env.llm, pub, env.usage, met, clock.Now)
 	return env
+}
+
+// warmRedis opens the client connection and returns the probe count at
+// that point, so a later assertion measures cascade traffic rather than
+// go-redis' one-off connection handshake.
+func (e *pipeEnv) warmRedis(t *testing.T) int {
+	t.Helper()
+	if err := e.rdb.Ping(context.Background()).Err(); err != nil {
+		t.Fatal(err)
+	}
+	return e.probe.count()
 }
 
 func (e *pipeEnv) process(t *testing.T, msg contracts.Message) {
