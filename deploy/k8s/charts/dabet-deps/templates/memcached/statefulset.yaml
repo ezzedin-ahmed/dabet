@@ -1,0 +1,116 @@
+{{- if .Values.memcached.enabled }}
+{{- $name := include "dabet-deps.componentName" (dict "root" . "component" "memcached") -}}
+{{- $hs   := include "dabet-deps.componentName" (dict "root" . "component" "memcached-headless") -}}
+{{- $port := .Values.memcached.port | int -}}
+{{- /*
+  ==========================================================================
+  MEMCACHED — §3 "managed pool", used by policy-service for the §6.8
+  document cache.
+
+  A StatefulSet rather than a Deployment, even though memcached has no
+  persistent state. The reason is addressing: the client shards keys across
+  the address list it is given (MEMCACHED_ADDRS), so those addresses have to
+  be stable. With a Deployment the pod names are random and change on every
+  roll, so every roll would rewrite the hash ring and cold-start the cache.
+  ==========================================================================
+*/ -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $hs }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dabet-deps.componentLabels" (dict "root" . "component" "memcached") | nindent 4 }}
+spec:
+  clusterIP: None
+  selector:
+    {{- include "dabet-deps.selectorLabels" (dict "root" . "component" "memcached") | nindent 4 }}
+  ports:
+    - name: memcached
+      port: {{ $port }}
+      targetPort: memcached
+---
+{{/*
+  A ClusterIP alongside, for tooling that wants one address. NOT what
+  MEMCACHED_ADDRS points at — see dabet-deps.memcachedAddrs.
+*/ -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dabet-deps.componentLabels" (dict "root" . "component" "memcached") | nindent 4 }}
+  annotations:
+    dabet.io/note: "convenience only; clients shard across the per-pod names in MEMCACHED_ADDRS"
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "dabet-deps.selectorLabels" (dict "root" . "component" "memcached") | nindent 4 }}
+  ports:
+    - name: memcached
+      port: {{ $port }}
+      targetPort: memcached
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dabet-deps.componentLabels" (dict "root" . "component" "memcached") | nindent 4 }}
+spec:
+  serviceName: {{ $hs }}
+  replicas: {{ .Values.memcached.replicas }}
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      {{- include "dabet-deps.selectorLabels" (dict "root" . "component" "memcached") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "dabet-deps.selectorLabels" (dict "root" . "component" "memcached") | nindent 8 }}
+      annotations:
+        {{- with .Values.memcached.podAnnotations }}{{ toYaml . | nindent 8 }}{{- end }}
+    spec:
+      {{- include "dabet-deps.imagePullSecrets" . | nindent 6 }}
+      securityContext:
+        runAsUser: 11211
+        runAsGroup: 11211
+        runAsNonRoot: true
+      {{- include "dabet-deps.scheduling" (dict "root" . "nodeSelector" .Values.memcached.nodeSelector "tolerations" .Values.memcached.tolerations) | nindent 6 }}
+      {{- if and .Values.memcached.topologySpreadEnabled (gt (.Values.memcached.replicas | int) 1) }}
+      {{- include "dabet-deps.topologySpread" (dict "root" . "component" "memcached") | nindent 6 }}
+      {{- end }}
+      containers:
+        - name: memcached
+          image: {{ include "dabet-deps.image" .Values.memcached.image }}
+          imagePullPolicy: {{ .Values.memcached.image.pullPolicy }}
+          args:
+            - "-m"
+            - {{ .Values.memcached.memoryLimitMB | quote }}
+            - "-c"
+            - {{ .Values.memcached.maxConnections | quote }}
+            - "-p"
+            - {{ $port | quote }}
+            {{- range .Values.memcached.extraArgs }}
+            - {{ . | quote }}
+            {{- end }}
+          ports:
+            - name: memcached
+              containerPort: {{ $port }}
+          # No shell in the image, so the probes are TCP. A memcached that
+          # accepts a connection is serving; there is no half-ready state.
+          readinessProbe:
+            tcpSocket:
+              port: memcached
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: memcached
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources:
+            {{- toYaml .Values.memcached.resources | nindent 12 }}
+{{- end }}

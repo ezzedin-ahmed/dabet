@@ -1,0 +1,299 @@
+{{- if .Values.clickhouse.enabled }}
+{{- $name := include "dabet-deps.componentName" (dict "root" . "component" "clickhouse") -}}
+{{- $hs   := include "dabet-deps.componentName" (dict "root" . "component" "clickhouse-headless") -}}
+{{- $kn   := include "dabet-deps.componentName" (dict "root" . "component" "clickhouse-keeper") -}}
+{{- $khs  := include "dabet-deps.componentName" (dict "root" . "component" "clickhouse-keeper-headless") -}}
+{{- $dom  := printf "%s.svc.%s" .Release.Namespace (include "dabet-deps.clusterDomain" .) -}}
+{{- $secretName := printf "%s-clickhouse" (include "dabet-deps.fullname" .) -}}
+{{- $pw := include "dabet-deps.password" (dict "root" . "secret" $secretName "key" "password" "given" .Values.clickhouse.auth.password) -}}
+{{- $shards := .Values.clickhouse.shards | int -}}
+{{- $rps := .Values.clickhouse.replicasPerShard | int -}}
+{{- /*
+  ==========================================================================
+  CLICKHOUSE — §3 "Cluster", holding the §8.7 tables.
+
+  THE AUTH TRAP. Copied verbatim from the compose profile because it costs
+  an afternoon to rediscover: the official image's entrypoint rewrites
+  users.xml to disable NETWORK access for `default` the moment
+  CLICKHOUSE_USER is present, and leaves it disabled if neither USER nor
+  PASSWORD is set. Meanwhile /ping answers 200 without authenticating. A
+  readiness probe on /ping therefore marks the pod Ready while every client
+  gets AUTHENTICATION_FAILED. Two consequences, both applied below:
+    1. CLICKHOUSE_USER and CLICKHOUSE_PASSWORD are always both set.
+    2. The readiness probe runs an authenticated SELECT 1, not /ping.
+
+  WHAT THIS PROVISIONS: the database and the credentials. The §8.7 tables
+  (topic_counts, topics) are created by clustering-service and clusters-job,
+  which own their engines and ORDER BY keys.
+
+  CLUSTER TOPOLOGY. <remote_servers> is always rendered, from shards ×
+  replicasPerShard. At 1×1 that is a one-node cluster, which is a real
+  cluster as far as ON CLUSTER DDL and the Distributed engine are concerned
+  — so raising the numbers later is a values change, not a rewrite.
+  Replication (replicasPerShard > 1) additionally needs Keeper, which the
+  validation refuses to let you skip.
+  ==========================================================================
+*/ -}}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $secretName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dabet-deps.componentLabels" (dict "root" . "component" "clickhouse") | nindent 4 }}
+type: Opaque
+stringData:
+  username: {{ .Values.clickhouse.auth.username | quote }}
+  password: {{ $pw | quote }}
+  database: {{ .Values.clickhouse.auth.database | quote }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dabet-deps.componentLabels" (dict "root" . "component" "clickhouse") | nindent 4 }}
+data:
+  # Dropped into /etc/clickhouse-server/config.d, which the image merges
+  # over its packaged config rather than replacing it.
+  cluster.xml: |
+    <clickhouse>
+      <max_open_files>{{ .Values.clickhouse.maxOpenFiles }}</max_open_files>
+      <listen_host>0.0.0.0</listen_host>
+      <interserver_http_port>{{ .Values.clickhouse.ports.interserver }}</interserver_http_port>
+      <remote_servers replace="true">
+        <{{ .Values.clickhouse.clusterName }}>
+          {{- range $s := until $shards }}
+          <shard>
+            <internal_replication>true</internal_replication>
+            {{- range $r := until $rps }}
+            <replica>
+              <host>{{ $name }}-{{ add (mul $s $rps) $r }}.{{ $hs }}.{{ $dom }}</host>
+              <port>{{ $.Values.clickhouse.ports.native }}</port>
+              <user from_env="CLICKHOUSE_USER"></user>
+              <password from_env="CLICKHOUSE_PASSWORD"></password>
+            </replica>
+            {{- end }}
+          </shard>
+          {{- end }}
+        </{{ .Values.clickhouse.clusterName }}>
+      </remote_servers>
+      {{- if .Values.clickhouse.keeper.enabled }}
+      <zookeeper replace="true">
+        {{- range $i := until (.Values.clickhouse.keeper.replicas | int) }}
+        <node>
+          <host>{{ $kn }}-{{ $i }}.{{ $khs }}.{{ $dom }}</host>
+          <port>9181</port>
+        </node>
+        {{- end }}
+      </zookeeper>
+      {{- end }}
+      {{- range $k, $v := .Values.clickhouse.extraConfig }}
+      <{{ $k }}>{{ $v }}</{{ $k }}>
+      {{- end }}
+    </clickhouse>
+  # Macros are per-pod, so they cannot live in a ConfigMap. The init
+  # container below writes them from the pod ordinal; this file only
+  # documents the shape.
+  README: |
+    macros.xml is generated per pod by the `macros` init container into an
+    emptyDir also mounted at config.d. ReplicatedMergeTree paths in the
+    §8.7 DDL should use {shard} and {replica} to pick them up.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $hs }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dabet-deps.componentLabels" (dict "root" . "component" "clickhouse") | nindent 4 }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "dabet-deps.selectorLabels" (dict "root" . "component" "clickhouse") | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.clickhouse.ports.http }}
+      targetPort: http
+    - name: native
+      port: {{ .Values.clickhouse.ports.native }}
+      targetPort: native
+    - name: interserver
+      port: {{ .Values.clickhouse.ports.interserver }}
+      targetPort: interserver
+---
+{{/*
+  CLICKHOUSE_DSN points here. A ClusterIP is the right shape for ClickHouse
+  in a way it is not for Kafka or Redis: any node can serve any query
+  against a Distributed table, so load-balancing the connection is exactly
+  what you want.
+*/ -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dabet-deps.componentLabels" (dict "root" . "component" "clickhouse") | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "dabet-deps.selectorLabels" (dict "root" . "component" "clickhouse") | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.clickhouse.ports.http }}
+      targetPort: http
+    - name: native
+      port: {{ .Values.clickhouse.ports.native }}
+      targetPort: native
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dabet-deps.componentLabels" (dict "root" . "component" "clickhouse") | nindent 4 }}
+spec:
+  serviceName: {{ $hs }}
+  replicas: {{ .Values.clickhouse.replicas }}
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      {{- include "dabet-deps.selectorLabels" (dict "root" . "component" "clickhouse") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "dabet-deps.selectorLabels" (dict "root" . "component" "clickhouse") | nindent 8 }}
+      annotations:
+        {{- with .Values.clickhouse.podAnnotations }}{{ toYaml . | nindent 8 }}{{- end }}
+        dabet.io/ch-config: {{ printf "%d|%d|%v|%s" $shards $rps .Values.clickhouse.keeper.enabled (.Values.clickhouse.extraConfig | toYaml) | sha256sum | trunc 16 }}
+    spec:
+      {{- include "dabet-deps.imagePullSecrets" . | nindent 6 }}
+      securityContext:
+        fsGroup: 101
+        runAsUser: 101
+        runAsGroup: 101
+      terminationGracePeriodSeconds: 60
+      {{- include "dabet-deps.scheduling" (dict "root" . "nodeSelector" .Values.clickhouse.nodeSelector "tolerations" .Values.clickhouse.tolerations) | nindent 6 }}
+      initContainers:
+        # Per-pod <macros>. Writing them here instead of overriding the
+        # container command leaves the image's own entrypoint — which is
+        # what applies CLICKHOUSE_USER/PASSWORD/DB — completely untouched.
+        - name: macros
+          image: {{ include "dabet-deps.image" .Values.clickhouse.image }}
+          imagePullPolicy: {{ .Values.clickhouse.image.pullPolicy }}
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -eu
+              ORD="${HOSTNAME##*-}"
+              SHARD=$(( ORD / {{ $rps }} ))
+              REPLICA=$(( ORD % {{ $rps }} ))
+              cat > /macros/macros.xml <<EOF
+              <clickhouse>
+                <macros>
+                  <cluster>{{ .Values.clickhouse.clusterName }}</cluster>
+                  <shard>${SHARD}</shard>
+                  <replica>${HOSTNAME}</replica>
+                  <replica_index>${REPLICA}</replica_index>
+                </macros>
+              </clickhouse>
+              EOF
+              echo "macros: shard=${SHARD} replica=${HOSTNAME}"
+          volumeMounts:
+            - name: macros
+              mountPath: /macros
+      containers:
+        - name: clickhouse
+          image: {{ include "dabet-deps.image" .Values.clickhouse.image }}
+          imagePullPolicy: {{ .Values.clickhouse.image.pullPolicy }}
+          env:
+            # ALL THREE ARE LOAD-BEARING. See the header.
+            - name: CLICKHOUSE_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.clickhouse.auth.existingSecret | default $secretName }}
+                  key: username
+            - name: CLICKHOUSE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.clickhouse.auth.existingSecret | default $secretName }}
+                  key: password
+            - name: CLICKHOUSE_DB
+              value: {{ .Values.clickhouse.auth.database | quote }}
+            # Without this the named user is created without access
+            # management rights and cannot GRANT anything later.
+            - name: CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT
+              value: "1"
+          ports:
+            - name: http
+              containerPort: {{ .Values.clickhouse.ports.http }}
+            - name: native
+              containerPort: {{ .Values.clickhouse.ports.native }}
+            - name: interserver
+              containerPort: {{ .Values.clickhouse.ports.interserver }}
+          readinessProbe:
+            exec:
+              # NOT /ping. /ping is unauthenticated and answers 200 on a
+              # server that rejects every real client.
+              command:
+                - /bin/bash
+                - -c
+                - clickhouse-client --host 127.0.0.1 --port {{ .Values.clickhouse.ports.native }} --user "$CLICKHOUSE_USER" --password "$CLICKHOUSE_PASSWORD" --query "SELECT 1" >/dev/null
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 10
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /ping
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            failureThreshold: 6
+          startupProbe:
+            httpGet:
+              path: /ping
+              port: http
+            periodSeconds: 5
+            failureThreshold: 60
+          resources:
+            {{- toYaml .Values.clickhouse.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/clickhouse
+            - name: config
+              mountPath: /etc/clickhouse-server/config.d/cluster.xml
+              subPath: cluster.xml
+              readOnly: true
+            - name: macros
+              mountPath: /etc/clickhouse-server/config.d/macros.xml
+              subPath: macros.xml
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: {{ $name }}-config
+        - name: macros
+          emptyDir: {}
+        {{- if not .Values.clickhouse.persistence.enabled }}
+        - name: data
+          emptyDir: {}
+        {{- end }}
+  {{- if .Values.clickhouse.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          {{- include "dabet-deps.componentLabels" (dict "root" . "component" "clickhouse") | nindent 10 }}
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- include "dabet-deps.storageClass" (dict "root" . "override" .Values.clickhouse.persistence.storageClass) | nindent 8 }}
+        resources:
+          requests:
+            storage: {{ .Values.clickhouse.persistence.size }}
+  {{- end }}
+{{- end }}

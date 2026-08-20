@@ -1,0 +1,52 @@
+{{- if .Values.redis.enabled }}
+{{- $port := .Values.redis.port | int -}}
+{{- $bus  := add $port (.Values.redis.busPortOffset | int) -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "dabet-deps.componentName" (dict "root" . "component" "redis-headless") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dabet-deps.componentLabels" (dict "root" . "component" "redis") | nindent 4 }}
+spec:
+  clusterIP: None
+  # Cluster formation happens before any node is Ready — `redis-cli --cluster
+  # create` has to reach nodes that have no slots yet and therefore report
+  # cluster_state:fail. Without this the init job cannot resolve them.
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "dabet-deps.selectorLabels" (dict "root" . "component" "redis") | nindent 4 }}
+  ports:
+    - name: redis
+      port: {{ $port }}
+      targetPort: redis
+    {{- if .Values.redis.cluster.enabled }}
+    - name: bus
+      port: {{ $bus }}
+      targetPort: bus
+    {{- end }}
+{{- if not .Values.redis.cluster.enabled }}
+---
+{{/*
+  Standalone mode only. In cluster mode a ClusterIP in front of the nodes is
+  actively harmful: it would answer a client on a random node, and the client
+  would then be redirected for most keys — so REDIS_ADDR is built from the
+  per-pod names instead and this Service is not rendered at all.
+*/ -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "dabet-deps.componentName" (dict "root" . "component" "redis") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dabet-deps.componentLabels" (dict "root" . "component" "redis") | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "dabet-deps.selectorLabels" (dict "root" . "component" "redis") | nindent 4 }}
+  ports:
+    - name: redis
+      port: {{ $port }}
+      targetPort: redis
+{{- end }}
+{{- end }}

@@ -1,0 +1,172 @@
+{{- if .Values.embedding.enabled }}
+{{- $name := include "dabet-deps.componentName" (dict "root" . "component" "embedding") -}}
+{{- $gpu := gt (.Values.embedding.gpu.count | int) 0 -}}
+{{- /*
+  ==========================================================================
+  EMBEDDING — §8.4.
+
+  ONE DEPLOYMENT, ONE SERVICE. §8.4 is explicit that the embedding service
+  is shared between semantic spam detection (§7.4) and Insights, "so a
+  message is embedded at most once". Two deployments — one per caller —
+  would embed twice, double the GPU bill, and make the §8.4 sampling
+  ceiling (the lever that controls the ~3.5 TB/day parquet volume) mean two
+  different things depending on who asked. So there is exactly one of these
+  and both callers get the same EMBEDDING_ENDPOINT.
+
+  384 DIMENSIONS IS FIXED (§8.4) and the validation refuses to change it:
+  the S3 corpus and the Milvus collection are both built to that width, so
+  a different model silently invalidates everything already stored.
+
+  BACKEND. The default is text-embeddings-inference rather than vLLM.
+  MiniLM-class models at 384 dimensions are small enough to serve at good
+  throughput on CPU, so gpu.count: 0 is a genuine production option here in
+  a way it never is for the §7.9 verdict model. Set backend: vllm to put
+  the embedder on the same GPU fleet image instead.
+  ==========================================================================
+*/ -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dabet-deps.componentLabels" (dict "root" . "component" "embedding") | nindent 4 }}
+  {{- with .Values.embedding.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.embedding.service.type }}
+  selector:
+    {{- include "dabet-deps.selectorLabels" (dict "root" . "component" "embedding") | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.embedding.port }}
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dabet-deps.componentLabels" (dict "root" . "component" "embedding") | nindent 4 }}
+  annotations:
+    dabet.io/model: {{ .Values.embedding.model | quote }}
+    dabet.io/dimensions: {{ .Values.embedding.dimensions | quote }}
+spec:
+  replicas: {{ .Values.embedding.replicas }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: {{ ternary 0 1 $gpu }}
+      maxUnavailable: 1
+  selector:
+    matchLabels:
+      {{- include "dabet-deps.selectorLabels" (dict "root" . "component" "embedding") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "dabet-deps.selectorLabels" (dict "root" . "component" "embedding") | nindent 8 }}
+      annotations:
+        {{- with .Values.embedding.podAnnotations }}{{ toYaml . | nindent 8 }}{{- end }}
+    spec:
+      {{- include "dabet-deps.imagePullSecrets" . | nindent 6 }}
+      {{- include "dabet-deps.scheduling" (dict "root" . "nodeSelector" .Values.embedding.nodeSelector "tolerations" .Values.embedding.tolerations) | nindent 6 }}
+      {{- with .Values.embedding.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: embedding
+          {{- if eq .Values.embedding.backend "tei" }}
+          image: {{ include "dabet-deps.image" .Values.embedding.tei.image }}
+          imagePullPolicy: {{ .Values.embedding.tei.image.pullPolicy }}
+          args:
+            - "--model-id"
+            - {{ .Values.embedding.model | quote }}
+            - "--port"
+            - {{ .Values.embedding.port | quote }}
+            - "--hostname"
+            - "0.0.0.0"
+            {{- range .Values.embedding.tei.extraArgs }}
+            - {{ . | quote }}
+            {{- end }}
+          {{- else }}
+          image: {{ include "dabet-deps.image" .Values.embedding.vllm.image }}
+          imagePullPolicy: {{ .Values.embedding.vllm.image.pullPolicy }}
+          args:
+            - "--model"
+            - {{ .Values.embedding.model | quote }}
+            - "--host"
+            - "0.0.0.0"
+            - "--port"
+            - {{ .Values.embedding.port | quote }}
+            {{- range .Values.embedding.vllm.extraArgs }}
+            - {{ . | quote }}
+            {{- end }}
+          {{- end }}
+          {{- with .Values.embedding.extraEnv }}
+          env:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.embedding.port }}
+          startupProbe:
+            httpGet:
+              path: {{ ternary "/health" "/health" (eq .Values.embedding.backend "tei") }}
+              port: http
+            periodSeconds: 10
+            failureThreshold: {{ .Values.embedding.startupProbeFailureThreshold }}
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 30
+            failureThreshold: 6
+          resources:
+            requests:
+              {{- toYaml .Values.embedding.resources.requests | nindent 14 }}
+              {{- if $gpu }}
+              {{ .Values.embedding.gpu.resourceName }}: {{ .Values.embedding.gpu.count }}
+              {{- end }}
+            limits:
+              {{- toYaml .Values.embedding.resources.limits | nindent 14 }}
+              {{- if $gpu }}
+              {{ .Values.embedding.gpu.resourceName }}: {{ .Values.embedding.gpu.count }}
+              {{- end }}
+          volumeMounts:
+            - name: cache
+              mountPath: {{ .Values.embedding.persistence.mountPath }}
+      volumes:
+        - name: cache
+          {{- if .Values.embedding.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ $name }}-cache
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+{{- if .Values.embedding.persistence.enabled }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ $name }}-cache
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dabet-deps.componentLabels" (dict "root" . "component" "embedding") | nindent 4 }}
+spec:
+  accessModes: ["ReadWriteMany"]
+  {{- include "dabet-deps.storageClass" (dict "root" . "override" .Values.embedding.persistence.storageClass) | nindent 2 }}
+  resources:
+    requests:
+      storage: {{ .Values.embedding.persistence.size }}
+{{- end }}
+{{- end }}

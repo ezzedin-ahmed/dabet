@@ -1,0 +1,172 @@
+{{- if and .Values.redis.enabled .Values.redis.cluster.enabled .Values.redis.init.enabled }}
+{{- $name := include "dabet-deps.componentName" (dict "root" . "component" "redis") -}}
+{{- $hs   := include "dabet-deps.componentName" (dict "root" . "component" "redis-headless") -}}
+{{- $dom  := printf "%s.svc.%s" .Release.Namespace (include "dabet-deps.clusterDomain" .) -}}
+{{- $port := .Values.redis.port | int -}}
+{{- $n    := .Values.redis.cluster.replicas | int -}}
+{{- $rpm  := .Values.redis.cluster.replicasPerMaster | int -}}
+{{- $job  := include "dabet-deps.componentName" (dict "root" . "component" "redis-init") -}}
+{{- $hosts := list -}}
+{{- range $i := until $n -}}
+{{- $hosts = append $hosts (printf "%s-%d.%s.%s" $name $i $hs $dom) -}}
+{{- end -}}
+{{- /*
+  ==========================================================================
+  CLUSTER FORMATION
+
+  `redis-cli --cluster create` is a one-shot: run it twice and the second
+  run aborts with "node X is not empty". So the job checks first, and the
+  check is the thing that makes this re-runnable on every helm upgrade.
+
+  Two conditions must both hold for "already formed":
+    * cluster_state:ok        — slots are covered and the node agrees
+    * cluster_known_nodes = N — every pod has joined, not just a subset
+
+  The second matters when the node count is raised: a 3-node cluster that
+  has grown to 6 in values has cluster_state:ok but only knows 3, and
+  re-running create is still the wrong move (that needs `--cluster add-node`
+  plus a reshard). The job says so and exits non-zero so the operator sees
+  it, rather than silently leaving half the pods idle.
+  ==========================================================================
+*/ -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $job }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dabet-deps.componentLabels" (dict "root" . "component" "redis-init") | nindent 4 }}
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/hook-delete-policy": before-hook-creation
+data:
+  init.sh: |
+    #!/bin/sh
+    set -eu
+
+    PORT={{ $port }}
+    WANT_NODES={{ $n }}
+    REPLICAS={{ $rpm }}
+    HOSTS="{{ join " " $hosts }}"
+
+    resolve() {
+      # busybox getent first, nslookup as the fallback: which of the two an
+      # alpine image ships has changed between releases.
+      ip=$(getent hosts "$1" 2>/dev/null | awk '{print $1; exit}') || ip=""
+      if [ -z "$ip" ]; then
+        ip=$(nslookup "$1" 2>/dev/null | awk '/^Address( [0-9]*)?: /{print $NF; exit}') || ip=""
+      fi
+      printf '%s' "$ip"
+    }
+
+    echo "waiting for ${WANT_NODES} redis node(s) ..."
+    for attempt in $(seq 1 120); do
+      ready=0
+      for h in $HOSTS; do
+        if redis-cli -h "$h" -p "$PORT" ping 2>/dev/null | grep -q PONG; then
+          ready=$((ready + 1))
+        fi
+      done
+      echo "  ${ready}/${WANT_NODES} responding (attempt ${attempt})"
+      [ "$ready" -eq "$WANT_NODES" ] && break
+      if [ "$attempt" -eq 120 ]; then
+        echo "FATAL: only ${ready}/${WANT_NODES} nodes responded" >&2
+        exit 1
+      fi
+      sleep 5
+    done
+
+    first=$(echo "$HOSTS" | awk '{print $1}')
+    state=$(redis-cli -h "$first" -p "$PORT" cluster info 2>/dev/null | tr -d '\r' | awk -F: '/^cluster_state:/{print $2}')
+    known=$(redis-cli -h "$first" -p "$PORT" cluster info 2>/dev/null | tr -d '\r' | awk -F: '/^cluster_known_nodes:/{print $2}')
+    known=${known:-0}
+
+    if [ "${state:-fail}" = "ok" ]; then
+      if [ "$known" -eq "$WANT_NODES" ]; then
+        echo "cluster already formed: state=ok known_nodes=${known}. Nothing to do."
+        redis-cli -h "$first" -p "$PORT" cluster info | tr -d '\r' | grep -E 'cluster_(state|slots_assigned|known_nodes|size)'
+        exit 0
+      fi
+      echo "cluster is ok but knows ${known} of ${WANT_NODES} nodes." >&2
+      echo "This is a SCALE CHANGE, not a fresh install. Growing a live cluster" >&2
+      echo "needs 'redis-cli --cluster add-node' followed by a reshard; running" >&2
+      echo "'create' again would refuse anyway (the nodes are not empty)." >&2
+      echo "Do it deliberately, then re-run this job." >&2
+      exit 2
+    fi
+
+    # --cluster create is given IPs rather than names: the CLUSTER MEET it
+    # issues stores whatever it was handed, and a name that some node cannot
+    # resolve becomes a permanently unreachable cluster member. The stable
+    # DNS identity is restored separately by cluster-announce-hostname on
+    # each node, which is what clients actually see in a MOVED reply.
+    addrs=""
+    for h in $HOSTS; do
+      ip=$(resolve "$h")
+      if [ -z "$ip" ]; then
+        echo "FATAL: could not resolve ${h}" >&2
+        exit 1
+      fi
+      echo "  ${h} -> ${ip}"
+      addrs="${addrs} ${ip}:${PORT}"
+    done
+
+    echo "creating cluster: ${WANT_NODES} nodes, ${REPLICAS} replica(s) per master"
+    # shellcheck disable=SC2086
+    redis-cli --cluster create ${addrs} --cluster-replicas "${REPLICAS}" --cluster-yes
+
+    echo "verifying ..."
+    for attempt in $(seq 1 30); do
+      state=$(redis-cli -h "$first" -p "$PORT" cluster info | tr -d '\r' | awk -F: '/^cluster_state:/{print $2}')
+      [ "$state" = "ok" ] && break
+      sleep 2
+    done
+    if [ "$state" != "ok" ]; then
+      echo "FATAL: cluster_state is ${state} after creation" >&2
+      exit 1
+    fi
+    redis-cli -h "$first" -p "$PORT" cluster info | tr -d '\r' | grep -E 'cluster_(state|slots_assigned|known_nodes|size)'
+    echo "redis cluster ready"
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ $job }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dabet-deps.componentLabels" (dict "root" . "component" "redis-init") | nindent 4 }}
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "0"
+    "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  backoffLimit: {{ .Values.redis.init.backoffLimit }}
+  activeDeadlineSeconds: {{ .Values.redis.init.activeDeadlineSeconds }}
+  template:
+    metadata:
+      labels:
+        {{- include "dabet-deps.selectorLabels" (dict "root" . "component" "redis-init") | nindent 8 }}
+    spec:
+      restartPolicy: OnFailure
+      {{- include "dabet-deps.imagePullSecrets" . | nindent 6 }}
+      {{- include "dabet-deps.scheduling" (dict "root" . "nodeSelector" .Values.redis.nodeSelector "tolerations" .Values.redis.tolerations) | nindent 6 }}
+      containers:
+        - name: init
+          image: {{ include "dabet-deps.image" .Values.redis.image }}
+          imagePullPolicy: {{ .Values.redis.image.pullPolicy }}
+          command: ["/bin/sh", "/scripts/init.sh"]
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+      volumes:
+        - name: scripts
+          configMap:
+            name: {{ $job }}
+{{- end }}

@@ -1,0 +1,144 @@
+{{- if and .Values.milvus.enabled .Values.milvus.etcd.enabled }}
+{{- $name := include "dabet-deps.componentName" (dict "root" . "component" "milvus-etcd") -}}
+{{- $hs   := include "dabet-deps.componentName" (dict "root" . "component" "milvus-etcd-headless") -}}
+{{- $dom  := printf "%s.svc.%s" .Release.Namespace (include "dabet-deps.clusterDomain" .) -}}
+{{- $n := .Values.milvus.etcd.replicas | int -}}
+{{- $cport := .Values.milvus.etcd.port | int -}}
+{{- $pport := .Values.milvus.etcd.peerPort | int -}}
+{{- $initial := list -}}
+{{- range $i := until $n -}}
+{{- $initial = append $initial (printf "%s-%d=http://%s-%d.%s.%s:%d" $name $i $name $i $hs $dom $pport) -}}
+{{- end -}}
+{{- /*
+  Milvus's metadata store. Not shared with anything else in this chart and
+  deliberately not exposed in the connection contract — nothing in Dabet
+  talks to it directly, it is an implementation detail of Milvus.
+
+  The compose profile's etcd tuning (revision compaction, 4 GB quota, a big
+  snapshot count) is carried over verbatim: Milvus writes a lot of small
+  revisions and an untuned etcd fills its default 2 GB quota and wedges
+  into a read-only alarm state, which surfaces as Milvus "failed to update
+  session" and nothing more useful.
+*/ -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $hs }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dabet-deps.componentLabels" (dict "root" . "component" "milvus-etcd") | nindent 4 }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "dabet-deps.selectorLabels" (dict "root" . "component" "milvus-etcd") | nindent 4 }}
+  ports:
+    - name: client
+      port: {{ $cport }}
+      targetPort: client
+    - name: peer
+      port: {{ $pport }}
+      targetPort: peer
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dabet-deps.componentLabels" (dict "root" . "component" "milvus-etcd") | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "dabet-deps.selectorLabels" (dict "root" . "component" "milvus-etcd") | nindent 4 }}
+  ports:
+    - name: client
+      port: {{ $cport }}
+      targetPort: client
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dabet-deps.componentLabels" (dict "root" . "component" "milvus-etcd") | nindent 4 }}
+spec:
+  serviceName: {{ $hs }}
+  replicas: {{ $n }}
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      {{- include "dabet-deps.selectorLabels" (dict "root" . "component" "milvus-etcd") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "dabet-deps.selectorLabels" (dict "root" . "component" "milvus-etcd") | nindent 8 }}
+    spec:
+      {{- include "dabet-deps.imagePullSecrets" . | nindent 6 }}
+      {{- include "dabet-deps.scheduling" (dict "root" . "nodeSelector" .Values.milvus.nodeSelector "tolerations" .Values.milvus.tolerations) | nindent 6 }}
+      containers:
+        - name: etcd
+          image: {{ include "dabet-deps.image" .Values.milvus.etcd.image }}
+          imagePullPolicy: {{ .Values.milvus.etcd.image.pullPolicy }}
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              exec etcd \
+                --name "${HOSTNAME}" \
+                --data-dir /etcd-data \
+                --listen-client-urls http://0.0.0.0:{{ $cport }} \
+                --advertise-client-urls "http://${HOSTNAME}.{{ $hs }}.{{ $dom }}:{{ $cport }}" \
+                --listen-peer-urls http://0.0.0.0:{{ $pport }} \
+                --initial-advertise-peer-urls "http://${HOSTNAME}.{{ $hs }}.{{ $dom }}:{{ $pport }}" \
+                --initial-cluster "{{ join "," $initial }}" \
+                --initial-cluster-token dabet-milvus-etcd \
+                --initial-cluster-state new \
+                --auto-compaction-mode revision \
+                --auto-compaction-retention 1000 \
+                --quota-backend-bytes 4294967296 \
+                --snapshot-count 50000
+          env:
+            - name: ETCDCTL_API
+              value: "3"
+          ports:
+            - name: client
+              containerPort: {{ $cport }}
+            - name: peer
+              containerPort: {{ $pport }}
+          readinessProbe:
+            exec:
+              command: ["etcdctl", "--endpoints=http://127.0.0.1:{{ $cport }}", "endpoint", "health"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 12
+          livenessProbe:
+            tcpSocket:
+              port: client
+            initialDelaySeconds: 20
+            periodSeconds: 20
+          resources:
+            {{- toYaml .Values.milvus.etcd.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /etcd-data
+      {{- if not .Values.milvus.etcd.persistence.enabled }}
+      volumes:
+        - name: data
+          emptyDir: {}
+      {{- end }}
+  {{- if .Values.milvus.etcd.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          {{- include "dabet-deps.componentLabels" (dict "root" . "component" "milvus-etcd") | nindent 10 }}
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- include "dabet-deps.storageClass" (dict "root" . "override" .Values.milvus.etcd.persistence.storageClass) | nindent 8 }}
+        resources:
+          requests:
+            storage: {{ .Values.milvus.etcd.persistence.size }}
+  {{- end }}
+{{- end }}

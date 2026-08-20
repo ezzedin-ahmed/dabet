@@ -1,0 +1,81 @@
+{{- if .Values.minio.enabled }}
+{{- $name := include "dabet-deps.componentName" (dict "root" . "component" "minio") -}}
+{{- $job  := include "dabet-deps.componentName" (dict "root" . "component" "minio-buckets") -}}
+{{- $secretName := printf "%s-minio" (include "dabet-deps.fullname" .) -}}
+{{- $endpoint := printf "http://%s.%s.svc.%s:%d" $name .Release.Namespace (include "dabet-deps.clusterDomain" .) (.Values.minio.ports.api | int) -}}
+{{- $buckets := list .Values.minio.buckets.embeddings -}}
+{{- if .Values.milvus.enabled -}}
+{{- $buckets = append $buckets .Values.minio.buckets.milvus -}}
+{{- end -}}
+{{- /*
+  `mc mb -p` is already idempotent — -p means "make parents, ignore if it
+  exists" — so this job is safe on every upgrade with no extra guard.
+*/ -}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ $job }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dabet-deps.componentLabels" (dict "root" . "component" "minio-buckets") | nindent 4 }}
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "0"
+    "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  backoffLimit: 6
+  activeDeadlineSeconds: 600
+  template:
+    metadata:
+      labels:
+        {{- include "dabet-deps.selectorLabels" (dict "root" . "component" "minio-buckets") | nindent 8 }}
+    spec:
+      restartPolicy: OnFailure
+      {{- include "dabet-deps.imagePullSecrets" . | nindent 6 }}
+      {{- include "dabet-deps.scheduling" (dict "root" . "nodeSelector" .Values.minio.nodeSelector "tolerations" .Values.minio.tolerations) | nindent 6 }}
+      containers:
+        - name: mc
+          image: {{ include "dabet-deps.image" .Values.minio.mcImage }}
+          imagePullPolicy: {{ .Values.minio.mcImage.pullPolicy }}
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              echo "waiting for {{ $endpoint }} ..."
+              for i in $(seq 1 60); do
+                if mc alias set dabet "{{ $endpoint }}" "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" >/dev/null 2>&1; then
+                  break
+                fi
+                if [ "$i" -eq 60 ]; then
+                  echo "FATAL: minio not reachable" >&2
+                  exit 1
+                fi
+                sleep 5
+              done
+              {{- range $buckets }}
+              mc mb -p "dabet/{{ . }}"
+              echo "bucket {{ . }} ready"
+              {{- end }}
+              mc ls dabet
+          env:
+            - name: MINIO_ROOT_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.minio.auth.existingSecret | default $secretName }}
+                  key: rootUser
+            - name: MINIO_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.minio.auth.existingSecret | default $secretName }}
+                  key: rootPassword
+            # mc writes its config under $HOME; the image runs as a user
+            # whose home may be read-only in a restricted PSS namespace.
+            - name: MC_CONFIG_DIR
+              value: /tmp/.mc
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+{{- end }}

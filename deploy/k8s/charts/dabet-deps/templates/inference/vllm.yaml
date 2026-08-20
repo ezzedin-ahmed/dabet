@@ -1,0 +1,179 @@
+{{- if .Values.vllm.enabled }}
+{{- $name := include "dabet-deps.componentName" (dict "root" . "component" "vllm") -}}
+{{- /*
+  ==========================================================================
+  vLLM — §3 "GPU fleet behind a load balancer", serving the §7.9 moderation
+  verdict prompts.
+
+  DISABLED BY DEFAULT. A Deployment that requests nvidia.com/gpu on a
+  cluster with no device plugin does not fail — it sits Pending forever
+  with an "Insufficient nvidia.com/gpu" event that nobody reads. The mock
+  in tools/mockllm is the substitute and is what VLLM_ENDPOINT points at
+  when this is off, so the moderation path runs end to end with no
+  accelerator at all.
+
+  THE LOAD BALANCER is the Service below. A ClusterIP is a genuine L4
+  balancer across the ready pods, and because every request to vLLM is
+  independent and stateless there is nothing to make sticky. Set
+  service.type: LoadBalancer only to expose the fleet outside the cluster —
+  in-cluster callers should stay on the ClusterIP.
+
+  THE PROBES ARE THE INTERESTING PART. vLLM spends minutes downloading and
+  loading weights before it binds /health. Without a startupProbe with a
+  long failureThreshold, the livenessProbe fires first, kills the pod
+  mid-download, and the Deployment loops forever — the classic way to make
+  a GPU fleet look broken when it is merely slow.
+  ==========================================================================
+*/ -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dabet-deps.componentLabels" (dict "root" . "component" "vllm") | nindent 4 }}
+  {{- with .Values.vllm.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.vllm.service.type }}
+  selector:
+    {{- include "dabet-deps.selectorLabels" (dict "root" . "component" "vllm") | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.vllm.port }}
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dabet-deps.componentLabels" (dict "root" . "component" "vllm") | nindent 4 }}
+spec:
+  replicas: {{ .Values.vllm.replicas }}
+  strategy:
+    # GPUs are scarce: surging by one would need a spare accelerator that,
+    # on a right-sized pool, does not exist — so the rollout would stall
+    # with the new pod Pending. Recreate one at a time instead.
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
+  selector:
+    matchLabels:
+      {{- include "dabet-deps.selectorLabels" (dict "root" . "component" "vllm") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "dabet-deps.selectorLabels" (dict "root" . "component" "vllm") | nindent 8 }}
+      annotations:
+        {{- with .Values.vllm.podAnnotations }}{{ toYaml . | nindent 8 }}{{- end }}
+    spec:
+      {{- include "dabet-deps.imagePullSecrets" . | nindent 6 }}
+      {{- include "dabet-deps.scheduling" (dict "root" . "nodeSelector" .Values.vllm.nodeSelector "tolerations" .Values.vllm.tolerations) | nindent 6 }}
+      {{- with .Values.vllm.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: vllm
+          image: {{ include "dabet-deps.image" .Values.vllm.image }}
+          imagePullPolicy: {{ .Values.vllm.image.pullPolicy }}
+          args:
+            - "--model"
+            - {{ .Values.vllm.model | quote }}
+            - "--host"
+            - "0.0.0.0"
+            - "--port"
+            - {{ .Values.vllm.port | quote }}
+            {{- range .Values.vllm.extraArgs }}
+            - {{ . | quote }}
+            {{- end }}
+          env:
+            {{- if .Values.vllm.hfTokenSecret }}
+            - name: HUGGING_FACE_HUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.vllm.hfTokenSecret }}
+                  key: token
+            {{- end }}
+            {{- with .Values.vllm.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.vllm.port }}
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            # The whole budget for downloading and loading weights.
+            failureThreshold: {{ .Values.vllm.startupProbeFailureThreshold }}
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 30
+            # Generous: a pod busy with a large batch can be slow to answer
+            # /health, and restarting it would drop that batch and add the
+            # reload cost on top.
+            failureThreshold: 10
+          resources:
+            requests:
+              {{- toYaml .Values.vllm.resources.requests | nindent 14 }}
+              # A GPU is not shareable and not burstable, so Kubernetes
+              # requires request == limit. Naming it in both places is not
+              # redundancy; omitting it from one is an error.
+              {{ .Values.vllm.gpu.resourceName }}: {{ .Values.vllm.gpu.count }}
+            limits:
+              {{- toYaml .Values.vllm.resources.limits | nindent 14 }}
+              {{ .Values.vllm.gpu.resourceName }}: {{ .Values.vllm.gpu.count }}
+          volumeMounts:
+            - name: cache
+              mountPath: {{ .Values.vllm.persistence.mountPath }}
+            # vLLM's tensor-parallel workers talk over /dev/shm; the 64 MB
+            # container default deadlocks them without an obvious error.
+            - name: dshm
+              mountPath: /dev/shm
+      volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 2Gi
+        - name: cache
+          {{- if .Values.vllm.persistence.enabled }}
+          # ReadWriteMany so the whole fleet shares one download. On a
+          # cluster with only RWO storage, drop persistence and accept that
+          # every pod re-downloads its weights on first start.
+          persistentVolumeClaim:
+            claimName: {{ $name }}-cache
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+{{- if .Values.vllm.persistence.enabled }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ $name }}-cache
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dabet-deps.componentLabels" (dict "root" . "component" "vllm") | nindent 4 }}
+spec:
+  accessModes: ["ReadWriteMany"]
+  {{- include "dabet-deps.storageClass" (dict "root" . "override" .Values.vllm.persistence.storageClass) | nindent 2 }}
+  resources:
+    requests:
+      storage: {{ .Values.vllm.persistence.size }}
+{{- end }}
+{{- end }}

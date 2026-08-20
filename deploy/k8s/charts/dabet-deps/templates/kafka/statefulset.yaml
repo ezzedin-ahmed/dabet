@@ -1,0 +1,179 @@
+{{- if .Values.kafka.enabled }}
+{{- $name := include "dabet-deps.componentName" (dict "root" . "component" "kafka") -}}
+{{- $hs   := include "dabet-deps.componentName" (dict "root" . "component" "kafka-headless") -}}
+{{- $dom  := printf "%s.svc.%s" .Release.Namespace (include "dabet-deps.clusterDomain" .) -}}
+{{- $rf   := include "dabet-deps.kafkaRF" . | int -}}
+{{- $isr  := include "dabet-deps.kafkaMinISR" . | int -}}
+{{- $cport := .Values.kafka.listeners.clientPort | int -}}
+{{- $qport := .Values.kafka.listeners.controllerPort | int -}}
+{{- /*
+  KRaft quorum voters. Every broker must be told the same list, and the
+  entries must be FULLY QUALIFIED: each node resolves the others' names
+  itself, and a bare `kafka-0` only works while every pod happens to share
+  the release namespace's search domain.
+
+  Node ids are ordinal+1 so that they start at 1 like the compose profile,
+  and so that id 0 (which Kafka accepts but which reads as "unset" in logs)
+  is never used.
+*/ -}}
+{{- $voters := list -}}
+{{- range $i := until (.Values.kafka.replicas | int) -}}
+{{- $voters = append $voters (printf "%d@%s-%d.%s.%s:%d" (add1 $i) $name $i $hs $dom $qport) -}}
+{{- end -}}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dabet-deps.componentLabels" (dict "root" . "component" "kafka") | nindent 4 }}
+spec:
+  serviceName: {{ $hs }}
+  replicas: {{ .Values.kafka.replicas }}
+  podManagementPolicy: Parallel
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      {{- include "dabet-deps.selectorLabels" (dict "root" . "component" "kafka") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "dabet-deps.selectorLabels" (dict "root" . "component" "kafka") | nindent 8 }}
+      annotations:
+        {{- with .Values.kafka.podAnnotations }}{{ toYaml . | nindent 8 }}{{- end }}
+        # A change to the broker configuration must restart the brokers.
+        dabet.io/kafka-config: {{ printf "%s|%d|%d|%s" .Values.kafka.clusterId $rf $isr (.Values.kafka.extraConfig | toYaml) | sha256sum | trunc 16 }}
+    spec:
+      {{- include "dabet-deps.imagePullSecrets" . | nindent 6 }}
+      # The apache/kafka image runs as uid 1000; without fsGroup the mounted
+      # PVC belongs to root and the broker cannot create its log dir.
+      securityContext:
+        fsGroup: 1000
+        runAsUser: 1000
+        runAsGroup: 1000
+      terminationGracePeriodSeconds: 60
+      {{- include "dabet-deps.scheduling" (dict "root" . "nodeSelector" .Values.kafka.nodeSelector "tolerations" .Values.kafka.tolerations) | nindent 6 }}
+      {{- with .Values.kafka.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if and .Values.kafka.topologySpreadEnabled (gt (.Values.kafka.replicas | int) 1) }}
+      {{- include "dabet-deps.topologySpread" (dict "root" . "component" "kafka") | nindent 6 }}
+      {{- end }}
+      containers:
+        - name: kafka
+          image: {{ include "dabet-deps.image" .Values.kafka.image }}
+          imagePullPolicy: {{ .Values.kafka.image.pullPolicy }}
+          # The image's entrypoint reads KAFKA_* env vars, but two of them
+          # have to differ per pod (node id, advertised listener) and a
+          # StatefulSet has no per-ordinal env. Deriving them from the
+          # hostname in the container is the standard way round that; the
+          # last line hands control back to the stock entrypoint.
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              ORDINAL="${HOSTNAME##*-}"
+              export KAFKA_NODE_ID="$((ORDINAL + 1))"
+              export KAFKA_ADVERTISED_LISTENERS="PLAINTEXT://${HOSTNAME}.{{ $hs }}.{{ $dom }}:{{ $cport }}"
+              echo "starting broker node.id=${KAFKA_NODE_ID} advertised=${KAFKA_ADVERTISED_LISTENERS}"
+              exec /etc/kafka/docker/run
+          env:
+            - name: KAFKA_PROCESS_ROLES
+              value: {{ if .Values.kafka.controllerOnly }}"broker"{{ else }}"broker,controller"{{ end }}
+            - name: KAFKA_CONTROLLER_QUORUM_VOTERS
+              value: {{ join "," $voters | quote }}
+            - name: KAFKA_LISTENERS
+              value: "PLAINTEXT://:{{ $cport }},CONTROLLER://:{{ $qport }}"
+            - name: KAFKA_LISTENER_SECURITY_PROTOCOL_MAP
+              value: "PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT"
+            - name: KAFKA_CONTROLLER_LISTENER_NAMES
+              value: "CONTROLLER"
+            - name: KAFKA_INTER_BROKER_LISTENER_NAME
+              value: "PLAINTEXT"
+            # Explicit rather than inherited: the image's packaged default
+            # log.dirs is under /tmp, which is emptyDir here. Pointing it at
+            # the PVC is what actually makes this StatefulSet persistent.
+            - name: KAFKA_LOG_DIRS
+              value: "/var/lib/kafka/data"
+            - name: CLUSTER_ID
+              value: {{ .Values.kafka.clusterId | quote }}
+            - name: KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR
+              value: {{ $rf | quote }}
+            - name: KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR
+              value: {{ $rf | quote }}
+            - name: KAFKA_TRANSACTION_STATE_LOG_MIN_ISR
+              value: {{ $isr | quote }}
+            - name: KAFKA_DEFAULT_REPLICATION_FACTOR
+              value: {{ $rf | quote }}
+            - name: KAFKA_MIN_INSYNC_REPLICAS
+              value: {{ $isr | quote }}
+            # §4.2: the four topics are created by the topics Job with exact
+            # partition counts. Auto-creation would race that job and produce
+            # a 1-partition messages.v1 that silently destroys the ordering
+            # guarantee the whole dedup design rests on.
+            - name: KAFKA_AUTO_CREATE_TOPICS_ENABLE
+              value: {{ .Values.kafka.autoCreateTopics | quote }}
+            - name: KAFKA_NUM_PARTITIONS
+              value: "3"
+            - name: KAFKA_HEAP_OPTS
+              value: {{ .Values.kafka.heapOpts | quote }}
+            {{- range $k, $v := .Values.kafka.extraConfig }}
+            - name: {{ $k }}
+              value: {{ $v | quote }}
+            {{- end }}
+          ports:
+            - name: client
+              containerPort: {{ $cport }}
+            - name: controller
+              containerPort: {{ $qport }}
+          # Liveness only checks the process is answering its own API; a
+          # broker that is up but lagging must NOT be restarted, because a
+          # restart is what would turn a lag into an outage.
+          livenessProbe:
+            tcpSocket:
+              port: client
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 6
+          readinessProbe:
+            exec:
+              command:
+                - /bin/bash
+                - -c
+                - /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:{{ $cport }} >/dev/null 2>&1
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            timeoutSeconds: 15
+            failureThreshold: 12
+          startupProbe:
+            tcpSocket:
+              port: client
+            periodSeconds: 5
+            failureThreshold: 60
+          resources:
+            {{- toYaml .Values.kafka.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/kafka/data
+      {{- if not .Values.kafka.persistence.enabled }}
+      volumes:
+        - name: data
+          emptyDir: {}
+      {{- end }}
+  {{- if .Values.kafka.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          {{- include "dabet-deps.componentLabels" (dict "root" . "component" "kafka") | nindent 10 }}
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- include "dabet-deps.storageClass" (dict "root" . "override" .Values.kafka.persistence.storageClass) | nindent 8 }}
+        resources:
+          requests:
+            storage: {{ .Values.kafka.persistence.size }}
+  {{- end }}
+{{- end }}

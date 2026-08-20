@@ -1,0 +1,162 @@
+{{- if .Values.redis.enabled }}
+{{- $name := include "dabet-deps.componentName" (dict "root" . "component" "redis") -}}
+{{- $hs   := include "dabet-deps.componentName" (dict "root" . "component" "redis-headless") -}}
+{{- $dom  := printf "%s.svc.%s" .Release.Namespace (include "dabet-deps.clusterDomain" .) -}}
+{{- $port := .Values.redis.port | int -}}
+{{- $bus  := add $port (.Values.redis.busPortOffset | int) -}}
+{{- $replicas := ternary (.Values.redis.cluster.replicas | int) 1 .Values.redis.cluster.enabled -}}
+{{- /*
+  ==========================================================================
+  REDIS — §4.3
+
+  The keyspace is already cluster-shaped: pkg/rediskeys puts a literal
+  {content_id:author_id} hash tag on dup:, emb: and rate:, so every key a
+  single Lua script touches lands in one slot. Nothing about the keys
+  changes between the two modes below; only the topology does. That is the
+  whole point of §4.3's "apply hash tags from day one".
+
+  cluster.enabled=false gives one standalone node for a laptop.
+  cluster.enabled=true gives a real multi-shard cluster — at least three
+  masters, each owning a contiguous third of the 16384 slots.
+
+  cluster-preferred-endpoint-type hostname (Redis 7+) is what makes this
+  survive Kubernetes: without it a node announces its pod IP, a MOVED reply
+  hands a client an IP that changes on every reschedule, and the cached
+  slot map goes stale in a way that looks like random CROSSSLOT errors.
+  ==========================================================================
+*/ -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dabet-deps.componentLabels" (dict "root" . "component" "redis") | nindent 4 }}
+data:
+  redis.conf: |
+    port {{ $port }}
+    bind 0.0.0.0
+    # No auth and no protected mode: this listens on a pod network reachable
+    # only from inside the namespace. Add a NetworkPolicy rather than a
+    # password — AUTH on the moderation hot path costs a round trip per
+    # reconnect and buys nothing that network isolation does not.
+    protected-mode no
+    dir /data
+    maxmemory {{ .Values.redis.maxmemory }}
+    # §4.3's keys are all short-TTL reconstructible state, so evicting the
+    # coldest of them under pressure is strictly better than an OOM: a miss
+    # costs one un-deduplicated message, an OOM costs the shard.
+    maxmemory-policy {{ .Values.redis.maxmemoryPolicy }}
+    appendonly {{ ternary "yes" "no" .Values.redis.appendonly }}
+    {{- if .Values.redis.cluster.enabled }}
+    cluster-enabled yes
+    cluster-config-file /data/nodes.conf
+    cluster-node-timeout 5000
+    {{- if .Values.redis.cluster.preferHostnameEndpoints }}
+    cluster-preferred-endpoint-type hostname
+    {{- end }}
+    {{- end }}
+    {{- range $k, $v := .Values.redis.extraConfig }}
+    {{ $k }} {{ $v }}
+    {{- end }}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dabet-deps.componentLabels" (dict "root" . "component" "redis") | nindent 4 }}
+spec:
+  serviceName: {{ $hs }}
+  replicas: {{ $replicas }}
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      {{- include "dabet-deps.selectorLabels" (dict "root" . "component" "redis") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "dabet-deps.selectorLabels" (dict "root" . "component" "redis") | nindent 8 }}
+      annotations:
+        {{- with .Values.redis.podAnnotations }}{{ toYaml . | nindent 8 }}{{- end }}
+        dabet.io/redis-config: {{ .Values.redis | toYaml | sha256sum | trunc 16 }}
+    spec:
+      {{- include "dabet-deps.imagePullSecrets" . | nindent 6 }}
+      securityContext:
+        fsGroup: 999
+        runAsUser: 999
+        runAsGroup: 999
+      terminationGracePeriodSeconds: 30
+      {{- include "dabet-deps.scheduling" (dict "root" . "nodeSelector" .Values.redis.nodeSelector "tolerations" .Values.redis.tolerations) | nindent 6 }}
+      {{- if and .Values.redis.topologySpreadEnabled (gt ($replicas | int) 1) }}
+      {{- include "dabet-deps.topologySpread" (dict "root" . "component" "redis") | nindent 6 }}
+      {{- end }}
+      containers:
+        - name: redis
+          image: {{ include "dabet-deps.image" .Values.redis.image }}
+          imagePullPolicy: {{ .Values.redis.image.pullPolicy }}
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              # The ConfigMap mount is read-only and the announce line is
+              # per-pod, so the config is copied and appended to rather than
+              # patched in place.
+              cp /config/redis.conf /tmp/redis.conf
+              {{- if and .Values.redis.cluster.enabled .Values.redis.cluster.preferHostnameEndpoints }}
+              echo "cluster-announce-hostname ${HOSTNAME}.{{ $hs }}.{{ $dom }}" >> /tmp/redis.conf
+              {{- end }}
+              exec redis-server /tmp/redis.conf
+          ports:
+            - name: redis
+              containerPort: {{ $port }}
+            {{- if .Values.redis.cluster.enabled }}
+            # The cluster bus. Nodes gossip on it; it is not a client port
+            # and must never be exposed outside the cluster.
+            - name: bus
+              containerPort: {{ $bus }}
+            {{- end }}
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "-p", "{{ $port }}", "ping"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          livenessProbe:
+            tcpSocket:
+              port: redis
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            failureThreshold: 6
+          resources:
+            {{- toYaml .Values.redis.resources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /config
+              readOnly: true
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: config
+          configMap:
+            name: {{ $name }}-config
+        {{- if not .Values.redis.persistence.enabled }}
+        - name: data
+          emptyDir: {}
+        {{- end }}
+  {{- if .Values.redis.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          {{- include "dabet-deps.componentLabels" (dict "root" . "component" "redis") | nindent 10 }}
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- include "dabet-deps.storageClass" (dict "root" . "override" .Values.redis.persistence.storageClass) | nindent 8 }}
+        resources:
+          requests:
+            storage: {{ .Values.redis.persistence.size }}
+  {{- end }}
+{{- end }}

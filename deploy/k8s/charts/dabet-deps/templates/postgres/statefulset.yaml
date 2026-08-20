@@ -1,0 +1,222 @@
+{{- if .Values.postgres.enabled }}
+{{- $root := . -}}
+{{- $d := .Values.postgres.defaults -}}
+{{- /*
+  ==========================================================================
+  TWO POSTGRES INSTANCES (§3: "separate clusters for identity/policy")
+
+  One StatefulSet per logical instance, rendered from the same template.
+  They are genuinely separate clusters: separate pods, separate PVCs,
+  separate credentials, separate failure domains. Nothing joins them, and
+  no query crosses them — the repository convention is explicitly "no
+  cross-schema foreign key into identity" (see review-service's
+  migrate_test.go), and the one place a service reads another's table
+  (credits-service reading identity.creators for the mailer) is a
+  documented deviation which is why `billing` sits on the identity
+  instance rather than the policy one.
+
+  WHAT THIS PROVISIONS: a database and a role. Nothing else. Every service
+  carries embedded migrations and runs them at startup; user-service,
+  credits-service, policy-service and review-service each do
+  `CREATE SCHEMA IF NOT EXISTS <theirs>` themselves. Creating schemas here
+  would fight those migrations for ownership.
+
+  THE ONE EXCEPTION is `CREATE EXTENSION citext` in
+  user-service/0001_identity.sql. Extension creation needs rights the app
+  role should not hold, so the initdb hook below creates it first and the
+  service's IF NOT EXISTS becomes a no-op — exactly what
+  deploy/compose/postgres-init/01-schemas.sql does for the compose profile.
+  ==========================================================================
+*/ -}}
+{{- range $name, $inst := .Values.postgres.instances }}
+{{- if $inst.enabled }}
+{{- $comp := printf "postgres-%s" $name -}}
+{{- $full := include "dabet-deps.componentName" (dict "root" $root "component" $comp) -}}
+{{- $secretName := printf "%s-postgres-%s" (include "dabet-deps.fullname" $root) $name -}}
+{{- $persistence := $inst.persistence | default $d.persistence -}}
+{{- $resources := $inst.resources | default $d.resources -}}
+{{- $params := $inst.parameters | default $d.parameters -}}
+{{- $user := $inst.username | default $d.username }}
+{{/* No right-hand trim on the line above, on purpose: it guarantees a
+     newline in front of the `---` below. Without it, an iteration whose
+     last emitted line was trimmed (which is what happens when persistence
+     is disabled and the volumeClaimTemplates block renders to nothing)
+     concatenates straight onto the separator and produces `emptyDir: {}---`. */}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $full }}
+  namespace: {{ $root.Release.Namespace }}
+  labels:
+    {{- include "dabet-deps.componentLabels" (dict "root" $root "component" $comp) | nindent 4 }}
+    dabet.io/postgres-instance: {{ $name }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "dabet-deps.selectorLabels" (dict "root" $root "component" $comp) | nindent 4 }}
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $full }}-init
+  namespace: {{ $root.Release.Namespace }}
+  labels:
+    {{- include "dabet-deps.componentLabels" (dict "root" $root "component" $comp) | nindent 4 }}
+data:
+  # Runs once, on an empty PGDATA, as the superuser, against POSTGRES_DB.
+  00-extensions.sql: |
+    -- The only DDL this chart owns. Schemas belong to the services'
+    -- embedded migrations (§3, and see the header of statefulset.yaml).
+    CREATE EXTENSION IF NOT EXISTS citext;
+    -- Schemas expected on this instance, for the record:
+    {{- range $inst.schemas }}
+    --   {{ . }}
+    {{- end }}
+    -- Owned by: {{ join ", " ($inst.consumers | default list) }}
+---
+{{- if not $inst.existingSecret }}
+{{- if not ($d.existingSecret) }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $secretName }}
+  namespace: {{ $root.Release.Namespace }}
+  labels:
+    {{- include "dabet-deps.componentLabels" (dict "root" $root "component" $comp) | nindent 4 }}
+  annotations:
+    # Kept across upgrades: helm.sh/resource-policy would orphan it on
+    # uninstall, which is worse. The stability comes from the lookup() in
+    # dabet-deps.password instead.
+    dabet.io/note: "password is generated once and read back from the live Secret on upgrade"
+type: Opaque
+stringData:
+  username: {{ $user | quote }}
+  password: {{ include "dabet-deps.password" (dict "root" $root "secret" $secretName "key" "password" "given" ($inst.password | default $d.password)) | quote }}
+  database: {{ $inst.database | quote }}
+---
+{{- end }}
+{{- end }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $full }}
+  namespace: {{ $root.Release.Namespace }}
+  labels:
+    {{- include "dabet-deps.componentLabels" (dict "root" $root "component" $comp) | nindent 4 }}
+    dabet.io/postgres-instance: {{ $name }}
+spec:
+  serviceName: {{ $full }}
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "dabet-deps.selectorLabels" (dict "root" $root "component" $comp) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "dabet-deps.selectorLabels" (dict "root" $root "component" $comp) | nindent 8 }}
+      annotations:
+        {{- with ($inst.podAnnotations | default $d.podAnnotations) }}{{ toYaml . | nindent 8 }}{{- end }}
+    spec:
+      {{- include "dabet-deps.imagePullSecrets" $root | nindent 6 }}
+      securityContext:
+        fsGroup: 999
+      terminationGracePeriodSeconds: 60
+      {{- include "dabet-deps.scheduling" (dict "root" $root "nodeSelector" ($inst.nodeSelector | default $d.nodeSelector) "tolerations" ($inst.tolerations | default $d.tolerations)) | nindent 6 }}
+      containers:
+        - name: postgres
+          image: {{ include "dabet-deps.image" $root.Values.postgres.image }}
+          imagePullPolicy: {{ $root.Values.postgres.image.pullPolicy }}
+          args:
+            {{- range $k, $v := $params }}
+            - "-c"
+            - "{{ $k }}={{ $v }}"
+            {{- end }}
+          env:
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $inst.existingSecret | default $d.existingSecret | default $secretName }}
+                  key: username
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $inst.existingSecret | default $d.existingSecret | default $secretName }}
+                  key: password
+            - name: POSTGRES_DB
+              value: {{ $inst.database | quote }}
+            # The image refuses to initdb into a non-empty directory, and a
+            # PVC mounted at /var/lib/postgresql/data always contains
+            # lost+found on ext4. A subdirectory is the standard fix.
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          ports:
+            - name: postgres
+              containerPort: 5432
+          # pg_isready over the unix socket, not TCP: during initdb the
+          # server listens on the socket only, and a TCP probe would report
+          # failure for the whole of the first start.
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "{{ $user }}", "-d", "{{ $inst.database }}", "-h", "/var/run/postgresql"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "{{ $user }}", "-d", "{{ $inst.database }}", "-h", "/var/run/postgresql"]
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 6
+          startupProbe:
+            exec:
+              command: ["pg_isready", "-U", "{{ $user }}", "-d", "{{ $inst.database }}", "-h", "/var/run/postgresql"]
+            periodSeconds: 5
+            failureThreshold: 60
+          resources:
+            {{- toYaml $resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: init
+              mountPath: /docker-entrypoint-initdb.d
+              readOnly: true
+            # Postgres uses shared memory for parallel query and hash joins;
+            # the container default of 64 MB is not enough and the failure
+            # mode is a runtime "could not resize shared memory segment".
+            - name: dshm
+              mountPath: /dev/shm
+      volumes:
+        - name: init
+          configMap:
+            name: {{ $full }}-init
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 256Mi
+        {{- if not $persistence.enabled }}
+        - name: data
+          emptyDir: {}
+        {{- end }}
+  {{- if $persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          {{- include "dabet-deps.componentLabels" (dict "root" $root "component" $comp) | nindent 10 }}
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- include "dabet-deps.storageClass" (dict "root" $root "override" $persistence.storageClass) | nindent 8 }}
+        resources:
+          requests:
+            storage: {{ $persistence.size }}
+  {{- end }}
+{{- end }}
+{{- end }}
+{{- end }}

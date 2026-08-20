@@ -1,0 +1,53 @@
+{{- if .Values.kafka.enabled }}
+{{- /*
+  Two Services, on purpose.
+
+  The headless one gives every broker a stable per-pod DNS name. That is
+  what KAFKA_BROKERS is built from: a Kafka client bootstraps against one
+  address, is told the real advertised listener of every broker, and talks
+  to each directly. A ClusterIP in front of the brokers would round-robin
+  the bootstrap and then be bypassed anyway, so it would add a hop that
+  helps nobody — but it IS useful as a bootstrap-only entry point for tools
+  that want a single address, which is what the second Service is for.
+*/ -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "dabet-deps.componentName" (dict "root" . "component" "kafka-headless") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dabet-deps.componentLabels" (dict "root" . "component" "kafka") | nindent 4 }}
+spec:
+  clusterIP: None
+  # Brokers must resolve each other's names during the KRaft quorum
+  # handshake, i.e. before any of them is Ready. Without this the quorum
+  # cannot form and every pod waits for a peer that DNS refuses to name.
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "dabet-deps.selectorLabels" (dict "root" . "component" "kafka") | nindent 4 }}
+  ports:
+    - name: client
+      port: {{ .Values.kafka.listeners.clientPort }}
+      targetPort: client
+    - name: controller
+      port: {{ .Values.kafka.listeners.controllerPort }}
+      targetPort: controller
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "dabet-deps.componentName" (dict "root" . "component" "kafka") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dabet-deps.componentLabels" (dict "root" . "component" "kafka") | nindent 4 }}
+  annotations:
+    dabet.io/note: "bootstrap only; clients are redirected to the per-broker advertised listeners"
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "dabet-deps.selectorLabels" (dict "root" . "component" "kafka") | nindent 4 }}
+  ports:
+    - name: client
+      port: {{ .Values.kafka.listeners.clientPort }}
+      targetPort: client
+{{- end }}

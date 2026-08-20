@@ -1,0 +1,90 @@
+{{- $root := . -}}
+{{- /*
+  ==========================================================================
+  MOCKS — tools/mockllm and tools/mockembed.
+
+  These are the reason the platform is runnable without a GPU. mockllm
+  serves the §7.9 verdict shape deterministically (a listed message
+  containing "FLAGME" violates rule 1); mockembed serves deterministic
+  384-dimension vectors seeded from a hash of the text. Both speak the same
+  HTTP interface as the real thing, so VLLM_ENDPOINT / EMBEDDING_ENDPOINT
+  point at them and no consuming service knows the difference.
+
+  THEIR IMAGES ARE NOT ON ANY REGISTRY. They are built from tools/ by the
+  repo's own Dockerfiles, so they have to be loaded into the cluster (kind
+  load / a push to your registry) before install. See README.md.
+  ==========================================================================
+*/ -}}
+{{- $mocks := list
+      (dict "key" "llm" "comp" "mockllm" "cfg" .Values.mocks.llm)
+      (dict "key" "embedding" "comp" "mockembed" "cfg" .Values.mocks.embedding)
+-}}
+{{- range $m := $mocks }}
+{{- if $m.cfg.enabled }}
+{{- $name := include "dabet-deps.componentName" (dict "root" $root "component" $m.comp) }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  namespace: {{ $root.Release.Namespace }}
+  labels:
+    {{- include "dabet-deps.componentLabels" (dict "root" $root "component" $m.comp) | nindent 4 }}
+    dabet.io/substitutes: {{ $m.key }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "dabet-deps.selectorLabels" (dict "root" $root "component" $m.comp) | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ $m.cfg.port }}
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  namespace: {{ $root.Release.Namespace }}
+  labels:
+    {{- include "dabet-deps.componentLabels" (dict "root" $root "component" $m.comp) | nindent 4 }}
+  annotations:
+    dabet.io/note: "deterministic stand-in from tools/{{ $m.comp }}; not for production"
+spec:
+  replicas: {{ $m.cfg.replicas }}
+  selector:
+    matchLabels:
+      {{- include "dabet-deps.selectorLabels" (dict "root" $root "component" $m.comp) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "dabet-deps.selectorLabels" (dict "root" $root "component" $m.comp) | nindent 8 }}
+    spec:
+      {{- include "dabet-deps.imagePullSecrets" $root | nindent 6 }}
+      {{- include "dabet-deps.scheduling" (dict "root" $root "nodeSelector" dict "tolerations" list) | nindent 6 }}
+      containers:
+        - name: {{ $m.comp }}
+          image: {{ include "dabet-deps.image" $m.cfg.image }}
+          imagePullPolicy: {{ $m.cfg.image.pullPolicy }}
+          {{- with $m.cfg.extraEnv }}
+          env:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ $m.cfg.port }}
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 20
+          resources:
+            {{- toYaml $m.cfg.resources | nindent 12 }}
+{{- end }}
+{{- end }}

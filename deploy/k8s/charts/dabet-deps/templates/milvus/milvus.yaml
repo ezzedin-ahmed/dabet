@@ -1,0 +1,301 @@
+{{- if .Values.milvus.enabled }}
+{{- $root := . -}}
+{{- $name := include "dabet-deps.componentName" (dict "root" . "component" "milvus") -}}
+{{- $etcd := include "dabet-deps.componentName" (dict "root" . "component" "milvus-etcd") -}}
+{{- $coord := include "dabet-deps.componentName" (dict "root" . "component" "milvus-mixcoord") -}}
+{{- $dom := printf "%s.svc.%s" .Release.Namespace (include "dabet-deps.clusterDomain" .) -}}
+{{- $brokers := include "dabet-deps.kafkaBrokers" . -}}
+{{- $minioSecret := printf "%s-minio" (include "dabet-deps.fullname" .) -}}
+{{- /* Milvus wants host and port separately, so the S3 endpoint is split. */ -}}
+{{- $s3Host := "" -}}
+{{- $s3Port := 9000 -}}
+{{- $s3SSL := false -}}
+{{- if .Values.minio.enabled -}}
+{{- $s3Host = printf "%s.%s" (include "dabet-deps.componentName" (dict "root" . "component" "minio")) $dom -}}
+{{- $s3Port = .Values.minio.ports.api | int -}}
+{{- else -}}
+{{- $u := urlParse .Values.external.s3.endpoint -}}
+{{- $hostport := splitList ":" $u.host -}}
+{{- $s3Host = index $hostport 0 -}}
+{{- $s3SSL = eq $u.scheme "https" -}}
+{{- if gt (len $hostport) 1 -}}
+{{- $s3Port = index $hostport 1 | int -}}
+{{- else -}}
+{{- $s3Port = ternary 443 80 $s3SSL -}}
+{{- end -}}
+{{- end -}}
+{{- /*
+  ==========================================================================
+  MILVUS — §3 "Distributed", §8.5 "one collection, partitioned by
+  creator_id, CENTROIDS only".
+
+  OPT-IN. milvus.enabled defaults to false and this whole file renders to
+  nothing, exactly as the compose profile hides Milvus behind the
+  `clustering` profile. Distributed Milvus is five component Deployments
+  plus a three-node etcd plus a message queue; it wants several GB before
+  it indexes a single vector, and nothing outside Area D touches it. Turn
+  it on when clustering-service and clusters-job are deployed, not before.
+
+  THE MESSAGE QUEUE IS THIS CHART'S KAFKA. Milvus needs a write-ahead log;
+  its defaults are Pulsar (four more pods, including its own ZooKeeper) or
+  RocksMQ (standalone only). Reusing the Kafka that already exists costs
+  nothing extra and keeps one fewer distributed system in the deployment.
+  Milvus creates its own `by-dev-*` topics with its own retention; they do
+  not touch the §4.2 registry and the topics job does not manage them.
+
+  COORDINATOR TOPOLOGY. mixcoord collapses root/data/query/index coord into
+  a single process. Milvus supports splitting them, but at Dabet's scale —
+  a few hundred centroids per active creator (§8.5) — four separate
+  coordinator pods would be four times the failure surface for no capacity.
+  ==========================================================================
+*/ -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dabet-deps.componentLabels" (dict "root" . "component" "milvus") | nindent 4 }}
+data:
+  milvus.yaml: |
+    etcd:
+      endpoints:
+        {{- range $i := until ($root.Values.milvus.etcd.replicas | int) }}
+        - {{ $etcd }}-{{ $i }}.{{ include "dabet-deps.componentName" (dict "root" $root "component" "milvus-etcd-headless") }}.{{ $dom }}:{{ $root.Values.milvus.etcd.port }}
+        {{- end }}
+      rootPath: by-dev
+      metaSubPath: meta
+      kvSubPath: kv
+    minio:
+      address: {{ $s3Host }}
+      port: {{ $s3Port }}
+      useSSL: {{ $s3SSL }}
+      bucketName: {{ .Values.milvus.objectStore.bucket }}
+      rootPath: {{ .Values.milvus.objectStore.rootPath }}
+      useIAM: false
+      # Credentials come from MINIO_ACCESS_KEY_ID / MINIO_SECRET_ACCESS_KEY
+      # in the pod env, not from this file — a ConfigMap is world-readable
+      # inside the namespace.
+    mq:
+      type: {{ .Values.milvus.messageQueue }}
+    {{- if eq .Values.milvus.messageQueue "kafka" }}
+    kafka:
+      brokerList: {{ $brokers }}
+      saslUsername: ""
+      saslPassword: ""
+      securityProtocol: PLAINTEXT
+    {{- end }}
+    {{- if eq .Values.milvus.mode "distributed" }}
+    rootCoord:
+      address: {{ $coord }}.{{ $dom }}
+      port: 53100
+    dataCoord:
+      address: {{ $coord }}.{{ $dom }}
+      port: 13333
+    queryCoord:
+      address: {{ $coord }}.{{ $dom }}
+      port: 19531
+    indexCoord:
+      address: {{ $coord }}.{{ $dom }}
+      port: 31000
+    {{- end }}
+    proxy:
+      port: {{ .Values.milvus.port }}
+    common:
+      security:
+        authorizationEnabled: false
+    log:
+      level: info
+      # §P4: message text never reaches Milvus (only centroids do), but a
+      # debug-level Milvus logs query payloads, so the level is pinned.
+      format: json
+---
+{{/* MILVUS_ADDR points here: the proxy in distributed mode, the single
+       pod in standalone. Same Service name either way, so nothing
+       downstream has to know which mode is running. */ -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dabet-deps.componentLabels" (dict "root" . "component" "milvus") | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- if eq .Values.milvus.mode "distributed" }}
+    {{- include "dabet-deps.selectorLabels" (dict "root" . "component" "milvus-proxy") | nindent 4 }}
+    {{- else }}
+    {{- include "dabet-deps.selectorLabels" (dict "root" . "component" "milvus-standalone") | nindent 4 }}
+    {{- end }}
+  ports:
+    - name: grpc
+      port: {{ .Values.milvus.port }}
+      targetPort: grpc
+    - name: metrics
+      port: {{ .Values.milvus.metricsPort }}
+      targetPort: metrics
+
+{{- if eq .Values.milvus.mode "distributed" }}
+{{- $components := list
+      (dict "role" "mixcoord" "comp" "milvus-mixcoord" "cfg" .Values.milvus.components.mixcoord)
+      (dict "role" "proxy"    "comp" "milvus-proxy"    "cfg" .Values.milvus.components.proxy)
+      (dict "role" "querynode" "comp" "milvus-querynode" "cfg" .Values.milvus.components.querynode)
+      (dict "role" "datanode" "comp" "milvus-datanode" "cfg" .Values.milvus.components.datanode)
+      (dict "role" "indexnode" "comp" "milvus-indexnode" "cfg" .Values.milvus.components.indexnode)
+-}}
+{{- range $c := $components }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "dabet-deps.componentName" (dict "root" $root "component" $c.comp) }}
+  namespace: {{ $root.Release.Namespace }}
+  labels:
+    {{- include "dabet-deps.componentLabels" (dict "root" $root "component" $c.comp) | nindent 4 }}
+spec:
+  replicas: {{ $c.cfg.replicas }}
+  selector:
+    matchLabels:
+      {{- include "dabet-deps.selectorLabels" (dict "root" $root "component" $c.comp) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "dabet-deps.selectorLabels" (dict "root" $root "component" $c.comp) | nindent 8 }}
+      annotations:
+        {{- with $root.Values.milvus.podAnnotations }}{{ toYaml . | nindent 8 }}{{- end }}
+    spec:
+      {{- include "dabet-deps.imagePullSecrets" $root | nindent 6 }}
+      {{- include "dabet-deps.scheduling" (dict "root" $root "nodeSelector" $root.Values.milvus.nodeSelector "tolerations" $root.Values.milvus.tolerations) | nindent 6 }}
+      containers:
+        - name: milvus
+          image: {{ include "dabet-deps.image" $root.Values.milvus.image }}
+          imagePullPolicy: {{ $root.Values.milvus.image.pullPolicy }}
+          command: ["milvus", "run", {{ $c.role | quote }}]
+          env:
+            - name: MINIO_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ if $root.Values.minio.enabled }}{{ $root.Values.minio.auth.existingSecret | default $minioSecret }}{{ else }}{{ $root.Values.connectionSecret.name }}{{ end }}
+                  key: {{ if $root.Values.minio.enabled }}rootUser{{ else }}S3_ACCESS_KEY{{ end }}
+            - name: MINIO_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ if $root.Values.minio.enabled }}{{ $root.Values.minio.auth.existingSecret | default $minioSecret }}{{ else }}{{ $root.Values.connectionSecret.name }}{{ end }}
+                  key: {{ if $root.Values.minio.enabled }}rootPassword{{ else }}S3_SECRET_KEY{{ end }}
+          ports:
+            - name: grpc
+              containerPort: {{ $root.Values.milvus.port }}
+            - name: metrics
+              containerPort: {{ $root.Values.milvus.metricsPort }}
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            failureThreshold: 12
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            initialDelaySeconds: 90
+            periodSeconds: 30
+            failureThreshold: 8
+          resources:
+            {{- toYaml $c.cfg.resources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /milvus/configs/milvus.yaml
+              subPath: milvus.yaml
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: {{ $name }}-config
+{{- end }}
+
+{{- else }}
+---
+{{/* Standalone: one pod, RocksMQ or the configured queue, a PVC for its
+       local WAL. Fine for a laptop; not the §3 target. */ -}}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "dabet-deps.componentName" (dict "root" . "component" "milvus-standalone") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dabet-deps.componentLabels" (dict "root" . "component" "milvus-standalone") | nindent 4 }}
+spec:
+  serviceName: {{ $name }}
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "dabet-deps.selectorLabels" (dict "root" . "component" "milvus-standalone") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "dabet-deps.selectorLabels" (dict "root" . "component" "milvus-standalone") | nindent 8 }}
+    spec:
+      {{- include "dabet-deps.imagePullSecrets" . | nindent 6 }}
+      {{- include "dabet-deps.scheduling" (dict "root" . "nodeSelector" .Values.milvus.nodeSelector "tolerations" .Values.milvus.tolerations) | nindent 6 }}
+      containers:
+        - name: milvus
+          image: {{ include "dabet-deps.image" .Values.milvus.image }}
+          imagePullPolicy: {{ .Values.milvus.image.pullPolicy }}
+          command: ["milvus", "run", "standalone"]
+          env:
+            - name: MINIO_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ if .Values.minio.enabled }}{{ .Values.minio.auth.existingSecret | default $minioSecret }}{{ else }}{{ .Values.connectionSecret.name }}{{ end }}
+                  key: {{ if .Values.minio.enabled }}rootUser{{ else }}S3_ACCESS_KEY{{ end }}
+            - name: MINIO_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ if .Values.minio.enabled }}{{ .Values.minio.auth.existingSecret | default $minioSecret }}{{ else }}{{ .Values.connectionSecret.name }}{{ end }}
+                  key: {{ if .Values.minio.enabled }}rootPassword{{ else }}S3_SECRET_KEY{{ end }}
+          ports:
+            - name: grpc
+              containerPort: {{ .Values.milvus.port }}
+            - name: metrics
+              containerPort: {{ .Values.milvus.metricsPort }}
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            initialDelaySeconds: 60
+            periodSeconds: 15
+            failureThreshold: 30
+          resources:
+            {{- toYaml .Values.milvus.standalone.resources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /milvus/configs/milvus.yaml
+              subPath: milvus.yaml
+              readOnly: true
+            - name: data
+              mountPath: /var/lib/milvus
+      volumes:
+        - name: config
+          configMap:
+            name: {{ $name }}-config
+        {{- if not .Values.milvus.standalone.persistence.enabled }}
+        - name: data
+          emptyDir: {}
+        {{- end }}
+  {{- if .Values.milvus.standalone.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          {{- include "dabet-deps.componentLabels" (dict "root" . "component" "milvus-standalone") | nindent 10 }}
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- include "dabet-deps.storageClass" (dict "root" . "override" .Values.milvus.standalone.persistence.storageClass) | nindent 8 }}
+        resources:
+          requests:
+            storage: {{ .Values.milvus.standalone.persistence.size }}
+  {{- end }}
+{{- end }}
+{{- end }}

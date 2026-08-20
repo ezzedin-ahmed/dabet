@@ -1,0 +1,167 @@
+{{- if .Values.minio.enabled }}
+{{- $name := include "dabet-deps.componentName" (dict "root" . "component" "minio") -}}
+{{- $hs   := include "dabet-deps.componentName" (dict "root" . "component" "minio-headless") -}}
+{{- $secretName := printf "%s-minio" (include "dabet-deps.fullname" .) -}}
+{{- $pw := include "dabet-deps.password" (dict "root" . "secret" $secretName "key" "rootPassword" "given" .Values.minio.auth.rootPassword) -}}
+{{- $api := .Values.minio.ports.api | int -}}
+{{- /*
+  ==========================================================================
+  MINIO — the S3 of §3 for clusters with no real S3. Holds the §8.4
+  embeddings parquet (creator_id / date partitions, 384-dim fp16 vectors,
+  no author_id and no text) and, when Milvus is on, Milvus's own segments.
+
+  ONE REPLICA BY DEFAULT, and that is a considered choice rather than a
+  simplification: MinIO's erasure coding needs at least four drives, and
+  four half-hearted drives on one node is not durability, it is four times
+  the storage for the same failure domain. If you need durability here,
+  either give it >= 4 replicas with real per-node disks or — much better —
+  disable this component and point external.s3 at actual S3.
+  ==========================================================================
+*/ -}}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $secretName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dabet-deps.componentLabels" (dict "root" . "component" "minio") | nindent 4 }}
+type: Opaque
+stringData:
+  rootUser: {{ .Values.minio.auth.rootUser | quote }}
+  rootPassword: {{ $pw | quote }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $hs }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dabet-deps.componentLabels" (dict "root" . "component" "minio") | nindent 4 }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "dabet-deps.selectorLabels" (dict "root" . "component" "minio") | nindent 4 }}
+  ports:
+    - name: api
+      port: {{ $api }}
+      targetPort: api
+    - name: console
+      port: {{ .Values.minio.ports.console }}
+      targetPort: console
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dabet-deps.componentLabels" (dict "root" . "component" "minio") | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "dabet-deps.selectorLabels" (dict "root" . "component" "minio") | nindent 4 }}
+  ports:
+    - name: api
+      port: {{ $api }}
+      targetPort: api
+    - name: console
+      port: {{ .Values.minio.ports.console }}
+      targetPort: console
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dabet-deps.componentLabels" (dict "root" . "component" "minio") | nindent 4 }}
+spec:
+  serviceName: {{ $hs }}
+  replicas: {{ .Values.minio.replicas }}
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      {{- include "dabet-deps.selectorLabels" (dict "root" . "component" "minio") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "dabet-deps.selectorLabels" (dict "root" . "component" "minio") | nindent 8 }}
+      annotations:
+        {{- with .Values.minio.podAnnotations }}{{ toYaml . | nindent 8 }}{{- end }}
+    spec:
+      {{- include "dabet-deps.imagePullSecrets" . | nindent 6 }}
+      securityContext:
+        fsGroup: 1000
+        runAsUser: 1000
+        runAsGroup: 1000
+      {{- include "dabet-deps.scheduling" (dict "root" . "nodeSelector" .Values.minio.nodeSelector "tolerations" .Values.minio.tolerations) | nindent 6 }}
+      containers:
+        - name: minio
+          image: {{ include "dabet-deps.image" .Values.minio.image }}
+          imagePullPolicy: {{ .Values.minio.image.pullPolicy }}
+          {{- if gt (.Values.minio.replicas | int) 1 }}
+          # Distributed mode: every node is given the full server list, which
+          # MinIO expands from the {0...N-1} ellipsis itself.
+          args:
+            - "server"
+            - "http://{{ $name }}-{0...{{ sub (.Values.minio.replicas | int) 1 }}}.{{ $hs }}.{{ .Release.Namespace }}.svc.{{ include "dabet-deps.clusterDomain" . }}:{{ $api }}/data"
+            - "--console-address"
+            - ":{{ .Values.minio.ports.console }}"
+          {{- else }}
+          args: ["server", "/data", "--console-address", ":{{ .Values.minio.ports.console }}"]
+          {{- end }}
+          env:
+            - name: MINIO_ROOT_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.minio.auth.existingSecret | default $secretName }}
+                  key: rootUser
+            - name: MINIO_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.minio.auth.existingSecret | default $secretName }}
+                  key: rootPassword
+          ports:
+            - name: api
+              containerPort: {{ $api }}
+            - name: console
+              containerPort: {{ .Values.minio.ports.console }}
+          readinessProbe:
+            httpGet:
+              path: /minio/health/ready
+              port: api
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /minio/health/live
+              port: api
+            initialDelaySeconds: 20
+            periodSeconds: 20
+            failureThreshold: 6
+          resources:
+            {{- toYaml .Values.minio.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      {{- if not .Values.minio.persistence.enabled }}
+      volumes:
+        - name: data
+          emptyDir: {}
+      {{- end }}
+  {{- if .Values.minio.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          {{- include "dabet-deps.componentLabels" (dict "root" . "component" "minio") | nindent 10 }}
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- include "dabet-deps.storageClass" (dict "root" . "override" .Values.minio.persistence.storageClass) | nindent 8 }}
+        resources:
+          requests:
+            storage: {{ .Values.minio.persistence.size }}
+  {{- end }}
+{{- end }}

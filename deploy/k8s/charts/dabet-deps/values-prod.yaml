@@ -1,0 +1,337 @@
+# dabet-deps — TARGET PROFILE (docs §3, "Target" column).
+#
+#   helm install deps deploy/k8s/charts/dabet-deps -f values-prod.yaml \
+#     --set global.storageClass=fast-ssd
+#
+# This is the self-hosted rendering of §3's target column: everything the
+# managed services would give you, running on your own cluster. It is the
+# path for bare metal and for clouds where the managed equivalents are not
+# used.
+#
+# ON A CLOUD THAT DOES USE THE MANAGED SERVICES, disable the component and
+# fill the matching external.* entry — Terraform writes those. The
+# connection contract is published identically either way, so the app chart
+# is unchanged. e.g. RDS + MSK + ElastiCache:
+#
+#   kafka.enabled: false      external.kafka.brokers: "b-1...:9092,b-2...:9092"
+#   postgres.enabled: false   external.postgres.identity/policy: <RDS DSNs>
+#   redis.enabled: false      external.redis.addr: <ElastiCache configuration endpoint>
+#                             external.redis.cluster: true
+#   minio.enabled: false      external.s3.endpoint: ""   # real S3
+#
+# SECRETS. Every password below is left empty on purpose: the chart
+# generates one and reads it back from the live Secret on upgrade. §4.4
+# says secrets come from a secret manager in the k8s target — when you wire
+# one up, point `existingSecret` at what it writes and this chart stops
+# generating anything.
+
+global:
+  # Databases and brokers want real disks. Name the class explicitly; the
+  # cluster default is often a network volume with the wrong IOPS profile.
+  storageClass: ""
+  imagePullSecrets: []
+
+kafka:
+  enabled: true
+  # §3: "3+ brokers". Raise for throughput; keep it ODD so the KRaft
+  # controller quorum gains a fault domain each time (3 -> 5 -> 7).
+  replicas: 3
+  replicationFactor: 3
+  minInsyncReplicas: 2
+  autoCreateTopics: false
+  heapOpts: "-Xmx4g -Xms4g"
+  persistence:
+    enabled: true
+    # §4.2's retentions are the sizing input: messages.v1 at 24 h dominates.
+    # At a sustained 50K msg/s and ~300 B compressed that is ~1.3 TB/day
+    # across the cluster before replication — size this against your own
+    # measured rate rather than trusting the default.
+    size: 500Gi
+  resources:
+    requests:
+      cpu: "2"
+      memory: 8Gi
+    limits:
+      memory: 12Gi
+  topologySpreadEnabled: true
+  topics:
+    enabled: true
+    replicationFactor: 3
+    # ============ THE §4.2 CONTRACT, VERBATIM ============
+    # Do not shrink these. messages.v1's 512 partitions are what let the
+    # moderation consumer group scale out: the partition count is the hard
+    # ceiling on consumer parallelism, and it can be raised later but never
+    # lowered without destroying the topic.
+    registry:
+      - name: messages.v1
+        partitions: 512
+        retentionMs: 86400000      # 24 h
+        config:
+          compression.type: producer
+      - name: flagged.v1
+        partitions: 128
+        retentionMs: 604800000     # 7 d
+        config:
+          compression.type: producer
+      - name: deletions.v1
+        partitions: 128
+        retentionMs: 86400000      # 24 h
+        config:
+          compression.type: producer
+      - name: usage.v1
+        partitions: 32
+        retentionMs: 604800000     # 7 d
+        config:
+          compression.type: producer
+
+postgres:
+  enabled: true
+  defaults:
+    password: ""            # generated; see the header
+    persistence:
+      enabled: true
+      size: 200Gi
+    resources:
+      requests:
+        cpu: "2"
+        memory: 8Gi
+      limits:
+        memory: 16Gi
+    parameters:
+      max_connections: "500"
+      shared_buffers: "2GB"
+      effective_cache_size: "6GB"
+      work_mem: "16MB"
+      maintenance_work_mem: "512MB"
+      # The moderation path never touches Postgres, so a slightly relaxed
+      # durability setting here costs at most a few hundred ms of committed
+      # identity writes on a hard crash, and buys a large amount of write
+      # throughput on the credits ledger.
+      synchronous_commit: "on"
+      wal_compression: "zstd"
+  instances:
+    # §3: separate clusters. Not separate databases on one server — separate
+    # StatefulSets, separate volumes, separate blast radius. An identity
+    # outage stops logins; a policy outage makes moderation fail open (P2)
+    # and chat keeps flowing. Sharing a server would couple those.
+    identity:
+      enabled: true
+      database: dabet_identity
+      schemas: ["identity", "billing"]
+      consumers: ["user-service", "credits-service", "provider-adapter"]
+    policy:
+      enabled: true
+      database: dabet_policy
+      schemas: ["policy", "review"]
+      consumers: ["policy-service", "review-service"]
+
+redis:
+  enabled: true
+  cluster:
+    enabled: true
+    # 6 nodes: 3 masters, 1 replica each. §4.3's hash tags mean every key a
+    # single Lua script touches shares a slot, so this shards cleanly by
+    # (content_id, author_id) with no CROSSSLOT errors. Grow in multiples of
+    # 2 to keep every master covered.
+    replicas: 6
+    replicasPerMaster: 1
+    preferHostnameEndpoints: true
+  maxmemory: "8gb"
+  maxmemoryPolicy: "allkeys-lru"
+  # Everything in §4.3 has a 5-minute TTL and is reconstructible; AOF fsync
+  # on the moderation hot path would cost latency for state that is worth
+  # nothing in 5 minutes' time.
+  appendonly: false
+  persistence:
+    enabled: true
+    # Not for the data — for nodes.conf. A cluster node that loses
+    # nodes.conf loses its identity and its slot ownership, and rejoining is
+    # a manual repair. This is the single reason Redis needs a PVC here.
+    size: 20Gi
+  resources:
+    requests:
+      cpu: "1"
+      memory: 10Gi
+    limits:
+      memory: 12Gi
+
+memcached:
+  enabled: true
+  # §6.8's policy documents. Small values, high read rate, client-side
+  # sharding across the pool.
+  replicas: 3
+  memoryLimitMB: 2048
+  maxConnections: 4096
+  resources:
+    requests:
+      cpu: 500m
+      memory: 2560Mi
+    limits:
+      memory: 3Gi
+
+clickhouse:
+  enabled: true
+  # §3: "Cluster". 2 shards x 2 replicas. §8.7's ORDER BY leads with
+  # creator_id and every query is creator-scoped, so sharding on creator
+  # keeps each query on one shard.
+  replicas: 4
+  shards: 2
+  replicasPerShard: 2
+  clusterName: dabet
+  keeper:
+    # Mandatory once replicasPerShard > 1 — ReplicatedMergeTree coordinates
+    # through it. 3 nodes for a Raft majority.
+    enabled: true
+    replicas: 3
+    persistence:
+      enabled: true
+      size: 20Gi
+  auth:
+    username: dabet
+    password: ""
+    database: dabet
+  persistence:
+    enabled: true
+    size: 1Ti
+  resources:
+    requests:
+      cpu: "4"
+      memory: 16Gi
+    limits:
+      memory: 32Gi
+
+minio:
+  # ON A CLOUD WITH REAL S3, TURN THIS OFF. §8.4 puts the dominant storage
+  # cost of the whole system here — ~3.5 TB/day of parquet at the sampled
+  # rate — and self-hosting that is a storage project in its own right.
+  # This block is for clusters that have no S3 at all.
+  enabled: true
+  # >= 4 for erasure coding. Below that MinIO runs single-drive with no
+  # redundancy, which is not a place to put an indefinitely-retained corpus.
+  replicas: 4
+  auth:
+    rootUser: dabet
+    rootPassword: ""
+  persistence:
+    enabled: true
+    size: 4Ti
+  resources:
+    requests:
+      cpu: "2"
+      memory: 8Gi
+    limits:
+      memory: 16Gi
+
+milvus:
+  # STILL OPT-IN, even here. Enable it together with clustering-service and
+  # clusters-job (§8.5, §8.6); until Area D is deployed nothing queries it
+  # and it is several idle GB.
+  enabled: false
+  mode: distributed
+  messageQueue: kafka
+  components:
+    mixcoord:
+      replicas: 1
+      resources:
+        requests: {cpu: 500m, memory: 2Gi}
+        limits: {memory: 4Gi}
+    proxy:
+      replicas: 2
+      resources:
+        requests: {cpu: 500m, memory: 2Gi}
+        limits: {memory: 4Gi}
+    querynode:
+      # The search path. §8.5 searches centroids per creator on every
+      # embedding, so this is the component that scales with traffic.
+      replicas: 4
+      resources:
+        requests: {cpu: "2", memory: 8Gi}
+        limits: {memory: 16Gi}
+    datanode:
+      replicas: 2
+      resources:
+        requests: {cpu: "1", memory: 4Gi}
+        limits: {memory: 8Gi}
+    indexnode:
+      replicas: 2
+      resources:
+        requests: {cpu: "2", memory: 8Gi}
+        limits: {memory: 16Gi}
+  etcd:
+    enabled: true
+    replicas: 3
+    persistence:
+      enabled: true
+      size: 20Gi
+
+vllm:
+  # §3: "GPU fleet behind a load balancer". Enable on a cluster with GPU
+  # nodes and the NVIDIA device plugin installed.
+  enabled: false
+  replicas: 4
+  model: "Qwen/Qwen2.5-7B-Instruct"
+  extraArgs:
+    - "--max-model-len=8192"
+    - "--gpu-memory-utilization=0.90"
+    # §7.9 batches verdicts behind a 250 ms linger, so the server should
+    # accept a deep queue rather than reject under burst.
+    - "--max-num-seqs=256"
+  gpu:
+    resourceName: nvidia.com/gpu
+    count: 1
+  # GPU pools are normally tainted so that CPU workloads cannot land on
+  # them; the toleration below is the common NVIDIA convention. The
+  # nodeSelector is left EMPTY on purpose — a selector with a placeholder
+  # value matches no node and leaves the fleet Pending with no useful
+  # error, which is worse than no selector at all. Fill it in for your own
+  # pool, e.g.
+  #   nodeSelector:
+  #     node.kubernetes.io/instance-type: g5.2xlarge
+  nodeSelector: {}
+  tolerations:
+    - key: nvidia.com/gpu
+      operator: Exists
+      effect: NoSchedule
+  resources:
+    requests:
+      cpu: "8"
+      memory: 32Gi
+    limits:
+      memory: 64Gi
+  persistence:
+    enabled: true
+    size: 200Gi
+  startupProbeFailureThreshold: 180
+
+embedding:
+  # §8.4, shared by §7.4 and Insights. One deployment, one Service.
+  enabled: false
+  backend: tei
+  model: "sentence-transformers/all-MiniLM-L6-v2"
+  dimensions: 384
+  replicas: 4
+  gpu:
+    resourceName: nvidia.com/gpu
+    count: 1
+  tolerations:
+    - key: nvidia.com/gpu
+      operator: Exists
+      effect: NoSchedule
+  resources:
+    requests:
+      cpu: "2"
+      memory: 8Gi
+    limits:
+      memory: 16Gi
+  persistence:
+    enabled: true
+    size: 50Gi
+
+# No mocks in production. When vllm/embedding are still disabled, the
+# corresponding endpoints are simply absent from the contract and the
+# services fall back to their own defaults and fail open (P2).
+mocks:
+  llm:
+    enabled: false
+  embedding:
+    enabled: false

@@ -1,0 +1,169 @@
+{{- if and .Values.clickhouse.enabled .Values.clickhouse.keeper.enabled }}
+{{- $kn  := include "dabet-deps.componentName" (dict "root" . "component" "clickhouse-keeper") -}}
+{{- $khs := include "dabet-deps.componentName" (dict "root" . "component" "clickhouse-keeper-headless") -}}
+{{- $dom := printf "%s.svc.%s" .Release.Namespace (include "dabet-deps.clusterDomain" .) -}}
+{{- $n := .Values.clickhouse.keeper.replicas | int -}}
+{{- /*
+  ClickHouse Keeper — the Raft coordination service ReplicatedMergeTree
+  needs. Only rendered when replicasPerShard > 1 asks for replication; a
+  single-replica ClickHouse has nothing to coordinate.
+
+  server_id must be stable per pod and cannot come from a ConfigMap, so it
+  is derived from the ordinal by the init container, the same trick as the
+  ClickHouse macros.
+*/ -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $kn }}-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dabet-deps.componentLabels" (dict "root" . "component" "clickhouse-keeper") | nindent 4 }}
+data:
+  raft.xml: |
+    <clickhouse>
+      <listen_host>0.0.0.0</listen_host>
+      <keeper_server>
+        <tcp_port>9181</tcp_port>
+        <log_storage_path>/var/lib/clickhouse-keeper/log</log_storage_path>
+        <snapshot_storage_path>/var/lib/clickhouse-keeper/snapshots</snapshot_storage_path>
+        <coordination_settings>
+          <operation_timeout_ms>10000</operation_timeout_ms>
+          <session_timeout_ms>30000</session_timeout_ms>
+        </coordination_settings>
+        <raft_configuration>
+          {{- range $i := until $n }}
+          <server>
+            <id>{{ add1 $i }}</id>
+            <hostname>{{ $kn }}-{{ $i }}.{{ $khs }}.{{ $dom }}</hostname>
+            <port>9234</port>
+          </server>
+          {{- end }}
+        </raft_configuration>
+      </keeper_server>
+    </clickhouse>
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $khs }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dabet-deps.componentLabels" (dict "root" . "component" "clickhouse-keeper") | nindent 4 }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "dabet-deps.selectorLabels" (dict "root" . "component" "clickhouse-keeper") | nindent 4 }}
+  ports:
+    - name: client
+      port: 9181
+      targetPort: client
+    - name: raft
+      port: 9234
+      targetPort: raft
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $kn }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dabet-deps.componentLabels" (dict "root" . "component" "clickhouse-keeper") | nindent 4 }}
+spec:
+  serviceName: {{ $khs }}
+  replicas: {{ $n }}
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      {{- include "dabet-deps.selectorLabels" (dict "root" . "component" "clickhouse-keeper") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "dabet-deps.selectorLabels" (dict "root" . "component" "clickhouse-keeper") | nindent 8 }}
+    spec:
+      {{- include "dabet-deps.imagePullSecrets" . | nindent 6 }}
+      securityContext:
+        fsGroup: 101
+        runAsUser: 101
+        runAsGroup: 101
+      {{- include "dabet-deps.scheduling" (dict "root" . "nodeSelector" .Values.clickhouse.nodeSelector "tolerations" .Values.clickhouse.tolerations) | nindent 6 }}
+      initContainers:
+        - name: server-id
+          image: {{ include "dabet-deps.image" .Values.clickhouse.keeper.image }}
+          imagePullPolicy: {{ .Values.clickhouse.keeper.image.pullPolicy }}
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -eu
+              ORD="${HOSTNAME##*-}"
+              cat > /gen/server-id.xml <<EOF
+              <clickhouse>
+                <keeper_server>
+                  <server_id>$((ORD + 1))</server_id>
+                </keeper_server>
+              </clickhouse>
+              EOF
+              echo "keeper server_id=$((ORD + 1))"
+          volumeMounts:
+            - name: gen
+              mountPath: /gen
+      containers:
+        - name: keeper
+          image: {{ include "dabet-deps.image" .Values.clickhouse.keeper.image }}
+          imagePullPolicy: {{ .Values.clickhouse.keeper.image.pullPolicy }}
+          ports:
+            - name: client
+              containerPort: 9181
+            - name: raft
+              containerPort: 9234
+          readinessProbe:
+            exec:
+              # The four-letter-word interface: `ruok` answers `imok` only
+              # once the node has joined the quorum.
+              command: ["/bin/bash", "-c", "printf 'ruok' | timeout 3 bash -c 'cat > /dev/tcp/127.0.0.1/9181; cat <&0' | grep -q imok"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 12
+          livenessProbe:
+            tcpSocket:
+              port: client
+            initialDelaySeconds: 20
+            periodSeconds: 20
+          resources:
+            {{- toYaml .Values.clickhouse.keeper.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/clickhouse-keeper
+            - name: config
+              mountPath: /etc/clickhouse-keeper/conf.d/raft.xml
+              subPath: raft.xml
+              readOnly: true
+            - name: gen
+              mountPath: /etc/clickhouse-keeper/conf.d/server-id.xml
+              subPath: server-id.xml
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: {{ $kn }}-config
+        - name: gen
+          emptyDir: {}
+        {{- if not .Values.clickhouse.keeper.persistence.enabled }}
+        - name: data
+          emptyDir: {}
+        {{- end }}
+  {{- if .Values.clickhouse.keeper.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          {{- include "dabet-deps.componentLabels" (dict "root" . "component" "clickhouse-keeper") | nindent 10 }}
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- include "dabet-deps.storageClass" (dict "root" . "override" .Values.clickhouse.keeper.persistence.storageClass) | nindent 8 }}
+        resources:
+          requests:
+            storage: {{ .Values.clickhouse.keeper.persistence.size }}
+  {{- end }}
+{{- end }}

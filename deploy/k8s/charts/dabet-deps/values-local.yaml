@@ -1,0 +1,204 @@
+# dabet-deps — LAPTOP PROFILE (docs §3, "Local (Compose)" column, adapted).
+#
+#   helm install deps deploy/k8s/charts/dabet-deps -f values-local.yaml
+#
+# Sized for a kind cluster on a machine with ~7 GB free and 8 cores. Total
+# pod memory requests come to roughly 2.4 GB, which leaves room for the app
+# chart on top.
+#
+# WHAT THIS PROFILE DELIBERATELY KEEPS REAL, because these are the things
+# that only fail on a real cluster:
+#
+#   * Kafka is 3 brokers, not 1. The KRaft quorum, the per-pod advertised
+#     listener and the replication factor are exactly where a chart breaks,
+#     and none of them exist at 1 broker.
+#   * Postgres is TWO instances, not one with four schemas. §3's separation
+#     is the point; collapsing it here would mean the split is never
+#     exercised until production.
+#   * Redis is a 3-shard CLUSTER, not one node. §4.3's hash tags exist
+#     precisely so this works, and a single node would not prove it.
+#
+# WHAT IT SHRINKS: partition counts (512 -> 12, which is still more than one
+# per broker), retentions, replica counts, volumes, and every memory
+# request. Milvus and the GPU fleet stay off; the tools/ mocks stand in.
+
+global:
+  storageClass: ""
+
+kafka:
+  enabled: true
+  replicas: 3
+  # 3 brokers, RF 3, ISR 2 — the smallest topology where losing a broker is
+  # survivable, so the failure behaviour is the same as production.
+  replicationFactor: 3
+  minInsyncReplicas: 2
+  heapOpts: "-Xmx512m -Xms512m"
+  persistence:
+    enabled: true
+    size: 2Gi
+  resources:
+    requests:
+      cpu: 100m
+      memory: 700Mi
+    limits:
+      memory: 1Gi
+  topics:
+    enabled: true
+    replicationFactor: 3
+    # §4.2 counts divided down. The RATIOS are preserved (messages ≫
+    # flagged ≈ deletions > usage) so consumer-group rebalancing and
+    # partition-assignment behaviour still look like production, just
+    # smaller. Retentions are cut to an hour: a laptop has no reason to
+    # keep a day of chat on disk.
+    registry:
+      - name: messages.v1
+        partitions: 12
+        retentionMs: 3600000       # 1 h (prod: 24 h)
+        config:
+          compression.type: producer
+      - name: flagged.v1
+        partitions: 6
+        retentionMs: 3600000       # 1 h (prod: 7 d)
+        config:
+          compression.type: producer
+      - name: deletions.v1
+        partitions: 6
+        retentionMs: 3600000       # 1 h (prod: 24 h)
+        config:
+          compression.type: producer
+      - name: usage.v1
+        partitions: 3
+        retentionMs: 3600000       # 1 h (prod: 7 d)
+        config:
+          compression.type: producer
+
+postgres:
+  enabled: true
+  defaults:
+    # Fixed so a developer can psql in without reading a Secret. NEVER do
+    # this anywhere that is not a laptop.
+    password: "dabet"
+    persistence:
+      enabled: true
+      size: 1Gi
+    resources:
+      requests:
+        cpu: 50m
+        memory: 128Mi
+      limits:
+        memory: 512Mi
+    parameters:
+      max_connections: "100"
+      shared_buffers: "64MB"
+  instances:
+    identity:
+      enabled: true
+      database: dabet_identity
+      schemas: ["identity", "billing"]
+      consumers: ["user-service", "credits-service", "provider-adapter"]
+    policy:
+      enabled: true
+      database: dabet_policy
+      schemas: ["policy", "review"]
+      consumers: ["policy-service", "review-service"]
+
+redis:
+  enabled: true
+  cluster:
+    enabled: true
+    # 3 nodes, 0 replicas — three masters, three shards, 16384 slots split
+    # three ways. The smallest configuration that is genuinely a cluster.
+    # A shard loss is unrecoverable here; that is the trade for fitting on
+    # a laptop, and it is stated rather than hidden.
+    replicas: 3
+    replicasPerMaster: 0
+    preferHostnameEndpoints: true
+  maxmemory: "128mb"
+  persistence:
+    enabled: true
+    size: 1Gi
+  resources:
+    requests:
+      cpu: 50m
+      memory: 96Mi
+    limits:
+      memory: 192Mi
+
+memcached:
+  enabled: true
+  replicas: 2
+  memoryLimitMB: 64
+  resources:
+    requests:
+      cpu: 25m
+      memory: 96Mi
+    limits:
+      memory: 128Mi
+
+clickhouse:
+  enabled: true
+  replicas: 1
+  shards: 1
+  replicasPerShard: 1
+  keeper:
+    enabled: false
+  auth:
+    username: dabet
+    password: "dabet"
+    database: dabet
+  persistence:
+    enabled: true
+    size: 2Gi
+  resources:
+    requests:
+      cpu: 100m
+      memory: 512Mi
+    limits:
+      memory: 1536Mi
+
+minio:
+  enabled: true
+  replicas: 1
+  auth:
+    rootUser: minioadmin
+    rootPassword: minioadmin
+  persistence:
+    enabled: true
+    size: 2Gi
+  resources:
+    requests:
+      cpu: 50m
+      memory: 192Mi
+    limits:
+      memory: 512Mi
+
+# Off, exactly as `make up` leaves it off. `make up-full` is the compose
+# equivalent of flipping this; here it is
+#   --set milvus.enabled=true --set milvus.mode=standalone
+# and it needs roughly 3 GB more than this profile budgets for.
+milvus:
+  enabled: false
+  mode: standalone
+
+# No GPU on a laptop.
+vllm:
+  enabled: false
+embedding:
+  enabled: false
+
+# The substitutes. Build and load them first — see README §"Mock images".
+mocks:
+  llm:
+    enabled: true
+    image:
+      repository: dabet/mockllm
+      tag: "dev"
+      # Never on a kind cluster: the image is side-loaded, so IfNotPresent
+      # finds it and Always would try a registry that does not have it.
+      pullPolicy: IfNotPresent
+  embedding:
+    enabled: true
+    image:
+      repository: dabet/mockembed
+      tag: "dev"
+      pullPolicy: IfNotPresent

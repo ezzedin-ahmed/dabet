@@ -1,0 +1,68 @@
+dabet-deps {{ .Chart.Version }} installed as {{ .Release.Name }} in {{ .Release.Namespace }}.
+
+COMPONENTS
+{{ if .Values.kafka.enabled }}  [on ] kafka          {{ .Values.kafka.replicas }} broker(s), KRaft, {{ len .Values.kafka.topics.registry }} topic(s) reconciled by the post-install job
+{{- else }}  [off] kafka          {{ if .Values.external.kafka.brokers }}external: {{ .Values.external.kafka.brokers }}{{ else }}NOT CONFIGURED{{ end }}
+{{- end }}
+{{- range $n, $i := .Values.postgres.instances }}
+{{ if and $.Values.postgres.enabled $i.enabled }}  [on ] postgres/{{ $n }}  db={{ $i.database }} schemas={{ join "," $i.schemas }}
+{{- else }}  [off] postgres/{{ $n }}  {{ if index $.Values.external.postgres $n }}external{{ else }}NOT CONFIGURED{{ end }}
+{{- end }}
+{{- end }}
+{{ if .Values.redis.enabled }}  [on ] redis          {{ if .Values.redis.cluster.enabled }}CLUSTER, {{ .Values.redis.cluster.replicas }} nodes, {{ div (.Values.redis.cluster.replicas | int) (add1 (.Values.redis.cluster.replicasPerMaster | int)) }} shard(s){{ else }}standalone (1 node){{ end }}
+{{- else }}  [off] redis          {{ if .Values.external.redis.addr }}external{{ else }}NOT CONFIGURED{{ end }}
+{{- end }}
+{{ if .Values.memcached.enabled }}  [on ] memcached      pool of {{ .Values.memcached.replicas }}
+{{- else }}  [off] memcached      {{ if .Values.external.memcached.addrs }}external{{ else }}NOT CONFIGURED{{ end }}
+{{- end }}
+{{ if .Values.clickhouse.enabled }}  [on ] clickhouse     {{ .Values.clickhouse.replicas }} node(s), {{ .Values.clickhouse.shards }}x{{ .Values.clickhouse.replicasPerShard }}, keeper={{ .Values.clickhouse.keeper.enabled }}
+{{- else }}  [off] clickhouse     {{ if .Values.external.clickhouse.dsn }}external{{ else }}NOT CONFIGURED{{ end }}
+{{- end }}
+{{ if .Values.minio.enabled }}  [on ] minio          {{ .Values.minio.replicas }} node(s), bucket={{ .Values.minio.buckets.embeddings }}
+{{- else }}  [off] minio          {{ if .Values.external.s3.endpoint }}external endpoint{{ else }}real AWS S3 (SDK default){{ end }}
+{{- end }}
+{{ if .Values.milvus.enabled }}  [on ] milvus         {{ .Values.milvus.mode }}, mq={{ .Values.milvus.messageQueue }}
+{{- else }}  [off] milvus         opt-in; enable with clustering-service (§8.5)
+{{- end }}
+{{ if .Values.vllm.enabled }}  [on ] vllm           {{ .Values.vllm.replicas }}x{{ .Values.vllm.gpu.count }} {{ .Values.vllm.gpu.resourceName }}, model={{ .Values.vllm.model }}
+{{- else if .Values.mocks.llm.enabled }}  [off] vllm           -> tools/mockllm stands in
+{{- else }}  [off] vllm           {{ if .Values.external.vllm.endpoint }}external{{ else }}NOT CONFIGURED — moderation will fail open (P2){{ end }}
+{{- end }}
+{{ if .Values.embedding.enabled }}  [on ] embedding      {{ .Values.embedding.replicas }}x {{ .Values.embedding.backend }}, {{ .Values.embedding.dimensions }} dims
+{{- else if .Values.mocks.embedding.enabled }}  [off] embedding      -> tools/mockembed stands in
+{{- else }}  [off] embedding      {{ if .Values.external.embedding.endpoint }}external{{ else }}NOT CONFIGURED{{ end }}
+{{- end }}
+
+CONNECTION CONTRACT (docs §4.4)
+  Secret:    {{ .Values.connectionSecret.name }}
+{{- if .Values.connectionSecret.configMap.enabled }}
+  ConfigMap: {{ .Values.connectionSecret.configMap.name }}   (credential-free view)
+{{- end }}
+
+  kubectl -n {{ .Release.Namespace }} get secret {{ .Values.connectionSecret.name }} \
+    -o go-template='{{ "{{range $k,$v := .data}}{{$k}}={{$v | base64decode}}{{\"\\n\"}}{{end}}" }}'
+
+  The app chart consumes these by name. POSTGRES_DSN is published PER
+  DATABASE (POSTGRES_DSN_IDENTITY / POSTGRES_DSN_POLICY) and is mapped onto
+  the bare POSTGRES_DSN that services read. A key is ABSENT, not empty,
+  when its component is neither enabled nor externally configured — always
+  use `optional: true` on the secretKeyRef.
+
+{{- if and .Values.redis.enabled .Values.redis.cluster.enabled }}
+
+  !! REDIS_CLUSTER=true is published. moderation-service currently builds a
+     go-redis *single-node* client (redis.NewClient). The §4.3 keyspace is
+     already cluster-safe — every multi-key group carries a hash tag — but
+     the CLIENT must be a ClusterClient or roughly two thirds of operations
+     will come back MOVED. That change is owned by the service, not by this
+     chart. Until it lands, set redis.cluster.enabled=false.
+{{- end }}
+
+NEXT
+{{- if .Values.kafka.enabled }}
+  kubectl -n {{ .Release.Namespace }} logs job/{{ include "dabet-deps.componentName" (dict "root" . "component" "kafka-topics") }}
+{{- end }}
+{{- if and .Values.redis.enabled .Values.redis.cluster.enabled }}
+  kubectl -n {{ .Release.Namespace }} logs job/{{ include "dabet-deps.componentName" (dict "root" . "component" "redis-init") }}
+{{- end }}
+  kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/part-of=dabet

@@ -1,0 +1,29 @@
+apiVersion: v2
+name: dabet-deps
+description: >-
+  Dabet's stateful dependencies (docs §3): Kafka, two Postgres clusters,
+  Redis Cluster, Memcached, ClickHouse, Milvus, MinIO and the inference
+  fleet. Every component is independently toggleable so a deployment can
+  mix self-hosted components with AWS managed equivalents.
+type: application
+
+# Chart version. Bump on any template change.
+version: 0.1.0
+
+# There is no single "app" here — the versions that matter are the per
+# component image tags in values.yaml, which are the contract with the
+# compose profile in deploy/compose/docker-compose.yml.
+appVersion: "0.1.0"
+
+kubeVersion: ">=1.27.0-0"
+
+keywords:
+  - dabet
+  - kafka
+  - postgres
+  - redis
+  - clickhouse
+  - milvus
+
+annotations:
+  dabet.io/spec-sections: "3, 4.2, 4.3, 4.4, 8.4, 8.7"

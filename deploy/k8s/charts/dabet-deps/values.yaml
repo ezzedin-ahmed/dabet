@@ -1,0 +1,677 @@
+# dabet-deps — default values.
+#
+# These defaults are a middle ground: they run a real, multi-node topology
+# (3 Kafka brokers, 6 Redis cluster nodes, two Postgres instances) but with
+# the two expensive optional components — Milvus and the GPU inference
+# fleet — switched off, exactly as deploy/compose/docker-compose.yml keeps
+# Milvus behind the `clustering` profile.
+#
+# Use values-local.yaml on a laptop and values-prod.yaml for the §3 target
+# column. Neither is a full replacement — both are overlays on this file.
+#
+# EVERY component has an `enabled` flag and every component has a matching
+# `external:` block. Disabling a component and filling in its `external`
+# entry is how a cluster mixes self-hosted pieces with AWS managed ones
+# (MSK, RDS, ElastiCache, S3): the connection contract in
+# `templates/connection-secret.yaml` is published either way, so the app
+# chart never learns which is which. See README.md §"Connection contract".
+
+# ---------------------------------------------------------------------------
+# Naming
+#
+# Resource names are "<release>-<chart>-<component>", which gets long fast
+# (deps-dabet-deps-postgres-identity). Those names are baked into DNS and
+# therefore into the connection contract, so shortening them AFTER an
+# install means every published address changes. Decide once, up front:
+#   fullnameOverride: dabet   ->   dabet-postgres-identity
+# ---------------------------------------------------------------------------
+nameOverride: ""
+fullnameOverride: ""
+
+# Only change this on a cluster installed with a non-default cluster domain.
+# It is used for the fully-qualified peer names that Kafka's quorum, etcd's
+# initial cluster and Redis's announced hostname all embed.
+clusterDomain: cluster.local
+
+# ---------------------------------------------------------------------------
+# Global
+# ---------------------------------------------------------------------------
+global:
+  # Storage class for every PVC. "" means the cluster default, which is what
+  # kind, k3s and most managed clusters want. Named explicitly per component
+  # below when a component needs different storage.
+  storageClass: ""
+  # Applied to every pod this chart creates.
+  imagePullSecrets: []
+  nodeSelector: {}
+  tolerations: []
+
+# Name of the Secret that carries the §4.4 connection contract. The app
+# chart references this by name; it is a coordination point, so it is a
+# value rather than a derived name.
+connectionSecret:
+  name: dabet-deps-connection
+  # Also emit the same keys as a ConfigMap, minus anything containing a
+  # password. Useful for debugging and for tools that cannot read Secrets.
+  # The DSN keys are omitted from it because they embed credentials.
+  configMap:
+    enabled: true
+    name: dabet-deps-endpoints
+
+# ---------------------------------------------------------------------------
+# External endpoints — used when the matching component is disabled.
+#
+# Terraform (the AWS path) writes these. Whatever is set here wins over the
+# in-cluster address even when the component is enabled, so a value here is
+# also a manual override hatch.
+# ---------------------------------------------------------------------------
+external:
+  kafka:
+    # e.g. "b-1.msk.eu-west-1.amazonaws.com:9092,b-2...:9092"
+    brokers: ""
+  postgres:
+    # Per logical instance; keys must match `postgres.instances`.
+    # A full DSN, e.g.
+    #   postgres://dabet:pw@identity.abc.eu-west-1.rds.amazonaws.com:5432/dabet_identity?sslmode=require
+    identity: ""
+    policy: ""
+  redis:
+    # host:port, or a comma-separated seed list for a cluster.
+    addr: ""
+    cluster: false
+  memcached:
+    addrs: ""
+  clickhouse:
+    dsn: ""
+  milvus:
+    addr: ""
+  s3:
+    # Empty endpoint means "the AWS SDK default", i.e. real S3.
+    endpoint: ""
+    region: "us-east-1"
+    bucket: "dabet-embeddings"
+    # When these are empty the app is expected to use IRSA / instance role.
+    accessKey: ""
+    secretKey: ""
+  vllm:
+    endpoint: ""
+  embedding:
+    endpoint: ""
+
+# ---------------------------------------------------------------------------
+# Kafka — KRaft, no ZooKeeper (§3: "3+ brokers")
+# ---------------------------------------------------------------------------
+kafka:
+  enabled: true
+  image:
+    repository: apache/kafka
+    tag: "3.9.0"
+    pullPolicy: IfNotPresent
+  # §3 target: 3+ brokers. Combined broker+controller roles: at three nodes
+  # a dedicated controller quorum buys nothing and costs three more pods.
+  # Set `controllerOnly: true` above ~9 brokers to split the roles.
+  replicas: 3
+  controllerOnly: false
+  # Deterministic so a re-format of a wiped volume rejoins the same cluster
+  # rather than refusing with an InconsistentClusterIdException. Override in
+  # prod with a value generated once by `kafka-storage.sh random-uuid`.
+  clusterId: "dabet-kraft-cluster-0"
+  listeners:
+    clientPort: 9092
+    controllerPort: 9093
+  # Applied to __consumer_offsets and the transaction state log. Capped at
+  # `replicas` by the template so a 1-broker laptop still starts.
+  replicationFactor: 3
+  minInsyncReplicas: 2
+  autoCreateTopics: false
+  heapOpts: "-Xmx1g -Xms1g"
+  extraConfig: {}
+  persistence:
+    enabled: true
+    size: 20Gi
+    storageClass: ""
+  resources:
+    requests:
+      cpu: 250m
+      memory: 1280Mi
+    limits:
+      memory: 2Gi
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  # Spread brokers over nodes when the cluster has more than one. "ScheduleAnyway"
+  # so a single-node kind cluster is not wedged by it.
+  topologySpreadEnabled: true
+
+  # ---- §4.2 topic registry -------------------------------------------------
+  # THE PARTITION COUNTS AND RETENTIONS BELOW ARE THE §4.2 CONTRACT.
+  # They are values so that values-local.yaml can shrink them; they must not
+  # be shrunk in a real deployment. `retentionMs` is copied from the table:
+  # messages.v1 24h, flagged.v1 7d, deletions.v1 24h, usage.v1 7d.
+  #
+  # NOTE: partitions can only ever be INCREASED in Kafka. The job raises a
+  # topic that is under the desired count and refuses (loudly, non-fatally)
+  # to lower one, because lowering means delete-and-recreate and that would
+  # silently drop data.
+  topics:
+    enabled: true
+    # Job-level knobs.
+    backoffLimit: 6
+    activeDeadlineSeconds: 900
+    registry:
+      - name: messages.v1
+        partitions: 512
+        retentionMs: 86400000      # 24 h
+        config:
+          # zstd on the producer (§4.2) — `producer` here means "keep whatever
+          # the producer sent" rather than recompressing on the broker.
+          compression.type: producer
+      - name: flagged.v1
+        partitions: 128
+        retentionMs: 604800000     # 7 d
+        config:
+          compression.type: producer
+      - name: deletions.v1
+        partitions: 128
+        retentionMs: 86400000      # 24 h — §4.2 table
+        config:
+          compression.type: producer
+      - name: usage.v1
+        partitions: 32
+        retentionMs: 604800000     # 7 d
+        config:
+          compression.type: producer
+    # Replication factor for the four topics. Capped at `kafka.replicas`.
+    replicationFactor: 3
+
+# ---------------------------------------------------------------------------
+# Postgres — §3: "separate clusters for identity/policy"
+#
+# The services carry embedded migrations and run them at startup, so this
+# provisions DATABASES and CREDENTIALS, never schemas. The one exception is
+# the citext extension: user-service's 0001_identity.sql does
+# `CREATE EXTENSION IF NOT EXISTS citext`, which needs superuser rights the
+# app role should not need to hold, so the initdb hook creates it first and
+# the service's statement becomes a no-op.
+#
+# SCHEMA PLACEMENT (see README for the reasoning):
+#   identity instance -> identity, billing
+#   policy   instance -> policy, review
+# ---------------------------------------------------------------------------
+postgres:
+  enabled: true
+  image:
+    repository: postgres
+    tag: "17"
+    pullPolicy: IfNotPresent
+  # Defaults inherited by every instance; each instance may override.
+  defaults:
+    username: dabet
+    # Leave empty to have the chart generate one and keep it stable across
+    # upgrades (it reads back the live Secret). Set explicitly in prod, or
+    # point existingSecret at something a secret manager writes.
+    password: ""
+    existingSecret: ""
+    persistence:
+      enabled: true
+      size: 20Gi
+      storageClass: ""
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        memory: 1Gi
+    # Rendered into postgresql.conf via -c flags.
+    parameters:
+      max_connections: "200"
+      shared_buffers: "256MB"
+    nodeSelector: {}
+    tolerations: []
+    podAnnotations: {}
+  instances:
+    identity:
+      enabled: true
+      database: dabet_identity
+      # Documentation only — the chart does not create these; the owning
+      # service's migrations do. Listed so the placement decision is
+      # visible in the values file rather than only in the README.
+      schemas: ["identity", "billing"]
+      consumers: ["user-service", "credits-service", "provider-adapter"]
+    policy:
+      enabled: true
+      database: dabet_policy
+      schemas: ["policy", "review"]
+      consumers: ["policy-service", "review-service"]
+
+# ---------------------------------------------------------------------------
+# Redis — §3: "Redis Cluster, sharded by hash(author_id, content_id)"
+#
+# §4.3 already puts hash tags on every multi-key group (`dup:{ct:sd}`), so
+# the cluster is a deployment change and not a keyspace change. See the
+# README for the ONE app-side change that is still outstanding.
+# ---------------------------------------------------------------------------
+redis:
+  enabled: true
+  image:
+    repository: redis
+    tag: "7.4-alpine"
+    pullPolicy: IfNotPresent
+  cluster:
+    # false => a single standalone node, for laptops. The keyspace is
+    # identical either way; only the client construction differs.
+    enabled: true
+    # Total nodes. masters = replicas / (1 + replicasPerMaster).
+    # 6 nodes / 1 replica each = 3 shards, the smallest cluster Redis will
+    # accept with redundancy.
+    replicas: 6
+    replicasPerMaster: 1
+    # Redis 7 can announce a DNS name instead of a pod IP, so a MOVED
+    # redirect points at a StatefulSet hostname that survives rescheduling.
+    # This is the single most important setting for Redis Cluster on k8s.
+    preferHostnameEndpoints: true
+  port: 6379
+  busPortOffset: 10000
+  # Dedup, rate-limit and embedding buckets are all short-TTL (§4.3), so the
+  # data is reconstructible. AOF is off by default; a cold shard refills in
+  # minutes and fsync costs latency on the moderation hot path.
+  appendonly: false
+  maxmemory: "512mb"
+  maxmemoryPolicy: "allkeys-lru"
+  extraConfig: {}
+  persistence:
+    enabled: true
+    size: 8Gi
+    storageClass: ""
+  resources:
+    requests:
+      cpu: 100m
+      memory: 320Mi
+    limits:
+      memory: 768Mi
+  init:
+    # The `redis-cli --cluster create` job. Idempotent: it checks
+    # cluster_state before doing anything.
+    enabled: true
+    backoffLimit: 10
+    activeDeadlineSeconds: 600
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations: []
+  topologySpreadEnabled: true
+
+# ---------------------------------------------------------------------------
+# Memcached — §3: "managed pool". Policy document cache (§6.8).
+# ---------------------------------------------------------------------------
+memcached:
+  enabled: true
+  image:
+    repository: memcached
+    tag: "1.6-alpine"
+    pullPolicy: IfNotPresent
+  # A pool. MEMCACHED_ADDRS is published as the full list of pod DNS names,
+  # because gomemcache shards client-side over the list — a single ClusterIP
+  # would randomise which node holds a key and destroy the hit rate.
+  replicas: 3
+  port: 11211
+  memoryLimitMB: 256
+  maxConnections: 1024
+  extraArgs: []
+  resources:
+    requests:
+      cpu: 50m
+      memory: 320Mi
+    limits:
+      memory: 384Mi
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations: []
+  topologySpreadEnabled: true
+
+# ---------------------------------------------------------------------------
+# ClickHouse — §3: "Cluster". Tables are §8.7 and are created by
+# clustering-service / clusters-job, not here.
+#
+# THE AUTH TRAP (learned in deploy/compose/docker-compose.yml): the official
+# image's entrypoint disables network access for the `default` user unless
+# CLICKHOUSE_USER *and* CLICKHOUSE_PASSWORD are both set. /ping needs no auth
+# and keeps answering 200, so the pod goes Ready while every client is
+# rejected with AUTHENTICATION_FAILED. Both are therefore always set below,
+# and the readiness probe authenticates instead of using /ping.
+# ---------------------------------------------------------------------------
+clickhouse:
+  enabled: true
+  image:
+    repository: clickhouse/clickhouse-server
+    tag: "24.8"
+    pullPolicy: IfNotPresent
+  auth:
+    username: dabet
+    password: ""            # generated + persisted when empty
+    database: dabet
+    existingSecret: ""
+  # 1 is fine for the small profile; raising it renders a real <remote_servers>
+  # cluster. Replication (ReplicatedMergeTree) additionally needs keeper.
+  replicas: 1
+  clusterName: dabet
+  # shards x replicasPerShard must equal `replicas`; the template validates it.
+  shards: 1
+  replicasPerShard: 1
+  keeper:
+    # ClickHouse Keeper — required only for ReplicatedMergeTree, i.e. when
+    # replicasPerShard > 1. Off for the single-replica profile.
+    enabled: false
+    replicas: 3
+    image:
+      repository: clickhouse/clickhouse-keeper
+      tag: "24.8"
+      pullPolicy: IfNotPresent
+    persistence:
+      enabled: true
+      size: 8Gi
+      storageClass: ""
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        memory: 512Mi
+  ports:
+    http: 8123
+    native: 9000
+    interserver: 9009
+  persistence:
+    enabled: true
+    size: 50Gi
+    storageClass: ""
+  resources:
+    requests:
+      cpu: 250m
+      memory: 1Gi
+    limits:
+      memory: 4Gi
+  # The image wants a high nofile; a StatefulSet cannot set ulimits directly,
+  # so it goes in the config as max_open_files.
+  maxOpenFiles: 262144
+  extraConfig: {}
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations: []
+
+# ---------------------------------------------------------------------------
+# MinIO — S3-compatible object store for the §8.4 embeddings parquet.
+# Disable it and fill external.s3 when the cluster has real S3.
+# ---------------------------------------------------------------------------
+minio:
+  enabled: true
+  image:
+    repository: minio/minio
+    tag: "RELEASE.2024-12-18T13-15-44Z"
+    pullPolicy: IfNotPresent
+  mcImage:
+    repository: minio/mc
+    tag: "RELEASE.2024-11-21T17-21-54Z"
+    pullPolicy: IfNotPresent
+  auth:
+    rootUser: minioadmin
+    rootPassword: ""       # generated + persisted when empty
+    existingSecret: ""
+  # MinIO erasure-coded mode needs >= 4 drives. 1 replica runs the
+  # single-drive filesystem backend, which is right for dev and for a
+  # cluster that only needs S3 semantics rather than S3 durability.
+  replicas: 1
+  ports:
+    api: 9000
+    console: 9001
+  buckets:
+    # §8.4 parquet corpus. Also published as S3_BUCKET.
+    embeddings: embeddings
+    # Milvus's own object store, created only when milvus.enabled.
+    milvus: milvus
+  persistence:
+    enabled: true
+    size: 100Gi
+    storageClass: ""
+  resources:
+    requests:
+      cpu: 100m
+      memory: 512Mi
+    limits:
+      memory: 2Gi
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations: []
+
+# ---------------------------------------------------------------------------
+# Milvus — §3: "Distributed". §8.5: one collection, partitioned by creator,
+# holding CENTROIDS only.
+#
+# DISABLED BY DEFAULT AND OPT-IN, matching the compose `clustering` profile.
+# Distributed Milvus is eight coordinated pods plus etcd plus a message
+# queue; it wants several GB before it does any work. Turn it on only when
+# clustering-service / clusters-job are being deployed.
+# ---------------------------------------------------------------------------
+milvus:
+  enabled: false
+  # "standalone" (one pod, dev) or "distributed" (§3 target).
+  mode: distributed
+  image:
+    repository: milvusdb/milvus
+    tag: "v2.4.15"
+    pullPolicy: IfNotPresent
+  port: 19530
+  metricsPort: 9091
+  # Component replica counts, used in distributed mode only.
+  components:
+    # mixcoord collapses root/data/query/index coordinators into one pod.
+    # Splitting them is supported upstream but buys nothing below very large
+    # scale and quadruples the pod count.
+    mixcoord:
+      replicas: 1
+      resources:
+        requests: {cpu: 100m, memory: 512Mi}
+        limits: {memory: 1Gi}
+    proxy:
+      replicas: 2
+      resources:
+        requests: {cpu: 100m, memory: 512Mi}
+        limits: {memory: 1Gi}
+    querynode:
+      replicas: 2
+      resources:
+        requests: {cpu: 250m, memory: 2Gi}
+        limits: {memory: 4Gi}
+    datanode:
+      replicas: 2
+      resources:
+        requests: {cpu: 100m, memory: 1Gi}
+        limits: {memory: 2Gi}
+    indexnode:
+      replicas: 1
+      resources:
+        requests: {cpu: 250m, memory: 2Gi}
+        limits: {memory: 4Gi}
+  standalone:
+    resources:
+      requests: {cpu: 250m, memory: 2Gi}
+      limits: {memory: 4Gi}
+    persistence:
+      enabled: true
+      size: 20Gi
+      storageClass: ""
+  # Milvus needs a write-ahead message queue. Reusing the Kafka this chart
+  # already runs avoids adding Pulsar (four more pods incl. its own
+  # ZooKeeper). Milvus creates its own `by-dev-*` topics; they do not touch
+  # the §4.2 registry. Set to "pulsar" only if you bring your own.
+  messageQueue: kafka
+  etcd:
+    enabled: true
+    image:
+      repository: quay.io/coreos/etcd
+      tag: "v3.5.16"
+      pullPolicy: IfNotPresent
+    replicas: 3
+    port: 2379
+    peerPort: 2380
+    persistence:
+      enabled: true
+      size: 10Gi
+      storageClass: ""
+    resources:
+      requests: {cpu: 100m, memory: 256Mi}
+      limits: {memory: 1Gi}
+  # Object store. Defaults to this chart's MinIO; point elsewhere for S3.
+  objectStore:
+    bucket: milvus
+    rootPath: files
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations: []
+
+# ---------------------------------------------------------------------------
+# Inference — §3: "vLLM: GPU fleet behind a load balancer" and §8.4's shared
+# embedding service.
+#
+# BOTH DISABLED BY DEFAULT: most clusters have no GPU, and a Deployment
+# requesting nvidia.com/gpu on a cluster without the device plugin sits
+# Pending forever. The mocks below are the substitute and are what makes the
+# platform runnable with no accelerator at all.
+# ---------------------------------------------------------------------------
+vllm:
+  enabled: false
+  image:
+    repository: vllm/vllm-openai
+    tag: "v0.6.4"
+    pullPolicy: IfNotPresent
+  # The fleet. The Service in front is the "load balancer" of §3 — a
+  # ClusterIP is a real L4 balancer across the ready pods; set
+  # service.type: LoadBalancer to expose it outside the cluster.
+  replicas: 2
+  model: "Qwen/Qwen2.5-1.5B-Instruct"
+  # Appended after the built-in --model/--port/--host.
+  extraArgs:
+    - "--max-model-len=8192"
+    - "--gpu-memory-utilization=0.90"
+  port: 8000
+  service:
+    type: ClusterIP
+    annotations: {}
+  gpu:
+    # Resource key. Change for AMD (amd.com/gpu) or a vendor-specific plugin.
+    resourceName: nvidia.com/gpu
+    count: 1
+  # Where the GPU pool lives. Both empty is almost certainly wrong on a real
+  # cluster — GPU nodes are normally tainted.
+  nodeSelector: {}
+  # e.g. [{key: nvidia.com/gpu, operator: Exists, effect: NoSchedule}]
+  tolerations: []
+  affinity: {}
+  resources:
+    requests:
+      cpu: "2"
+      memory: 8Gi
+    limits:
+      memory: 24Gi
+  # Model weights cache. Without it every pod re-downloads on restart.
+  persistence:
+    enabled: true
+    size: 100Gi
+    storageClass: ""
+    mountPath: /root/.cache/huggingface
+  # HF token for gated models; read from a Secret you create out of band.
+  hfTokenSecret: ""
+  # vLLM takes minutes to load weights. The startup probe is what stops the
+  # liveness probe from killing it mid-load.
+  startupProbeFailureThreshold: 120
+  podAnnotations: {}
+  extraEnv: []
+
+embedding:
+  # The §8.4 embedding service, shared between semantic spam (§7.4) and
+  # Insights. ONE deployment, ONE Service — a message is embedded at most
+  # once, so there is exactly one place that does it.
+  enabled: false
+  # "vllm" runs a second vLLM fleet in embedding mode (--task embed);
+  # "tei" runs HuggingFace text-embeddings-inference, which is far cheaper
+  # for a 384-dim sentence-transformer and runs on CPU if need be.
+  backend: tei
+  model: "sentence-transformers/all-MiniLM-L6-v2"
+  dimensions: 384
+  replicas: 2
+  port: 8080
+  service:
+    type: ClusterIP
+    annotations: {}
+  tei:
+    image:
+      repository: ghcr.io/huggingface/text-embeddings-inference
+      # "cpu-latest" for the CPU build. The default is the Turing+ GPU build.
+      tag: "1.5"
+      pullPolicy: IfNotPresent
+    extraArgs: []
+  vllm:
+    image:
+      repository: vllm/vllm-openai
+      tag: "v0.6.4"
+      pullPolicy: IfNotPresent
+    extraArgs: ["--task=embed"]
+  gpu:
+    # 0 => CPU only, which a 384-dim MiniLM handles perfectly well.
+    resourceName: nvidia.com/gpu
+    count: 1
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  resources:
+    requests:
+      cpu: "1"
+      memory: 2Gi
+    limits:
+      memory: 8Gi
+  persistence:
+    enabled: true
+    size: 20Gi
+    storageClass: ""
+    mountPath: /data
+  startupProbeFailureThreshold: 60
+  podAnnotations: {}
+  extraEnv: []
+
+# ---------------------------------------------------------------------------
+# Mocks — the deterministic stand-ins from tools/. They are what lets the
+# whole platform run with no GPU and no third party, and they are what the
+# e2e suite already asserts against.
+#
+# These images are built from tools/ and are not published to a registry, so
+# they must be loaded into the cluster first:
+#     make k8s-mock-images            (build)
+#     kind load docker-image ...      (or push to your registry)
+# See README.md §"Mock images".
+# ---------------------------------------------------------------------------
+mocks:
+  llm:
+    # Stands in for vllm. Enabled iff vllm.enabled is false, by default.
+    enabled: true
+    image:
+      repository: dabet/mockllm
+      tag: "dev"
+      pullPolicy: IfNotPresent
+    replicas: 1
+    port: 8089
+    resources:
+      requests: {cpu: 25m, memory: 32Mi}
+      limits: {memory: 128Mi}
+    extraEnv: []
+  embedding:
+    enabled: true
+    image:
+      repository: dabet/mockembed
+      tag: "dev"
+      pullPolicy: IfNotPresent
+    replicas: 1
+    port: 8091
+    resources:
+      requests: {cpu: 25m, memory: 32Mi}
+      limits: {memory: 128Mi}
+    extraEnv: []
