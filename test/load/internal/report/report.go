@@ -66,6 +66,7 @@ type LatencyView struct {
 	P99S             float64 `json:"p99_s_est"`
 	P95LowerS        float64 `json:"p95_bucket_lower_s"`
 	P95UpperS        float64 `json:"p95_bucket_upper_s"`
+	P95Unbounded     bool    `json:"p95_above_last_bucket,omitempty"`
 	FractionUnder1S  float64 `json:"fraction_le_1s"`
 	FractionUnder2S5 float64 `json:"fraction_le_2p5s"`
 }
@@ -82,17 +83,47 @@ func ViewOf(h promx.Histogram) LatencyView {
 		return LatencyView{}
 	}
 	lo, hi := h.Bounds(0.95)
+	// The top bucket is +Inf, which encoding/json refuses. When the
+	// quantile lands there the honest statement is "above the last
+	// finite bound", so that bound is reported and P95Unbounded says
+	// the real value is somewhere above it.
+	unbounded := math.IsInf(hi, 1)
+	if unbounded {
+		hi = lastFiniteBound(h)
+	}
 	return LatencyView{
 		Count:            h.Count,
-		MeanS:            h.Mean(),
-		P50S:             h.Quantile(0.50),
-		P95S:             h.Quantile(0.95),
-		P99S:             h.Quantile(0.99),
-		P95LowerS:        lo,
-		P95UpperS:        hi,
-		FractionUnder1S:  h.FractionAtMost(1),
-		FractionUnder2S5: h.FractionAtMost(2.5),
+		MeanS:            fin(h.Mean()),
+		P50S:             fin(h.Quantile(0.50)),
+		P95S:             fin(h.Quantile(0.95)),
+		P99S:             fin(h.Quantile(0.99)),
+		P95LowerS:        fin(lo),
+		P95UpperS:        fin(hi),
+		P95Unbounded:     unbounded,
+		FractionUnder1S:  fin(h.FractionAtMost(1)),
+		FractionUnder2S5: fin(h.FractionAtMost(2.5)),
 	}
+}
+
+// fin maps NaN and infinities to 0 so the result document stays valid
+// JSON. Every field it guards has a companion (Count, P95Unbounded,
+// E2ELatencyPresent) that says whether the zero means "zero" or "not
+// available", so nothing is silently rounded into a real-looking number.
+func fin(f float64) float64 {
+	if math.IsNaN(f) || math.IsInf(f, 0) {
+		return 0
+	}
+	return f
+}
+
+func lastFiniteBound(h promx.Histogram) float64 {
+	last := 0.0
+	for _, b := range h.Buckets {
+		if !math.IsInf(b.LE, 1) {
+			last = b.LE
+		}
+	}
+	return last
 }
 
 // Moderation is everything read off moderation-service's /metrics as a
@@ -130,9 +161,9 @@ type KafkaView struct {
 	// steady part of the run. Positive and sustained is the §4.7
 	// overload signal: the verdict still arrives, just later and later.
 	LagSlopePerS float64 `json:"lag_slope_per_s"`
-	// PartitionImbalance is max/mean of per-partition end-offset
-	// deltas: 1.0 is perfectly even, higher means the key distribution
-	// concentrated the run on a few partitions.
+	// PartitionImbalance is max/mean of the records THIS run produced
+	// per partition: 1.0 is perfectly even, higher means the key
+	// distribution concentrated the run on a few partitions.
 	PartitionImbalance float64                `json:"partition_imbalance"`
 	BusiestPartitions  []kadmlag.PartitionLag `json:"busiest_partitions,omitempty"`
 }
@@ -288,6 +319,11 @@ func (r *Result) WriteTable(w io.Writer) {
 	p("  arrival at harness          p50 %8.1f  p95 %8.1f  p99 %8.1f  max %8.1f ms",
 		v.ArrivalLatency.P50MS, v.ArrivalLatency.P95MS, v.ArrivalLatency.P99MS, v.ArrivalLatency.MaxMS)
 	p("  fraction under 1.5s %.2f%%", 100*v.FractionUnder1s5)
+	if v.ClockSkewedSamples > 0 {
+		p("  !! %s samples discarded as clock skew: the host clock moved during the run,",
+			num(float64(v.ClockSkewedSamples)))
+		p("     so the latency above describes only the samples that survived. Re-run.")
+	}
 	p("  by detector %s", kvlineI(v.ByDetector))
 
 	k := r.Kafka
@@ -296,7 +332,7 @@ func (r *Result) WriteTable(w io.Writer) {
 	p("  messages.v1 partitions %d   (§4.2 target 512; local compose default 3)", k.MessagesPartitions)
 	p("  lag  peak %s   final %s   slope %+.1f msg/s over the run", num(float64(k.PeakLag)),
 		num(float64(k.FinalLag)), k.LagSlopePerS)
-	p("  partition imbalance (max/mean produced) %.2fx", k.PartitionImbalance)
+	p("  partition imbalance (max/mean produced by THIS run) %.2fx", k.PartitionImbalance)
 	for _, pl := range k.BusiestPartitions {
 		p("    p%-3d produced %10s  lag %10s", pl.Partition, num(float64(pl.End)), num(float64(pl.Lag)))
 	}

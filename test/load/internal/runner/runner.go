@@ -142,6 +142,10 @@ func (r *Runner) Run(ctx context.Context, sc scenario.Scenario, runID string) (*
 	if sc.TrackPerContent {
 		tailer.TrackPerContent()
 	}
+	// Nothing in this run can legitimately take longer than the profile
+	// plus its drain window plus a generous margin; anything that does
+	// is a clock that moved, not a message that was slow.
+	tailer.SetMaxPlausible(sc.Profile.Duration() + sc.DrainFor + 5*time.Minute)
 	tailCtx, stopTail := context.WithCancel(ctx)
 	var tailWG sync.WaitGroup
 	tailWG.Add(1)
@@ -243,6 +247,17 @@ func (r *Runner) Run(ctx context.Context, sc scenario.Scenario, runID string) (*
 		}()
 	}
 
+	// Per-partition end offsets BEFORE the run. The imbalance figure has
+	// to describe what this run produced, not the cumulative contents of
+	// a topic that previous runs also wrote to.
+	var baseline map[int32]int64
+	if s0, err := lagCl.Sample(ctx, []string{contracts.TopicMessages}, true); err == nil {
+		baseline = make(map[int32]int64, len(s0.Partitions))
+		for _, pl := range s0.Partitions {
+			baseline[pl.Partition] = pl.End
+		}
+	}
+
 	// ---- drive
 	r.logf("driving %s: %s", sc.Name, sc.ProfileName)
 	driver := &sched.Driver{Schedule: schedule, Workers: workers, Granularity: 200 * time.Microsecond}
@@ -306,10 +321,16 @@ func (r *Runner) Run(ctx context.Context, sc scenario.Scenario, runID string) (*
 	}
 	res.Offered.SendLag = sendLag.Summarize()
 
-	r.fillKafka(res, samples)
+	r.fillKafka(res, samples, baseline)
 	r.fillModeration(res, before, after, elapsed+drain)
 	r.fillServices(res, before, after)
 	res.Verdicts = tailer.Result()
+	if n := res.Verdicts.ClockSkewedSamples; n > 0 {
+		res.Note("%d verdicts were discarded as clock skew (measured latency above the plausible "+
+			"bound). The host clock moved during the run; treat this run's latency as unusable.", n)
+		res.Fatal("host clock stable through the run", "0 skewed samples",
+			strconv.FormatInt(n, 10), false)
+	}
 	res.EndedAt = time.Now()
 
 	// Generated category counts, so intent can be compared with the
@@ -390,7 +411,7 @@ func (r *Runner) runSelfBench(ctx context.Context, sc scenario.Scenario, pop gen
 // fillKafka turns the lag samples into the report's broker view,
 // including the least-squares slope that distinguishes "lag, accepted"
 // (§4.7) from "lag growing without bound".
-func (r *Runner) fillKafka(res *report.Result, samples []kadmlag.Sample) {
+func (r *Runner) fillKafka(res *report.Result, samples []kadmlag.Sample, baseline map[int32]int64) {
 	res.Kafka.LagSamples = samples
 	if len(samples) == 0 {
 		return
@@ -410,8 +431,20 @@ func (r *Runner) fillKafka(res *report.Result, samples []kadmlag.Sample) {
 	res.Kafka.LagSlopePerS = slope(samples)
 
 	if len(last.Partitions) > 0 {
-		parts := make([]kadmlag.PartitionLag, len(last.Partitions))
-		copy(parts, last.Partitions)
+		// Per-partition production is reported as THIS run's delta: the
+		// absolute end offset carries every previous run on the same
+		// topic, which would dilute exactly the concentration the
+		// hot-spot scenario is trying to show.
+		parts := make([]kadmlag.PartitionLag, 0, len(last.Partitions))
+		for _, pl := range last.Partitions {
+			if baseline != nil {
+				pl.End -= baseline[pl.Partition]
+				if pl.End < 0 {
+					pl.End = 0
+				}
+			}
+			parts = append(parts, pl)
+		}
 		var sum, max float64
 		for _, p := range parts {
 			sum += float64(p.End)

@@ -58,6 +58,16 @@ type Tailer struct {
 
 	first atomic.Int64 // unix nanos of the first verdict seen
 	last  atomic.Int64
+
+	// maxPlausible bounds a latency sample. Anything above it is not a
+	// slow message, it is a clock that moved: the harness stamps the
+	// intended send time on the host while flagged_at is stamped inside
+	// the container, and an NTP correction or a suspend/resume between
+	// the two turns an 0.6 s message into an 8-hour one. Such samples
+	// are counted separately and kept out of the SLI rather than
+	// silently destroying it.
+	maxPlausible time.Duration
+	skewed       atomic.Int64
 }
 
 // New joins a fresh group at the end of flagged.v1.
@@ -73,14 +83,22 @@ func New(brokers []string, group, prefix string) (*Tailer, error) {
 		return nil, err
 	}
 	return &Tailer{
-		cl:        cl,
-		lat:       hist.New(),
-		arrival:   hist.New(),
-		byDetect:  map[string]int64{},
-		byAction:  map[string]int64{},
-		byContent: map[string]int64{},
-		prefix:    prefix,
+		cl:           cl,
+		lat:          hist.New(),
+		arrival:      hist.New(),
+		byDetect:     map[string]int64{},
+		byAction:     map[string]int64{},
+		byContent:    map[string]int64{},
+		prefix:       prefix,
+		maxPlausible: time.Hour,
 	}, nil
+}
+
+// SetMaxPlausible overrides the clock-skew rejection threshold.
+func (t *Tailer) SetMaxPlausible(d time.Duration) {
+	if d > 0 {
+		t.maxPlausible = d
+	}
 }
 
 // TrackPerContent turns on the per-content verdict tally the sampler
@@ -108,8 +126,13 @@ func (t *Tailer) Run(ctx context.Context) {
 			// intended send time comes back out of the harness-minted
 			// message_id (see gen.MintMessageID).
 			if sent, ok := gen.DecodeIntendedSend(f.MessageID); ok {
-				t.lat.Record(f.FlaggedAt.Sub(sent))
-				t.arrival.Record(now.Sub(sent))
+				sli, arrival := f.FlaggedAt.Sub(sent), now.Sub(sent)
+				if sli > t.maxPlausible || arrival > t.maxPlausible {
+					t.skewed.Add(1)
+				} else {
+					t.lat.Record(sli)
+					t.arrival.Record(arrival)
+				}
 			}
 			t.stamp(now)
 			t.mu.Lock()
@@ -142,6 +165,12 @@ type Result struct {
 	ByAction         map[string]int64 `json:"by_action"`
 	ByContent        map[string]int64 `json:"by_content,omitempty"`
 	VerdictRate      float64          `json:"verdict_rate_per_s"`
+	// ClockSkewedSamples is the number of verdicts whose measured
+	// latency was implausibly large and was therefore excluded. A
+	// non-zero value means the host clock moved during the run and the
+	// SLI here should be read with suspicion, not that messages were
+	// slow.
+	ClockSkewedSamples int64 `json:"clock_skewed_samples,omitempty"`
 }
 
 // Result snapshots what the tailer saw.
@@ -165,16 +194,21 @@ func (t *Tailer) Result() Result {
 	t.mu.Unlock()
 
 	r := Result{
-		Verdicts:         t.count.Load(),
-		SLILatency:       t.lat.Summarize(),
-		ArrivalLatency:   t.arrival.Summarize(),
-		FractionUnder1s5: t.lat.FractionAtMost(1500 * time.Millisecond),
-		ByDetector:       det,
-		ByAction:         act,
-		ByContent:        byContent,
+		Verdicts:           t.count.Load(),
+		SLILatency:         t.lat.Summarize(),
+		ArrivalLatency:     t.arrival.Summarize(),
+		FractionUnder1s5:   t.lat.FractionAtMost(1500 * time.Millisecond),
+		ByDetector:         det,
+		ByAction:           act,
+		ByContent:          byContent,
+		ClockSkewedSamples: t.skewed.Load(),
 	}
+	// first and last come off the same host clock, so a jump between
+	// them would invent a rate too; bound it the same way.
 	if f, l := t.first.Load(), t.last.Load(); f > 0 && l > f {
-		r.VerdictRate = float64(r.Verdicts) / (time.Duration(l - f).Seconds())
+		if span := time.Duration(l - f); span <= t.maxPlausible {
+			r.VerdictRate = float64(r.Verdicts) / span.Seconds()
+		}
 	}
 	return r
 }

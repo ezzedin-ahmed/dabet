@@ -48,10 +48,13 @@ func DefaultEndpoints() Endpoints {
 type PolicyShape struct {
 	RateLimitMessages int      `json:"rate_limit_messages"`
 	RateLimitSeconds  int      `json:"rate_limit_seconds"`
-	Spam              string   `json:"spam"` // off | identical | semantic
+	Spam              string   `json:"spam"` // none | identical | semantic
 	RestrictedWords   []string `json:"restricted_words"`
-	// RestrictedContentAction is auto_delete or review; only
-	// restricted_content may carry review (§6.4).
+	// RestrictedContentAction is the policy API's spelling: "auto" or
+	// "review". Note the divergence from the wire contract — flagged.v1
+	// carries action="auto_delete" (§4.2) while the policy document
+	// carries restricted_content_action="auto" (§6.4). Both are as
+	// implemented; the harness has to speak each in its own place.
 	RestrictedContentAction string `json:"restricted_content_action"`
 	// LLMRuleTitle/Description/Examples become the numbered rubric of
 	// §7.9. Keeping them short keeps the prompt small, which matters
@@ -77,7 +80,7 @@ func DefaultPolicy() PolicyShape {
 		RateLimitSeconds:        10,
 		Spam:                    "identical",
 		RestrictedWords:         []string{"bannedword"},
-		RestrictedContentAction: "auto_delete",
+		RestrictedContentAction: "auto",
 		LLMRuleTitle:            "Ticket scalping",
 		LLMRuleDescription:      "Offers to resell event tickets, or requests to buy them.",
 		LLMRuleExamples:         []string{"selling 2 tickets for tonight DM me", "anyone got a spare ticket"},

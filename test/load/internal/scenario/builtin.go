@@ -220,7 +220,7 @@ func sampler() Scenario {
 	pol := setup.DefaultPolicy()
 	pol.RateLimitMessages = 0
 	pol.RateLimitSeconds = 0
-	pol.Spam = "off"
+	pol.Spam = "none"
 	pol.RestrictedWords = nil
 	return Scenario{
 		Name: "sampler",

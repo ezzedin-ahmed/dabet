@@ -96,7 +96,7 @@ func TestSamplerScenarioPinsTheCoverageTable(t *testing.T) {
 	if s.Population.Mix.LLMFlag != 1.0 {
 		t.Errorf("sampler mix must be entirely LLM-bound, got %+v", s.Population.Mix)
 	}
-	if s.Policy.RateLimitMessages != 0 || s.Policy.Spam != "off" || len(s.Policy.RestrictedWords) != 0 {
+	if s.Policy.RateLimitMessages != 0 || s.Policy.Spam != "none" || len(s.Policy.RestrictedWords) != 0 {
 		t.Error("sampler policy must leave every cheap detector off, or messages never reach stage 8")
 	}
 	if !s.TrackPerContent {
