@@ -1,0 +1,162 @@
+{{/*
+Autoscaling. §4.7: "Consumer lag growing -> Accept the lag. Do not shed, do
+not skip", and "Lag is therefore an availability signal, not just a
+performance one." Lag is the thing to scale on.
+
+Why lag and not CPU. test/load/README.md F3 measured the moderation cascade
+as latency-bound, not CPU-bound: the per-instance ceiling of 170-200 msg/s
+comes from four sequential Redis round trips plus a policy lookup, so an
+instance can be minutes behind while its CPU sits low. A CPU HPA therefore
+under-scales exactly when it matters. kafka_consumer_lag_messages is the
+signal that actually moves.
+
+Two ways to read it:
+
+  KEDA, trigger=kafka (default). The scaler asks the BROKER for the group's
+  committed offsets and high watermarks. No Prometheus in the loop, so the
+  autoscaler keeps working when the monitoring stack is down — which, given
+  P2, is a property worth having. Costs: a KEDA operator, and broker
+  credentials for the scaler (TriggerAuthentication) when the cluster is not
+  PLAINTEXT.
+
+  KEDA, trigger=prometheus. Reads the §4.5 gauge that every consumer now
+  publishes. Cheaper to authorise (no broker credentials) and it scales on
+  exactly the number the alert fires on, so autoscaler and pager agree. But
+  it inherits Prometheus's scrape interval and availability: with
+  KAFKA_LAG_INTERVAL at 15s and a 30s scrape, the signal is up to 45s stale,
+  and if Prometheus is down the autoscaler is blind.
+
+  HPA on CPU (mode: hpa). The fallback for a cluster with no operator. It is
+  a genuinely worse signal for the consumers (see above) and is the right
+  signal for the request-driven services (user-service, policy-service,
+  review-service, clustering-service), which have no consumer lag at all.
+
+THE CEILING. A consumer group cannot usefully exceed its topic's partition
+count: surplus members own nothing. §4.2 sets messages.v1 to 512, so
+moderation-service and insights-service cap at 512; flagged.v1 and
+deletions.v1 at 128; usage.v1 at 32, which is the real cap on
+credits-service however generous its maxReplicas looks. dabet.maxReplicas
+clamps it, so this is enforced and not merely documented.
+*/}}
+{{- $root := . -}}
+{{- range $name, $svc := .Values.services }}
+{{- if $svc.enabled }}
+{{- $mode := include "dabet.autoscalingMode" (dict "root" $root "svc" $svc) }}
+{{- if ne $mode "none" }}
+{{- $fullName := include "dabet.svcName" (dict "root" $root "name" $name) }}
+{{- $as := default (dict) $svc.autoscaling }}
+{{- $min := int (default $svc.replicas $as.minReplicas) }}
+{{- $max := int (include "dabet.maxReplicas" (dict "root" $root "name" $name "svc" $svc)) }}
+{{- if lt $max $min }}
+{{- fail (printf "services.%s: maxReplicas resolves to %d (clamped to the topic's partition count) which is below minReplicas %d. Lower minReplicas, or raise the partition count in kafka.topics." $name $max $min) }}
+{{- end }}
+{{- $consumer := default (dict) $svc.consumer }}
+---
+{{- if eq $mode "keda" }}
+{{- $keda := $root.Values.autoscaling.keda }}
+{{- $topic := include "dabet.consumerTopicName" (dict "root" $root "svc" $svc) }}
+apiVersion: {{ $keda.apiVersion }}
+kind: ScaledObject
+metadata:
+  name: {{ $fullName }}
+  labels:
+    {{- include "dabet.labels" (dict "root" $root "name" $name) | nindent 4 }}
+  annotations:
+    {{/* Without this, deleting the ScaledObject leaves the workload pinned
+         at whatever the autoscaler last set — which after an incident is
+         usually a very large number. Restoring the original count is the
+         safer end state. */}}
+    autoscaling.keda.sh/restore-to-original-replica-count: "true"
+    {{- with $root.Values.global.commonAnnotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: {{ $svc.kind }}
+    name: {{ $fullName }}
+  pollingInterval: {{ $keda.pollingInterval }}
+  cooldownPeriod: {{ $keda.cooldownPeriod }}
+  {{/* NOT zero. A consumer scaled to zero still accrues lag with nothing
+       draining it, and §4.7 forbids shedding. The floor is the service's
+       own minReplicas. */}}
+  minReplicaCount: {{ default $min $keda.minReplicaCountOverride }}
+  maxReplicaCount: {{ $max }}
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        {{- toYaml $root.Values.autoscaling.behavior | nindent 8 }}
+  triggers:
+    {{- if eq $keda.trigger "kafka" }}
+    - type: kafka
+      metadata:
+        bootstrapServers: {{ default $root.Values.config.kafkaBrokers $keda.kafka.bootstrapServers | quote }}
+        consumerGroup: {{ $consumer.group | quote }}
+        topic: {{ $topic | quote }}
+        lagThreshold: {{ $keda.kafka.lagThreshold | quote }}
+        activationLagThreshold: {{ $keda.kafka.activationLagThreshold | quote }}
+        offsetResetPolicy: {{ $keda.kafka.offsetResetPolicy | quote }}
+        allowIdleConsumers: {{ $keda.kafka.allowIdleConsumers | quote }}
+        {{- with $keda.kafka.sasl }}
+        sasl: {{ . | quote }}
+        {{- end }}
+        tls: {{ $keda.kafka.tls | quote }}
+      {{- with $keda.kafka.triggerAuthenticationRef }}
+      authenticationRef:
+        name: {{ . }}
+      {{- end }}
+    {{- else if eq $keda.trigger "prometheus" }}
+    - type: prometheus
+      metadata:
+        serverAddress: {{ required "autoscaling.keda.prometheus.serverAddress is required when trigger=prometheus" $keda.prometheus.serverAddress | quote }}
+        {{/* §4.5's kafka_consumer_lag_messages, summed over the group's
+             partitions. __GROUP__/__TOPIC__ are substituted here. */}}
+        query: {{ $keda.prometheus.query | replace "__GROUP__" $consumer.group | replace "__TOPIC__" $topic | quote }}
+        threshold: {{ $keda.prometheus.threshold | quote }}
+        activationThreshold: {{ $keda.prometheus.activationThreshold | quote }}
+    {{- else }}
+    {{- fail (printf "autoscaling.keda.trigger must be kafka or prometheus, got %q" $keda.trigger) }}
+    {{- end }}
+{{- else if eq $mode "hpa" }}
+apiVersion: {{ $root.Values.autoscaling.hpa.apiVersion }}
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ $fullName }}
+  labels:
+    {{- include "dabet.labels" (dict "root" $root "name" $name) | nindent 4 }}
+  {{- with $root.Values.global.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: {{ $svc.kind }}
+    name: {{ $fullName }}
+  minReplicas: {{ $min }}
+  maxReplicas: {{ $max }}
+  metrics:
+    {{- with $root.Values.autoscaling.hpa.targetCPUUtilizationPercentage }}
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ . }}
+    {{- end }}
+    {{- with $root.Values.autoscaling.hpa.targetMemoryUtilizationPercentage }}
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: {{ . }}
+    {{- end }}
+  behavior:
+    {{- toYaml $root.Values.autoscaling.behavior | nindent 4 }}
+{{- else }}
+{{- fail (printf "services.%s.autoscaling.mode / autoscaling.mode must be keda, hpa or none, got %q" $name $mode) }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}

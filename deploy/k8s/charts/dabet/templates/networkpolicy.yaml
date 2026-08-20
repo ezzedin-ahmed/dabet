@@ -1,0 +1,112 @@
+{{- if .Values.networkPolicy.enabled }}
+{{/*
+NetworkPolicies. OFF by default, and that is a considered position rather
+than laziness:
+
+  * On a cluster whose CNI does not enforce policy (kind's default kindnet,
+    for one), these objects apply cleanly and enforce NOTHING. Shipping them
+    on by default would mean every bare install carries security theatre.
+  * On a cluster that does enforce, a default-deny would cut the pods off
+    from dependencies that are outside this release's label scope — managed
+    RDS, MSK, ElastiCache, S3, the vLLM fleet — and the first symptom is
+    every pod failing open at once, i.e. the exact §4.7 outcome this design
+    tries hardest to avoid.
+
+So: turn this on deliberately, in an environment where you can verify it,
+and fill networkPolicy.egressCIDRs with the dependency ranges.
+
+The shape below is: deny nothing outbound unless egressCIDRs is set; allow
+inbound only on :8080 (from the ingress controller and from other Dabet
+pods) and :9090 (from the monitoring namespace). The one genuinely
+sensitive rule is provider-adapter, whose /mock/messages injection endpoint
+must never be reachable from outside the release.
+*/}}
+{{- $root := . -}}
+{{- range $name, $svc := .Values.services }}
+{{- if $svc.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "dabet.svcName" (dict "root" $root "name" $name) }}
+  labels:
+    {{- include "dabet.labels" (dict "root" $root "name" $name) | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "dabet.selectorLabels" (dict "root" $root "name" $name) | nindent 6 }}
+  policyTypes:
+    - Ingress
+    {{- if $root.Values.networkPolicy.egressCIDRs }}
+    - Egress
+    {{- end }}
+  ingress:
+    {{- /* Other Dabet pods: moderation -> policy (gRPC 7101) and ->
+           credits (/internal/v1/credits-ok), insights -> clustering
+           (/internal/v1/assign). All in-release, so one rule covers them. */}}
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: {{ include "dabet.name" $root }}
+              app.kubernetes.io/instance: {{ $root.Release.Name }}
+      ports:
+        - port: http
+          protocol: TCP
+        {{- range $svc.ports.extra }}
+        - port: {{ .name }}
+          protocol: {{ default "TCP" .protocol }}
+        {{- end }}
+    {{- /* The scrape. §4.5 metrics are on a separate listener, so this is a
+           separate rule and does not open the application port. */}}
+    - from:
+        {{- if $root.Values.networkPolicy.monitoringNamespaceSelector }}
+        - namespaceSelector:
+            {{- toYaml $root.Values.networkPolicy.monitoringNamespaceSelector | nindent 12 }}
+        {{- else }}
+        - namespaceSelector: {}
+        {{- end }}
+      ports:
+        - port: metrics
+          protocol: TCP
+    {{- if and (default (dict) $svc.ingress).enabled $root.Values.ingress.enabled }}
+    {{- /* Only services with a public API accept traffic from the ingress
+           controller. provider-adapter, moderation-service and
+           clustering-service are absent from this branch on purpose. */}}
+    - from:
+        {{- if $root.Values.networkPolicy.ingressNamespaceSelector }}
+        - namespaceSelector:
+            {{- toYaml $root.Values.networkPolicy.ingressNamespaceSelector | nindent 12 }}
+        {{- else }}
+        - namespaceSelector: {}
+        {{- end }}
+      ports:
+        - port: http
+          protocol: TCP
+    {{- end }}
+  {{- if $root.Values.networkPolicy.egressCIDRs }}
+  egress:
+    {{- if $root.Values.networkPolicy.allowDNS }}
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    {{- end }}
+    {{- /* In-release traffic: moderation -> policy/credits, insights ->
+           clustering. */}}
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: {{ include "dabet.name" $root }}
+              app.kubernetes.io/instance: {{ $root.Release.Name }}
+    - to:
+        {{- range $root.Values.networkPolicy.egressCIDRs }}
+        - ipBlock:
+            cidr: {{ . | quote }}
+        {{- end }}
+  {{- end }}
+{{- end }}
+{{- end }}
+{{- end }}

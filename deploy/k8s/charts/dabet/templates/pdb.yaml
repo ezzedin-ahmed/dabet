@@ -1,0 +1,43 @@
+{{- if .Values.podDisruptionBudget.enabled }}
+{{/*
+PodDisruptionBudgets bound VOLUNTARY disruption — node drains, cluster
+upgrades, karpenter consolidation. They are what stops a node rotation from
+taking every moderation replica at once, which per §4.7 would not stop chat
+(the pipeline fails open) but would build lag that takes minutes to drain.
+
+maxUnavailable rather than minAvailable, deliberately. minAvailable on a
+single-replica workload (clusters-job) makes its node undrainable forever,
+which turns a routine upgrade into a manual intervention.
+
+Single-replica workloads get no PDB at all: `maxUnavailable: 1` on one
+replica is a no-op that only adds an object, and anything stricter blocks
+drains. clusters-job is intentionally one replica (no leader election), so
+its disruption story is "it restarts and resumes its sweep", not a PDB.
+*/}}
+{{- $root := . -}}
+{{- range $name, $svc := .Values.services }}
+{{- if $svc.enabled }}
+{{- $mode := include "dabet.autoscalingMode" (dict "root" $root "svc" $svc) }}
+{{- $as := default (dict) $svc.autoscaling }}
+{{- $floor := int (default $svc.replicas $as.minReplicas) }}
+{{- if gt $floor 1 }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "dabet.svcName" (dict "root" $root "name" $name) }}
+  labels:
+    {{- include "dabet.labels" (dict "root" $root "name" $name) | nindent 4 }}
+spec:
+  {{- if $root.Values.podDisruptionBudget.minAvailable }}
+  minAvailable: {{ $root.Values.podDisruptionBudget.minAvailable }}
+  {{- else }}
+  maxUnavailable: {{ $root.Values.podDisruptionBudget.maxUnavailable }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "dabet.selectorLabels" (dict "root" $root "name" $name) | nindent 6 }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}

@@ -1,0 +1,98 @@
+{{- if .Values.ingress.enabled }}
+{{/*
+One Ingress carrying only the routes that are genuinely public, path by path.
+
+WHY PATH BY PATH AND NOT A CATCH-ALL PER SERVICE. Two of the nine expose an
+internal route on the same listener as their public one, and a `/` rule would
+publish it:
+
+  credits-service   /internal/v1/credits-ok/{creator_id} is the §5.8 check
+                    moderation-service makes in-cluster. Public, it is an
+                    unauthenticated oracle for any creator's credit state.
+  clustering-service /internal/v1/assign takes an embedding and writes topic
+                    assignments, with no auth at all (service-to-service).
+
+And three must have no Ingress whatsoever:
+
+  moderation-service  registers nothing beyond /healthz and /readyz.
+  provider-adapter    registers POST /mock/messages and GET /mock/deletions
+                      UNCONDITIONALLY — an unauthenticated injection surface
+                      that would let anyone push chat messages into any
+                      creator's moderation pipeline.
+  clustering-service  see above.
+
+PATH PRECEDENCE. insights-service serves GET /v1/topics* and clusters-job
+serves POST /v1/topics/recluster. The recluster rule is pathType: Exact so
+it out-ranks the insights Prefix rule under the Ingress spec's matching
+rules ("Exact" wins over "Prefix" of the same length, and longest-prefix
+wins otherwise). ingress-nginx and the AWS LB controller both implement it;
+verify on any other controller, or split the two onto separate hosts.
+*/}}
+{{- $root := . -}}
+{{- $rules := list -}}
+{{- range $name, $svc := .Values.services }}
+{{- if and $svc.enabled (default (dict) $svc.ingress).enabled }}
+{{- range (default (list) $svc.ingress.paths) }}
+{{- $rules = append $rules (dict "path" .path "pathType" .pathType "service" (include "dabet.svcName" (dict "root" $root "name" $name)) "port" $svc.ports.http) }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- if not $rules }}
+{{- fail "ingress.enabled is true but no service has ingress.enabled with any paths." }}
+{{- end }}
+{{- $hosts := concat (list .Values.ingress.host) .Values.ingress.extraHosts -}}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "dabet.fullname" . }}
+  labels:
+    {{- include "dabet.labels" (dict "root" .) | nindent 4 }}
+  {{- $ann := merge (dict) .Values.ingress.annotations .Values.global.commonAnnotations }}
+  {{- with $ann }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .Values.ingress.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  {{- if .Values.ingress.tls.enabled }}
+  tls:
+    - hosts:
+        {{- range $hosts }}
+        - {{ . | quote }}
+        {{- end }}
+      secretName: {{ default (printf "%s-tls" (include "dabet.fullname" .)) .Values.ingress.tls.secretName }}
+  {{- end }}
+  rules:
+    {{- range $host := $hosts }}
+    - host: {{ $host | quote }}
+      http:
+        paths:
+          {{- /* Exact rules first so they read in precedence order. The
+                 controller does not depend on ordering, but a human
+                 debugging a 404 does. */}}
+          {{- range $rules }}
+          {{- if eq .pathType "Exact" }}
+          - path: {{ .path }}
+            pathType: Exact
+            backend:
+              service:
+                name: {{ .service }}
+                port:
+                  number: {{ .port }}
+          {{- end }}
+          {{- end }}
+          {{- range $rules }}
+          {{- if ne .pathType "Exact" }}
+          - path: {{ .path }}
+            pathType: {{ .pathType }}
+            backend:
+              service:
+                name: {{ .service }}
+                port:
+                  number: {{ .port }}
+          {{- end }}
+          {{- end }}
+    {{- end }}
+{{- end }}

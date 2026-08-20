@@ -1,0 +1,79 @@
+{{- if .Values.metrics.serviceMonitor.enabled }}
+{{/*
+§4.5: "Prometheus metrics on :9090/metrics". Every image exposes it on a
+SEPARATE listener from the application port, which is why the scrape targets
+the `metrics` port by name rather than the app port with a path.
+
+Guarded on the values flag so the chart installs on a cluster with no
+Prometheus Operator CRDs — rendering a ServiceMonitor there is a hard
+`no matches for kind` failure at install time, not a warning.
+
+kind is switchable: ServiceMonitor selects the ClusterIP Service, PodMonitor
+scrapes pods directly. PodMonitor is the better fit for provider-adapter,
+whose per-pod identity matters (A13 ring membership) — a ServiceMonitor over
+a headless Service works too, but PodMonitor keeps the pod label without
+relabelling.
+
+CARDINALITY. §4.5 forbids message_id / author_id / content_id labels
+anywhere, and permits creator_id only on credits_*. review-service's
+review_queue_lag_seconds carries creator_id by design (§7.6.3 requires
+per-creator lag) — at 10M creators (N5) that is a series count Prometheus
+will not enjoy. metricRelabelings is the place to drop or aggregate it if
+that becomes a problem; the chart does not do it for you because dropping a
+mandated metric should be a deliberate act.
+*/}}
+{{- $root := . -}}
+{{- $sm := .Values.metrics.serviceMonitor -}}
+{{- range $name, $svc := .Values.services }}
+{{- if $svc.enabled }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: {{ $sm.kind }}
+metadata:
+  name: {{ include "dabet.svcName" (dict "root" $root "name" $name) }}
+  labels:
+    {{- include "dabet.labels" (dict "root" $root "name" $name) | nindent 4 }}
+    {{- with $sm.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  {{- if eq $sm.kind "PodMonitor" }}
+  podMetricsEndpoints:
+    - port: metrics
+      path: /metrics
+      interval: {{ $sm.interval }}
+      scrapeTimeout: {{ $sm.scrapeTimeout }}
+      honorLabels: {{ $sm.honorLabels }}
+      {{- with $sm.relabelings }}
+      relabelings:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $sm.metricRelabelings }}
+      metricRelabelings:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  {{- else }}
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: {{ $sm.interval }}
+      scrapeTimeout: {{ $sm.scrapeTimeout }}
+      honorLabels: {{ $sm.honorLabels }}
+      {{- with $sm.relabelings }}
+      relabelings:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $sm.metricRelabelings }}
+      metricRelabelings:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  {{- end }}
+  namespaceSelector:
+    matchNames:
+      - {{ $root.Release.Namespace }}
+  selector:
+    matchLabels:
+      {{- include "dabet.selectorLabels" (dict "root" $root "name" $name) | nindent 6 }}
+{{- end }}
+{{- end }}
+{{- end }}
