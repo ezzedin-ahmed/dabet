@@ -113,8 +113,14 @@ func main() {
 	if addr == "" {
 		addr = ":8089"
 	}
+	// Latency injection is configured entirely by MOCKLLM_* environment
+	// variables and is inert when none are set, so the deterministic
+	// FLAGME behaviour test/e2e depends on is unchanged (see latency.go).
+	inj := newInjector(logger)
+
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/chat/completions", completions)
+	mux.HandleFunc("POST /v1/chat/completions", inj.wrap(completions))
+	mux.HandleFunc("GET /mockllm/stats", inj.stats)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("ok"))
 	})
