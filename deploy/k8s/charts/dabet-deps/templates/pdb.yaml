@@ -1,0 +1,143 @@
+{{- /*
+  ==========================================================================
+  POD DISRUPTION BUDGETS
+
+  These only constrain VOLUNTARY disruption — `kubectl drain`, a node-pool
+  upgrade, a descheduler. They do nothing about a node dying, which is what
+  the replication factors are for.
+
+  Why they matter here specifically: the quorum systems in this chart lose
+  availability at a threshold, not gradually. Draining two of three Kafka
+  brokers takes the KRaft controller quorum below majority and the cluster
+  stops accepting writes; draining two of three Redis masters leaves a
+  third of the 16384 slots uncovered and `cluster_state` goes to `fail`.
+  A node-pool upgrade that drains in parallel does exactly that, and
+  without a PDB the eviction API has no reason to refuse.
+
+  maxUnavailable: 1 rather than minAvailable: N-1, because it stays correct
+  when the replica count changes.
+
+  NOT rendered at 1 replica. A single-replica PDB with maxUnavailable: 1
+  permits the eviction anyway (so it is pointless), and minAvailable: 1
+  would block every drain forever (so it is worse than pointless) — on a
+  single-node kind cluster that turns `kind delete` into a hang.
+  ==========================================================================
+*/ -}}
+{{- $root := . -}}
+
+{{- if and .Values.kafka.enabled (gt (.Values.kafka.replicas | int) 1) }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "dabet-deps.componentName" (dict "root" . "component" "kafka") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dabet-deps.componentLabels" (dict "root" . "component" "kafka") | nindent 4 }}
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      {{- include "dabet-deps.selectorLabels" (dict "root" . "component" "kafka") | nindent 6 }}
+{{- end }}
+
+{{- if and .Values.redis.enabled .Values.redis.cluster.enabled (gt (.Values.redis.cluster.replicas | int) 1) }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "dabet-deps.componentName" (dict "root" . "component" "redis") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dabet-deps.componentLabels" (dict "root" . "component" "redis") | nindent 4 }}
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      {{- include "dabet-deps.selectorLabels" (dict "root" . "component" "redis") | nindent 6 }}
+{{- end }}
+
+{{- if and .Values.clickhouse.enabled (gt (.Values.clickhouse.replicas | int) 1) }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "dabet-deps.componentName" (dict "root" . "component" "clickhouse") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dabet-deps.componentLabels" (dict "root" . "component" "clickhouse") | nindent 4 }}
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      {{- include "dabet-deps.selectorLabels" (dict "root" . "component" "clickhouse") | nindent 6 }}
+{{- end }}
+
+{{- if and .Values.clickhouse.enabled .Values.clickhouse.keeper.enabled (gt (.Values.clickhouse.keeper.replicas | int) 1) }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "dabet-deps.componentName" (dict "root" . "component" "clickhouse-keeper") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dabet-deps.componentLabels" (dict "root" . "component" "clickhouse-keeper") | nindent 4 }}
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      {{- include "dabet-deps.selectorLabels" (dict "root" . "component" "clickhouse-keeper") | nindent 6 }}
+{{- end }}
+
+{{- if and .Values.memcached.enabled (gt (.Values.memcached.replicas | int) 1) }}
+---
+{{/*
+  Memcached holds no durable state, so this is not about data. It is about
+  the §6.8 hit rate: MEMCACHED_ADDRS is a client-sharded list, so every
+  node drained is a fraction of the policy cache cold, and every miss is a
+  policy-service round trip on the moderation path.
+*/ -}}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "dabet-deps.componentName" (dict "root" . "component" "memcached") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dabet-deps.componentLabels" (dict "root" . "component" "memcached") | nindent 4 }}
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      {{- include "dabet-deps.selectorLabels" (dict "root" . "component" "memcached") | nindent 6 }}
+{{- end }}
+
+{{- if and .Values.milvus.enabled .Values.milvus.etcd.enabled (gt (.Values.milvus.etcd.replicas | int) 1) }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "dabet-deps.componentName" (dict "root" . "component" "milvus-etcd") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dabet-deps.componentLabels" (dict "root" . "component" "milvus-etcd") | nindent 4 }}
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      {{- include "dabet-deps.selectorLabels" (dict "root" . "component" "milvus-etcd") | nindent 6 }}
+{{- end }}
+
+{{- if and .Values.minio.enabled (gt (.Values.minio.replicas | int) 1) }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "dabet-deps.componentName" (dict "root" . "component" "minio") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dabet-deps.componentLabels" (dict "root" . "component" "minio") | nindent 4 }}
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      {{- include "dabet-deps.selectorLabels" (dict "root" . "component" "minio") | nindent 6 }}
+{{- end }}

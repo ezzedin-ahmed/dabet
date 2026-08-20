@@ -401,6 +401,16 @@ running Postgres — whose PGDATA still has the old one — unreachable. The
 side effect is that `helm template` output is not byte-stable, since `lookup()`
 returns nothing outside a live cluster.
 
+**PodDisruptionBudgets are about quorum, not durability.** Kafka, Redis
+Cluster, ClickHouse Keeper and Milvus's etcd all lose availability at a
+threshold rather than gradually: drain two of three Kafka brokers and the KRaft
+controller quorum drops below majority; drain two of three Redis masters and a
+third of the slots go uncovered. A parallel node-pool drain does exactly that,
+and without a PDB the eviction API has no reason to refuse. They are not
+rendered at one replica, where `maxUnavailable: 1` is a no-op and
+`minAvailable: 1` would block every drain forever — which on a single-node kind
+cluster turns `kind delete` into a hang.
+
 **Redis needs a PVC even though its data is disposable.** Everything in §4.3 has
 a 5-minute TTL and is reconstructible. The PVC is for `nodes.conf`: a cluster
 node that loses it loses its identity and its slot ownership, and rejoining is a
