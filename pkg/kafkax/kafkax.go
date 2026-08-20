@@ -26,6 +26,28 @@
 // anywhere in the hot path. Concurrency here is across partitions only and
 // cannot break it.
 //
+// # Per-key concurrency (opt-in)
+//
+// Serialising a whole partition is far coarser than §7.3 requires: the
+// sentence above names the (sender, content) pair, which is the record
+// key, and one partition carries thousands of unrelated keys. Setting
+// KAFKA_CONSUMER_KEY_CONCURRENCY (default 1) above 1 fans each partition
+// out to N workers and routes every record to worker
+// stableHash(record.Key) % N. A key is therefore still handled by exactly
+// one worker of one member, one record at a time, in offset order —
+// §7.3 verbatim — while unrelated keys run in parallel. Records with an
+// empty or nil key all route to worker 0, so their relative order is
+// preserved too.
+//
+// With the knob unset the consumer runs the same one-goroutine-per-
+// partition code it always has, including its per-record commit marks.
+//
+// KAFKA_CONSUMER_PARTITION_CONCURRENCY is unchanged and composes with it:
+// the former is a per-partition fan-out width, the latter the
+// instance-wide ceiling on concurrent handler invocations, and effective
+// parallelism is the smaller. PARTITION_CONCURRENCY=1 forces key
+// concurrency back to 1, so "make this instance serial" still means it.
+//
 // # Commit granularity
 //
 // Offsets are committed per partition as that partition makes progress:
@@ -36,6 +58,15 @@
 // kafka_consumer_lag_messages moves smoothly instead of in fetch-sized
 // jumps. What has never changed is the invariant underneath: a commit can
 // only ever include records whose handler returned nil.
+//
+// Under per-key concurrency a partition's records finish out of order, so
+// the committed offset is the partition's *low-water mark*: offset n is
+// only committed once every record dispatched before n has returned nil. A
+// record that is still running, or that failed, holds the mark behind it
+// however many later records have finished. At-least-once is therefore
+// exactly what it was — a crash re-delivers from the mark, and the
+// finished-but-uncommitted records above it are replayed against the
+// idempotent effects of §7.8.
 //
 // # Lag
 //

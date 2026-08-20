@@ -97,12 +97,17 @@ func discardLogger() *slog.Logger {
 func testConfig(opts ...Option) ConsumerConfig {
 	cfg := ConsumerConfig{
 		PartitionConcurrency: DefaultPartitionConcurrency,
-		QueueDepth:           DefaultQueueDepth,
-		MaxPollRecords:       DefaultMaxPollRecords,
-		DrainTimeout:         5 * time.Second,
-		CommitInterval:       time.Hour, // count-triggered unless a test says otherwise
-		CommitRecords:        0,
-		Logger:               discardLogger(),
+		// Mirrors DefaultConsumerConfig: key concurrency off, and the real
+		// per-key queue depth so a test that switches it on gets the
+		// production in-flight window rather than a window of one.
+		KeyConcurrency: DefaultKeyConcurrency,
+		KeyQueueDepth:  DefaultKeyQueueDepth,
+		QueueDepth:     DefaultQueueDepth,
+		MaxPollRecords: DefaultMaxPollRecords,
+		DrainTimeout:   5 * time.Second,
+		CommitInterval: time.Hour, // count-triggered unless a test says otherwise
+		CommitRecords:  0,
+		Logger:         discardLogger(),
 	}
 	for _, o := range opts {
 		o(&cfg)

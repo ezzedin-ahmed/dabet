@@ -21,6 +21,22 @@ const (
 	// handler invocations, never a reordering. 1 restores the old
 	// serial-per-instance behaviour; 0 means unlimited.
 	EnvConsumerPartitionConcurrency = "KAFKA_CONSUMER_PARTITION_CONCURRENCY"
+	// EnvConsumerKeyConcurrency is how many records of one partition may be
+	// in flight at once, fanned out by record key: a record is routed to
+	// worker stableHash(key) % N, so one key is always handled by one
+	// worker, in offset order, while unrelated keys proceed in parallel.
+	// 1 — the default — is the historical one-goroutine-per-partition
+	// consumer and changes nothing at all.
+	//
+	// This is the throughput knob. Ordering is preserved per record key,
+	// which for messages.v1 is exactly the (sender, content) pair §7.3
+	// names; see keyed.go for why that keeps the guarantee verbatim.
+	EnvConsumerKeyConcurrency = "KAFKA_CONSUMER_KEY_CONCURRENCY"
+	// EnvConsumerKeyQueueDepth is how many records may queue in front of
+	// one per-key worker. It also sets the partition's in-flight ceiling
+	// (KeyConcurrency × KeyQueueDepth records), which is what stops a slow
+	// key growing the uncommitted window without limit.
+	EnvConsumerKeyQueueDepth = "KAFKA_CONSUMER_KEY_QUEUE_DEPTH"
 	// EnvConsumerQueueDepth is how many polled batches may sit queued in
 	// front of one partition worker before the poll loop waits for it.
 	// Bounds memory; a partition can never queue more than this.
@@ -50,19 +66,30 @@ const (
 // regardless of these values.
 const (
 	DefaultPartitionConcurrency = 64
-	DefaultQueueDepth           = 2
-	DefaultMaxPollRecords       = 1000
-	DefaultDrainTimeout         = 30 * time.Second
-	DefaultCommitInterval       = time.Second
-	DefaultCommitRecords        = 1000
-	DefaultLagInterval          = 15 * time.Second
-	DefaultLagTimeout           = 5 * time.Second
+	// DefaultKeyConcurrency is 1 on purpose: per-key concurrency is opt-in,
+	// so an unconfigured deployment behaves exactly as it did before this
+	// feature existed. Set KAFKA_CONSUMER_KEY_CONCURRENCY to turn it on.
+	DefaultKeyConcurrency = 1
+	DefaultKeyQueueDepth  = 64
+	DefaultQueueDepth     = 2
+	DefaultMaxPollRecords = 1000
+	DefaultDrainTimeout   = 30 * time.Second
+	DefaultCommitInterval = time.Second
+	DefaultCommitRecords  = 1000
+	DefaultLagInterval    = 15 * time.Second
+	DefaultLagTimeout     = 5 * time.Second
 )
 
 // MinCommitInterval is the shortest commit interval franz-go accepts;
 // anything below it is clamped. Finer granularity than this comes from
 // CommitRecords, which costs no extra timer.
 const MinCommitInterval = 100 * time.Millisecond
+
+// MaxKeyConcurrency caps the per-partition fan-out. A member owning many
+// partitions multiplies this number by its assignment, so a fat-fingered
+// value is clamped rather than turned into a few hundred thousand
+// goroutines and their queues.
+const MaxKeyConcurrency = 1024
 
 // ConsumerConfig carries the consumer's tunables. Build one with
 // DefaultConsumerConfig (which reads the environment) and adjust it with
@@ -71,6 +98,24 @@ type ConsumerConfig struct {
 	// PartitionConcurrency caps concurrent handler invocations across all
 	// partitions this instance owns. 0 is unlimited, 1 is serial.
 	PartitionConcurrency int
+	// KeyConcurrency is how many per-key workers each partition fans out
+	// to. 1 (the default) is the historical serial-per-partition
+	// consumer. Above 1, records are routed by stableHash(record.Key), so
+	// ordering is preserved per key rather than per partition and offsets
+	// are committed at the contiguous completed prefix.
+	//
+	// It composes with PartitionConcurrency rather than replacing it:
+	// KeyConcurrency is the per-partition fan-out width, PartitionConcurrency
+	// is the instance-wide ceiling on concurrent handler invocations, and
+	// the effective parallelism is the smaller of the two. Setting
+	// PartitionConcurrency to 1 forces KeyConcurrency back to 1, since a
+	// strictly serial instance cannot use a fan-out and would pay for the
+	// out-of-order bookkeeping for nothing.
+	KeyConcurrency int
+	// KeyQueueDepth bounds one per-key worker's queue, and with
+	// KeyConcurrency bounds a partition's in-flight (uncommitted) window at
+	// KeyConcurrency × KeyQueueDepth records. Minimum 1.
+	KeyQueueDepth int
 	// QueueDepth is the per-partition batch queue depth (minimum 1).
 	QueueDepth int
 	// MaxPollRecords caps records returned by one poll (minimum 1).
@@ -117,6 +162,8 @@ type Option func(*ConsumerConfig)
 func DefaultConsumerConfig() (ConsumerConfig, error) {
 	cfg := ConsumerConfig{
 		PartitionConcurrency: DefaultPartitionConcurrency,
+		KeyConcurrency:       DefaultKeyConcurrency,
+		KeyQueueDepth:        DefaultKeyQueueDepth,
 		QueueDepth:           DefaultQueueDepth,
 		MaxPollRecords:       DefaultMaxPollRecords,
 		DrainTimeout:         DefaultDrainTimeout,
@@ -128,6 +175,12 @@ func DefaultConsumerConfig() (ConsumerConfig, error) {
 	}
 	var err error
 	if cfg.PartitionConcurrency, err = config.GetInt(EnvConsumerPartitionConcurrency, cfg.PartitionConcurrency); err != nil {
+		return cfg, err
+	}
+	if cfg.KeyConcurrency, err = config.GetInt(EnvConsumerKeyConcurrency, cfg.KeyConcurrency); err != nil {
+		return cfg, err
+	}
+	if cfg.KeyQueueDepth, err = config.GetInt(EnvConsumerKeyQueueDepth, cfg.KeyQueueDepth); err != nil {
 		return cfg, err
 	}
 	if cfg.QueueDepth, err = config.GetInt(EnvConsumerQueueDepth, cfg.QueueDepth); err != nil {
@@ -161,6 +214,22 @@ func DefaultConsumerConfig() (ConsumerConfig, error) {
 func (c *ConsumerConfig) normalise() {
 	if c.PartitionConcurrency < 0 {
 		c.PartitionConcurrency = 0
+	}
+	if c.KeyConcurrency < 1 {
+		c.KeyConcurrency = 1
+	}
+	if c.KeyConcurrency > MaxKeyConcurrency {
+		c.KeyConcurrency = MaxKeyConcurrency
+	}
+	if c.PartitionConcurrency == 1 {
+		// A fan-out behind a ceiling of one handler is strictly serial
+		// anyway: it would buy no throughput and would only trade
+		// per-record commits for low-water-mark commits. The explicit
+		// "make this instance serial" knob wins.
+		c.KeyConcurrency = 1
+	}
+	if c.KeyQueueDepth < 1 {
+		c.KeyQueueDepth = 1
 	}
 	if c.QueueDepth < 1 {
 		c.QueueDepth = 1
@@ -200,6 +269,17 @@ func (c *ConsumerConfig) normalise() {
 func WithPartitionConcurrency(n int) Option {
 	return func(c *ConsumerConfig) { c.PartitionConcurrency = n }
 }
+
+// WithKeyConcurrency sets the per-partition per-key fan-out. 1 (the
+// default) is the historical serial-per-partition consumer; above 1,
+// records are routed by record key so unrelated keys run in parallel while
+// each key stays strictly in offset order. Clamped to MaxKeyConcurrency,
+// and forced back to 1 if PartitionConcurrency is 1.
+func WithKeyConcurrency(n int) Option { return func(c *ConsumerConfig) { c.KeyConcurrency = n } }
+
+// WithKeyQueueDepth bounds one per-key worker's queue, and with it the
+// partition's in-flight window.
+func WithKeyQueueDepth(n int) Option { return func(c *ConsumerConfig) { c.KeyQueueDepth = n } }
 
 // WithQueueDepth sets how many polled batches may queue per partition.
 func WithQueueDepth(n int) Option { return func(c *ConsumerConfig) { c.QueueDepth = n } }
