@@ -15,7 +15,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/redis/go-redis/v9"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
@@ -182,13 +181,23 @@ func run(svc *service.Service) error {
 	// fail open; nothing blocks startup. The shared breaker inside the
 	// pipeline turns a sustained outage into "skip the stage" rather than
 	// "pay the failure latency again" (§4.7, and see mod.Breaker).
-	rdb := redis.NewClient(&redis.Options{
-		Addr:         config.GetDefault(config.EnvRedisAddr, "localhost:6379"),
-		DialTimeout:  redisTimeout,
-		ReadTimeout:  redisTimeout,
-		WriteTimeout: redisTimeout,
-		MaxRetries:   redisMaxRetries,
-	})
+	//
+	// Single node locally, ElastiCache in cluster mode when
+	// REDIS_CLUSTER_ENABLED says so or REDIS_ADDR lists more than one
+	// endpoint — §3's sharded row. §4.3's hash tags already put every key
+	// of a (content, author) pair in one slot, and every Lua script here
+	// touches exactly one key, so the cluster client needs nothing else.
+	redisCfg, err := mod.DefaultRedisConfig(
+		config.GetDefault(config.EnvRedisAddr, "localhost:6379"), redisTimeout, redisMaxRetries)
+	if err != nil {
+		return err
+	}
+	rdb, err := mod.NewRedisClient(redisCfg)
+	if err != nil {
+		return err
+	}
+	defer rdb.Close()
+	log.Info("redis configured", "redis", redisCfg)
 	state := mod.NewRedisState(rdb)
 
 	// Policy gRPC client + in-process LRU (§6.8).
