@@ -46,8 +46,15 @@ type partitionWorker struct {
 	quitOnce sync.Once
 	// next is the offset this worker will process next: the first offset
 	// it has seen until it completes a record, then last processed + 1.
-	// Read by the lag sampler; -1 means "nothing seen yet".
+	// Read by the lag sampler; -1 means "nothing seen yet". Used by the
+	// serial path only — see track.
 	next atomic.Int64
+	// track is the partition's low-water-mark tracker, present only on the
+	// key-concurrent path. When it is set it, not next, is the partition's
+	// read position: records complete out of order there, so "the offset
+	// the partition would resume from" is the contiguous completed prefix
+	// and nothing else.
+	track atomic.Pointer[offsetTracker]
 }
 
 func (w *partitionWorker) stop() { w.quitOnce.Do(func() { close(w.quit) }) }
@@ -108,6 +115,11 @@ func newDispatcher(ctx context.Context, cl groupClient, h Handler, group string,
 	}
 	return d
 }
+
+// keyed reports whether this run routes records to per-key sub-workers
+// within each partition. False — the default — is the historical
+// one-goroutine-per-partition consumer, byte for byte.
+func (d *dispatcher) keyed() bool { return d.cfg.KeyConcurrency > 1 }
 
 // fail records the first handler error and stops the run. Nothing at or
 // past the failed record is ever marked, so the offset does not advance
@@ -215,6 +227,13 @@ func (d *dispatcher) dispatch(fetches kgo.Fetches) {
 // and the offset marked only after the handler has returned nil.
 func (d *dispatcher) runWorker(w *partitionWorker) {
 	defer close(w.done)
+	if d.keyed() {
+		// Same contract, finer ordering unit: see keyed.go. The serial loop
+		// below is left exactly as it was so that the default configuration
+		// runs the code it has always run.
+		d.runKeyedWorker(w)
+		return
+	}
 	for {
 		select {
 		case <-w.quit:
@@ -320,7 +339,13 @@ func (d *dispatcher) positions() map[topicPartition]int64 {
 	defer d.mu.Unlock()
 	out := make(map[topicPartition]int64, len(d.workers))
 	for tp, w := range d.workers {
-		if next := w.next.Load(); next >= 0 {
+		next := w.next.Load()
+		if tr := w.track.Load(); tr != nil {
+			// Key-concurrent partition: the true resume position is the
+			// low-water mark, not "the highest offset someone finished".
+			next = tr.mark()
+		}
+		if next >= 0 {
 			out[tp] = next
 		}
 	}
