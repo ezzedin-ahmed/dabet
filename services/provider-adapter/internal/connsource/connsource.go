@@ -1,13 +1,12 @@
 // Package connsource tells the adapter which connections this instance is
 // responsible for watching.
 //
-// Deferred (A13): the production mechanism is consistent hashing over a
-// coordinator — each active connection is a work item hashed onto a ring of
-// adapter instances (etcd or Kafka group membership), ~5 000 connections
-// per instance, with only the affected ring segment reconnecting on
-// membership change. That coordinator implements this same Source
-// interface; v1 ships the single-instance Static source below and the
-// ingest manager never learns the difference.
+// A13 (multi-instance sharding) lands in internal/shard, exactly where
+// this comment always said it would: shard.Filter wraps any Source here
+// and yields only the connections this instance's ring segment owns, so
+// the ingest manager still sees a Source and never learns the difference.
+// It is off by default (ADAPTER_SHARDING_ENABLED); with it off the
+// sources below behave as they always have.
 package connsource
 
 import (
