@@ -144,6 +144,90 @@ kafka:
   # so a single-node kind cluster is not wedged by it.
   topologySpreadEnabled: true
 
+  # ---- the admin client (topic + ACL reconcilers) --------------------------
+  #
+  # Both reconciler Jobs run against WHATEVER BROKER THE CONNECTION CONTRACT
+  # POINTS AT — `external.kafka.brokers` when set, the in-cluster StatefulSet
+  # otherwise. Neither is gated on `kafka.enabled`: a managed broker (MSK,
+  # Confluent) still needs its topics created, and MSK ships with
+  # `auto.create.topics.enable=false`, so a chart that only reconciled its own
+  # brokers left an AWS deployment with no topics at all.
+  admin:
+    # Escape hatch for a broker that publishes a separate admin listener.
+    # Empty means "the same address the services use", which is what keeps
+    # the reconciler from ever managing a different cluster from the one in
+    # use.
+    bootstrapOverride: ""
+
+    # Merged OVER kafka.image, so `{}` means "the same Kafka distribution the
+    # brokers run". The scripts use kafka-topics.sh, kafka-configs.sh and
+    # kafka-acls.sh out of /opt/kafka/bin.
+    image: {}
+
+    # ---- broker security ----------------------------------------------------
+    # The names mirror pkg/kafkax/security.go so a value that works for the
+    # services works here: KAFKA_TLS_ENABLED, KAFKA_TLS_CA_FILE,
+    # KAFKA_TLS_SKIP_VERIFY, KAFKA_SASL_MECHANISM, KAFKA_SASL_USERNAME,
+    # KAFKA_SASL_PASSWORD.
+    #
+    # THE CREDENTIAL IS NEVER A VALUE. There is no `password:` key here and
+    # there is no way to add one: the username and password reach the Job as
+    # a secretKeyRef against an EXISTING Secret, and the entrypoint turns
+    # them into a client.properties inside a memory-backed emptyDir. Nothing
+    # secret is baked into the image, into a ConfigMap, or into the rendered
+    # manifest.
+    auth:
+      tls:
+        enabled: false
+        # Turns off HOSTNAME verification only (the JVM's
+        # ssl.endpoint.identification.algorithm knob). A self-signed broker
+        # still needs its CA below. Never for production.
+        skipVerify: false
+        # A PEM bundle mounted from a Secret, for a private CA. MSK brokers
+        # present a publicly trusted certificate, so on AWS this stays empty.
+        caSecret:
+          name: ""
+          key: ca.crt
+      sasl:
+        # "", SCRAM-SHA-512, SCRAM-SHA-256 or PLAIN. AWS_MSK_IAM is NOT
+        # usable here: the Kafka shell tools need aws-msk-iam-auth on the
+        # classpath and this image does not carry it. The script says so and
+        # exits rather than failing in a connect loop.
+        mechanism: ""
+        # The Secret the credential comes from. On the AWS path this is the
+        # ExternalSecret-backed copy of the admin SCRAM secret Terraform
+        # creates (modules/msk, scram_users["<name>-admin"]) — a credential
+        # of its own, NOT one of the service credentials, because it is the
+        # only principal holding CreateTopic and cluster Alter.
+        existingSecret:
+          name: ""
+          usernameKey: KAFKA_SASL_USERNAME
+          passwordKey: KAFKA_SASL_PASSWORD
+
+    # A managed broker is already up but its DNS or its security group may
+    # not be; the in-cluster brokers may still be forming their quorum.
+    waitAttempts: 120
+    waitIntervalSeconds: 5
+
+    # Empty inherits kafka.nodeSelector / kafka.tolerations, which is right
+    # for the self-hosted path and harmlessly unconstrained for the managed
+    # one (where those keys are usually unset anyway).
+    nodeSelector: {}
+    tolerations: []
+
+    podSecurityContext: {}
+    securityContext:
+      allowPrivilegeEscalation: false
+      capabilities:
+        drop: ["ALL"]
+
+    resources:
+      requests:
+        cpu: 50m
+        memory: 256Mi
+      limits:
+        memory: 512Mi
+
   # ---- §4.2 topic registry -------------------------------------------------
   # THE PARTITION COUNTS AND RETENTIONS BELOW ARE THE §4.2 CONTRACT.
   # They are values so that values-local.yaml can shrink them; they must not
@@ -159,6 +243,12 @@ kafka:
     # Job-level knobs.
     backoffLimit: 6
     activeDeadlineSeconds: 900
+    # min.insync.replicas written onto each topic. Null means "use
+    # kafka.minInsyncReplicas", which is right when this chart runs the
+    # brokers. Set it when the broker is external and has its own durability
+    # contract. Capped at the effective topic replication factor either way,
+    # so `acks=all` can never be unsatisfiable.
+    minInsyncReplicas: null
     registry:
       - name: messages.v1
         partitions: 512
@@ -182,8 +272,64 @@ kafka:
         retentionMs: 604800000     # 7 d
         config:
           compression.type: producer
-    # Replication factor for the four topics. Capped at `kafka.replicas`.
+      # ---- §7.2 / A13, not §4.2 -------------------------------------------
+      # provider-adapter's shard ring is a consumer group, and a consumer
+      # group needs something to subscribe to. This topic never carries a
+      # record: membership of the group IS the fleet view.
+      #
+      # The adapter creates it itself on startup (a best-effort CreateTopics
+      # with -1/-1, services/provider-adapter/internal/shard/kafka.go), but
+      # that only works where the principal holds CreateTopic — which under
+      # least-privilege ACLs it does, and under a locked-down cluster it may
+      # not. Creating it here means sharding works either way, and means the
+      # layout is a value rather than whatever the broker defaults happen to
+      # be that week.
+      #
+      # Three partitions because the ring balancer ignores them entirely
+      # (internal/shard/kafka.go: "Partitions are irrelevant to this group's
+      # purpose"); one hour of retention because nothing is ever written.
+      - name: adapter.shards.v1
+        partitions: 3
+        retentionMs: 3600000       # 1 h — the topic holds no records
+        config:
+          compression.type: producer
+    # Replication factor for the topics above. Capped at `kafka.replicas` when
+    # this chart runs the brokers; taken verbatim when the broker is external,
+    # because the chart cannot know how many brokers are out there.
     replicationFactor: 3
+
+  # ---- Kafka ACLs (§1.5 least privilege) ------------------------------------
+  #
+  # OFF by default, because they are only meaningful on a broker that
+  # authenticates its clients, and the in-cluster broker this chart runs does
+  # not. Terraform turns them on for the MSK path and renders `rules` from the
+  # same §1.5 table that produces the IAM policies — see
+  # deploy/terraform/modules/kafka-acls.
+  #
+  # Why a Job rather than Terraform: Kafka ACLs are a Kafka protocol
+  # operation, the AWS provider has no resource for them, and the brokers sit
+  # in subnets with no route to anywhere Terraform runs. The cluster is the
+  # only place with the network path. See templates/kafka/acls-job.yaml.
+  #
+  # Each rule is:
+  #   principal:    "User:dabet-moderation-service" (SCRAM principals are
+  #                 "User:<scram username>")
+  #   resourceType: cluster | topic | group | transactional-id
+  #   resourceName: ignored for `cluster`
+  #   patternType:  literal | prefixed | any
+  #   operations:   Kafka operation names — Read, Write, Describe, Create,
+  #                 Alter, DescribeConfigs, AlterConfigs, IdempotentWrite, ...
+  #
+  # ORDER MATTERS: put the admin principal's own cluster grants first. On a
+  # broker with allow.everyone.if.no.acl.found=true (MSK's default)
+  # authorisation is per-resource — a resource with no ACL is open, a
+  # resource with one ACL is closed to everyone else — so the first Cluster
+  # binding decides who may write bindings at all.
+  acls:
+    enabled: false
+    backoffLimit: 6
+    activeDeadlineSeconds: 600
+    rules: []
 
 # ---------------------------------------------------------------------------
 # Postgres — §3: "separate clusters for identity/policy"

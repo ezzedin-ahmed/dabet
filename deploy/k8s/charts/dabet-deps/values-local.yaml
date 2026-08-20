@@ -71,6 +71,15 @@ kafka:
         retentionMs: 3600000       # 1 h (prod: 7 d)
         config:
           compression.type: producer
+      # §7.2/A13. Carries no records — the consumer group's membership is
+      # the adapter fleet view. Repeated here because Helm REPLACES a list
+      # rather than merging it, so an overlay that redefines `registry`
+      # silently drops anything it does not restate.
+      - name: adapter.shards.v1
+        partitions: 3
+        retentionMs: 3600000       # 1 h
+        config:
+          compression.type: producer
 
 postgres:
   enabled: true

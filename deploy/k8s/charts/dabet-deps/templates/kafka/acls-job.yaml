@@ -1,0 +1,77 @@
+{{- $bootstrap := include "dabet-deps.kafkaAdminBootstrap" . -}}
+{{- if and .Values.kafka.acls.enabled $bootstrap .Values.kafka.acls.rules -}}
+{{- /*
+  ============================================================================
+  KAFKA ACL RECONCILER
+
+  Why this is a Kubernetes Job and not Terraform:
+
+  Kafka ACLs are a Kafka protocol operation, not an AWS API call. The AWS
+  provider has no resource for them; the only Terraform provider that does
+  (Mongey/kafka) speaks the Kafka protocol directly, which means the machine
+  running `tofu apply` must be able to REACH THE BROKERS. MSK brokers live in
+  the isolated data subnets — no internet route in either direction, a
+  security group that takes ingress only from the EKS cluster's security
+  group — so a Terraform run from a laptop or from a CI runner outside the
+  VPC cannot open a socket to them at all. Making it work would mean either
+  putting the brokers somewhere reachable (undoing the network design) or
+  running Terraform inside the VPC (a different, larger decision).
+
+  The cluster is the one place that already has the network path, the
+  credential and a scheduler. So Terraform stays the SOURCE OF TRUTH for the
+  matrix — it renders values.kafka.acls.rules out of the same table that
+  produces the IAM policies — and the cluster is the APPLIER.
+
+  Weight -2 puts this before the topic reconciler (0): when the admin
+  credential's own CreateTopic right is itself an ACL, the grant has to land
+  before the create is attempted.
+  ============================================================================
+*/ -}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "dabet-deps.componentName" (dict "root" . "component" "kafka-acls") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dabet-deps.componentLabels" (dict "root" . "component" "kafka-acls") | nindent 4 }}
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "-2"
+    "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  backoffLimit: {{ .Values.kafka.acls.backoffLimit }}
+  activeDeadlineSeconds: {{ .Values.kafka.acls.activeDeadlineSeconds }}
+  template:
+    metadata:
+      labels:
+        {{- include "dabet-deps.selectorLabels" (dict "root" . "component" "kafka-acls") | nindent 8 }}
+    spec:
+      restartPolicy: OnFailure
+      {{- include "dabet-deps.imagePullSecrets" . | nindent 6 }}
+      {{- include "dabet-deps.scheduling" (dict "root" . "nodeSelector" (.Values.kafka.admin.nodeSelector | default .Values.kafka.nodeSelector) "tolerations" (.Values.kafka.admin.tolerations | default .Values.kafka.tolerations)) | nindent 6 }}
+      {{- with .Values.kafka.admin.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: acls
+          image: {{ include "dabet-deps.kafkaAdminImage" . }}
+          imagePullPolicy: {{ include "dabet-deps.kafkaAdminImagePullPolicy" . }}
+          command: ["/bin/bash", "/spec/acls.sh"]
+          {{- with .Values.kafka.admin.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          env:
+            {{- include "dabet-deps.kafkaAdminEnv" . | nindent 12 }}
+            - name: KAFKA_WAIT_ATTEMPTS
+              value: {{ .Values.kafka.admin.waitAttempts | quote }}
+            - name: KAFKA_WAIT_INTERVAL
+              value: {{ .Values.kafka.admin.waitIntervalSeconds | quote }}
+          volumeMounts:
+            {{- include "dabet-deps.kafkaAdminVolumeMounts" . | nindent 12 }}
+          resources:
+            {{- toYaml .Values.kafka.admin.resources | nindent 12 }}
+      volumes:
+        {{- include "dabet-deps.kafkaAdminVolumes" . | nindent 8 }}
+{{- end }}
