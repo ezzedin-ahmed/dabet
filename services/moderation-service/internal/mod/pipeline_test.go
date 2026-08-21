@@ -338,9 +338,14 @@ func TestSamplerCeilingSkipsLLM(t *testing.T) {
 	if got := testutil.ToFloat64(env.met.SamplerSkipped); got != 2 {
 		t.Fatalf("sampler_skipped = %v, want 2 of 4", got)
 	}
-	// Skipped messages are treated clean.
-	if env.outcome(t, "clean") != 2 {
-		t.Fatalf("clean = %v, want 2 (unsampled)", env.outcome(t, "clean"))
+	// An unsampled message is "skipped", never "clean": no stage judged it
+	// against the policy's restricted_content rules, and counting it clean
+	// would overstate evaluated coverage.
+	if env.outcome(t, "skipped") != 2 {
+		t.Fatalf("skipped = %v, want 2 (unsampled)", env.outcome(t, "skipped"))
+	}
+	if got := env.outcome(t, "clean"); got != 0 {
+		t.Fatalf("clean = %v, want 0 -- unsampled messages must not be counted clean", got)
 	}
 }
 

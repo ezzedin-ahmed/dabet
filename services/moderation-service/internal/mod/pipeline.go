@@ -440,7 +440,11 @@ func (p *Pipeline) Process(ctx context.Context, value []byte) {
 	p.observeStage("sampler", t0)
 	if !sampled {
 		p.met.SamplerSkipped.Inc()
-		p.met.MessagesTotal.WithLabelValues("clean").Inc()
+		// "skipped", not "clean". Nothing judged this message against the
+		// policy's restricted_content rules, so recording it clean would
+		// overstate how much traffic was actually evaluated -- the one
+		// number an operator uses to trust the coverage figures.
+		p.met.MessagesTotal.WithLabelValues("skipped").Inc()
 		return
 	}
 

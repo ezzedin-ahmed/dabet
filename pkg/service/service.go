@@ -8,6 +8,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"net/http/pprof"
 	"os"
 	"os/signal"
 	"syscall"
@@ -97,6 +98,19 @@ func (s *Service) Run(ctx context.Context) error {
 
 	metricsMux := http.NewServeMux()
 	metricsMux.Handle("GET /metrics", promhttp.HandlerFor(s.Registry, promhttp.HandlerOpts{}))
+
+	// Opt-in profiler on the metrics listener, never the application one, so
+	// it is not reachable from an ingress. Off unless DEBUG_PPROF is set:
+	// attributing CPU cost to a function needs a profile, and guessing from
+	// the source is how you end up optimising the wrong thing.
+	if config.GetDefault("DEBUG_PPROF", "") != "" {
+		metricsMux.HandleFunc("/debug/pprof/", pprof.Index)
+		metricsMux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+		metricsMux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+		metricsMux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+		metricsMux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+		s.Logger.Warn("pprof enabled on the metrics listener", "addr", s.metricsAddr)
+	}
 
 	// RequestID first so the trace middleware can put request_id on the
 	// span; Trace outside Instrument so the metric labels and the span
