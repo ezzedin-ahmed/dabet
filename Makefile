@@ -14,7 +14,7 @@ RATE     ?= 400
 GOBIN   := $(shell go env GOPATH)/bin
 MODULES := $(shell go work edit -json | grep DiskPath | cut -d'"' -f4)
 
-.PHONY: build test vet tidy proto k8s-lint k8s-template tf-check up up-full up-traced up-mail up-load up-sharded up-full-e2e e2e-full load load-selfbench load-drills down logs ps e2e
+.PHONY: build test vet kafka-guard tidy proto k8s-lint k8s-template tf-check up up-full up-traced up-mail up-load up-sharded up-full-e2e e2e-full load load-selfbench load-drills down logs ps e2e
 
 build:
 	@for m in $(MODULES); do (cd $$m && go build ./...) || exit 1; done
@@ -31,8 +31,11 @@ tidy:
 	@for m in $(MODULES); do (cd $$m && GOWORK=off go build ./... >/dev/null) || exit 1; done
 	@echo "all modules tidy and standalone-buildable"
 
-vet:
+vet: kafka-guard
 	@for m in $(MODULES); do (cd $$m && go vet ./...) || exit 1; done
+
+kafka-guard:
+	@python3 hack/kafka-guard.py
 
 proto:
 	@command -v $(GOBIN)/protoc-gen-go >/dev/null 2>&1 || go install google.golang.org/protobuf/cmd/protoc-gen-go@latest

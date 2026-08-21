@@ -9,6 +9,7 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 
 	"dabet/pkg/contracts"
+	"dabet/pkg/kafkax"
 )
 
 // TextSource supplies a bounded sample of the creator's recent message
@@ -46,11 +47,22 @@ func (s *KafkaTextSource) Sample(ctx context.Context, creatorID string, max int)
 		return nil, nil
 	}
 	since := s.now().Add(-s.lookback)
-	cl, err := kgo.NewClient(
+	// Direct kgo client: it must resolve the shared KAFKA_TLS_*/KAFKA_SASL_*
+	// settings itself, or §8.6 labelling silently loses its text sample
+	// against a managed broker while the rest of the job works.
+	sec, err := kafkax.DefaultSecurityConfig()
+	if err != nil {
+		return nil, err
+	}
+	secOpts, err := sec.Options()
+	if err != nil {
+		return nil, err
+	}
+	cl, err := kgo.NewClient(append([]kgo.Opt{
 		kgo.SeedBrokers(s.brokers...),
 		kgo.ConsumeTopics(contracts.TopicMessages),
 		kgo.ConsumeResetOffset(kgo.NewOffset().AfterMilli(since.UnixMilli())),
-	)
+	}, secOpts...)...)
 	if err != nil {
 		return nil, err
 	}

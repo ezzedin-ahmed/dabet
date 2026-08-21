@@ -8,6 +8,8 @@ import (
 
 	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
+
+	"dabet/pkg/kafkax"
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
@@ -29,11 +31,32 @@ type Kafka struct {
 // NewKafka connects the metadata client. metaTTL bounds how long a
 // discovered partition count is trusted before re-asking the broker.
 func NewKafka(brokers []string, topic string, metaTTL time.Duration) (*Kafka, error) {
-	cl, err := kgo.NewClient(kgo.SeedBrokers(brokers...))
+	// Direct kgo clients must still carry the shared transport security, or
+	// they silently stay plaintext while this service's kafkax clients
+	// authenticate fine — which only shows up against a managed broker.
+	sec, err := kafkax.DefaultSecurityConfig()
+	if err != nil {
+		return nil, fmt.Errorf("kafka reader: %w", err)
+	}
+	secOpts, err := sec.Options()
+	if err != nil {
+		return nil, fmt.Errorf("kafka reader: %w", err)
+	}
+	cl, err := kgo.NewClient(append([]kgo.Opt{kgo.SeedBrokers(brokers...)}, secOpts...)...)
 	if err != nil {
 		return nil, fmt.Errorf("kafka reader: %w", err)
 	}
 	return &Kafka{brokers: brokers, topic: topic, cl: cl, metaTTL: metaTTL}, nil
+}
+
+// securityOptions resolves the shared KAFKA_TLS_*/KAFKA_SASL_* transport
+// settings for the short-lived clients this reader creates per scan.
+func (k *Kafka) securityOptions() ([]kgo.Opt, error) {
+	sec, err := kafkax.DefaultSecurityConfig()
+	if err != nil {
+		return nil, err
+	}
+	return sec.Options()
 }
 
 // Close closes the metadata client.
@@ -123,12 +146,16 @@ func (k *Kafka) Scan(ctx context.Context, partition int32, from int64, fn func(R
 		return nil
 	}
 
-	cl, err := kgo.NewClient(
+	secOpts, err := k.securityOptions()
+	if err != nil {
+		return fmt.Errorf("kafka scan client: %w", err)
+	}
+	cl, err := kgo.NewClient(append([]kgo.Opt{
 		kgo.SeedBrokers(k.brokers...),
 		kgo.ConsumePartitions(map[string]map[int32]kgo.Offset{
 			k.topic: {partition: kgo.NewOffset().At(from)},
 		}),
-	)
+	}, secOpts...)...)
 	if err != nil {
 		return fmt.Errorf("kafka scan client: %w", err)
 	}

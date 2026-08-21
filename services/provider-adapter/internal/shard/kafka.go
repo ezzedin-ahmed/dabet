@@ -13,6 +13,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
+
+	"dabet/pkg/kafkax"
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
@@ -116,7 +118,20 @@ func NewKafkaCoordinator(cfg KafkaConfig) (*KafkaCoordinator, error) {
 	c := &KafkaCoordinator{cfg: cfg, changes: make(chan struct{}, 1)}
 	c.bal = &ringBalancer{self: cfg.Self, onView: c.setMembers}
 
-	cl, err := kgo.NewClient(
+	// The coordinator is a direct kgo client, so it must pick up the shared
+	// KAFKA_TLS_*/KAFKA_SASL_* settings itself; otherwise the ring silently
+	// stays plaintext against a managed broker while the adapter's kafkax
+	// clients authenticate normally.
+	sec, err := kafkax.DefaultSecurityConfig()
+	if err != nil {
+		return nil, fmt.Errorf("shard: kafka security: %w", err)
+	}
+	secOpts, err := sec.Options()
+	if err != nil {
+		return nil, fmt.Errorf("shard: kafka security: %w", err)
+	}
+
+	cl, err := kgo.NewClient(append([]kgo.Opt{
 		kgo.SeedBrokers(cfg.Brokers...),
 		kgo.ConsumerGroup(cfg.Group),
 		kgo.ConsumeTopics(cfg.Topic),
@@ -131,7 +146,7 @@ func NewKafkaCoordinator(cfg KafkaConfig) (*KafkaCoordinator, error) {
 		kgo.OnPartitionsLost(func(context.Context, *kgo.Client, map[string][]int32) {
 			c.setConnected(false, "group lost")
 		}),
-	)
+	}, secOpts...)...)
 	if err != nil {
 		return nil, fmt.Errorf("shard coordinator: %w", err)
 	}
