@@ -295,51 +295,84 @@ func (p *Pipeline) Process(ctx context.Context, value []byte) {
 
 	norm := Normalize(msg.Text)
 
-	// Stage 4 — rate limit, only when the policy sets one.
-	if pol.RateLimitMessages != nil && pol.RateLimitSeconds != nil && rg.use() {
-		capacity := float64(pol.GetRateLimitMessages())
-		window := time.Duration(pol.GetRateLimitSeconds()) * time.Second
-		t0 = p.now()
-		allowed, err := p.state.TakeToken(ctx, rediskeys.Rate(msg.ContentID, msg.AuthorID),
-			capacity, capacity/window.Seconds(), p.now(), 2*window)
-		p.observeStage("rate_limit", t0)
-		if err != nil {
-			rg.fail()
-		} else {
-			rg.ok()
-			if !allowed {
-				p.flag(ctx, msg, contracts.DetectorRateLimit, contracts.ActionAutoDelete, pol.GetPolicyId())
-				return
-			}
-		}
-	}
-
-	// Stage 5 — duplicate, for spam = identical OR semantic (semantic
-	// implies the identical check as its cheap first line).
+	// Stages 4–6 — rate limit, duplicate, semantic spam. All three read and
+	// write keys of one (content, author) pair, which §4.3 gives the same
+	// hash tag, so the whole group is one Lua script and one round trip
+	// (cascadeLua). §7.3's ordering is unchanged and still observable in
+	// the state: the script returns on the first hit and never touches the
+	// structures of a later stage, so a rate-limited message still does not
+	// enter the duplicate window.
+	rateOn := pol.RateLimitMessages != nil && pol.RateLimitSeconds != nil
 	spam := pol.GetSpam()
 	spamOn := spam == policyapi.SpamMode_SPAM_MODE_IDENTICAL || spam == policyapi.SpamMode_SPAM_MODE_SEMANTIC
-	if spamOn && rg.use() {
+	semanticOn := spam == policyapi.SpamMode_SPAM_MODE_SEMANTIC
+
+	// windowRead is set once the merged call has returned a comparison
+	// window, i.e. once stages 4 and 5 have passed with Redis healthy.
+	// Without it there is nothing for the semantic stage to compare
+	// against and it is skipped, exactly as it was when Redis was the
+	// stage's own dependency.
+	var cascade CascadeResult
+	windowRead := false
+
+	if (rateOn || spamOn) && rg.use() {
+		params := CascadeParams{}
+		if rateOn {
+			capacity := float64(pol.GetRateLimitMessages())
+			window := time.Duration(pol.GetRateLimitSeconds()) * time.Second
+			params.Rate = &RateParams{
+				Capacity:     capacity,
+				RefillPerSec: capacity / window.Seconds(),
+				Now:          p.now(),
+				TTL:          2 * window,
+			}
+		}
+		// The duplicate stage runs for spam = identical AND for semantic,
+		// which keeps the identical check as its cheap first line.
+		if spamOn {
+			params.Dup = &DupParams{Hash: HashText(norm), Depth: p.cfg.DupDepth, TTL: p.cfg.DupTTL}
+		}
+		if semanticOn {
+			params.EmbDepth = p.cfg.EmbDepth
+		}
+
 		t0 = p.now()
-		hit, err := p.state.DupCheck(ctx, rediskeys.Dup(msg.ContentID, msg.AuthorID),
-			HashText(norm), p.cfg.DupDepth, p.cfg.DupTTL)
-		p.observeStage("duplicate", t0)
+		res, err := p.state.Cascade(ctx, msg.ContentID, msg.AuthorID, params)
+		// One call, so one duration — attributed to each stage that took
+		// part in it, which keeps every stage histogram's COUNT meaning
+		// "messages that ran this stage" (what §4.6's budget line and the
+		// e2e assertions read). The sum across the three now double-counts
+		// the shared round trip, deliberately: §4.6 budgets the Redis
+		// cascade as one line, not three.
+		if rateOn {
+			p.observeStage("rate_limit", t0)
+		}
+		if spamOn && res.Hit != CascadeRateLimited {
+			p.observeStage("duplicate", t0)
+		}
 		if err != nil {
 			rg.fail()
 		} else {
 			rg.ok()
-			if hit {
+			switch res.Hit {
+			case CascadeRateLimited:
+				p.flag(ctx, msg, contracts.DetectorRateLimit, contracts.ActionAutoDelete, pol.GetPolicyId())
+				return
+			case CascadeDuplicate:
 				p.flag(ctx, msg, contracts.DetectorDuplicate, contracts.ActionAutoDelete, pol.GetPolicyId())
 				return
 			}
+			cascade, windowRead = res, semanticOn
 		}
 	}
 
-	// Stage 6 — semantic spam. Embedding down: skip the stage, continue.
-	// The gate is consulted BEFORE the embedding call: with Redis out
-	// there is nothing to compare against, so paying for an embedding
-	// would be waste, and the stage counts as a Redis skip rather than an
-	// embedding one.
-	if spam == policyapi.SpamMode_SPAM_MODE_SEMANTIC && rg.use() {
+	// Stage 6, second half — the embedding is only paid for once the two
+	// cheaper stages have passed, which is the whole point of ordering by
+	// cost (§7.4: this is the only pre-LLM detector that costs a network
+	// round trip). The comparison window arrived with the merged call
+	// above, so what remains is embed → cosine in Go → append.
+	// Embedding down: skip the stage, continue.
+	if windowRead && rg.use() {
 		t0 = p.now()
 		vecs, err := p.embed.Embed(ctx, []string{norm})
 		if err != nil || len(vecs) != 1 {
@@ -348,10 +381,14 @@ func (p *Pipeline) Process(ctx context.Context, value []byte) {
 			p.observeStage("semantic", t0)
 		} else {
 			p.met.DependencyUp.WithLabelValues("embedding").Set(1)
-			sim, err := p.state.EmbMaxSimilarity(ctx, rediskeys.Emb(msg.ContentID, msg.AuthorID),
-				vecs[0], p.cfg.EmbDepth, p.cfg.EmbTTL)
+			sim := maxSimilarity(vecs[0], cascade.Vectors)
+			// The verdict is decided before the append, but an append
+			// failure still suppresses it: a flag the window did not
+			// record would make the next repeat look like a first
+			// sighting, which is what the pre-merge read-then-write did.
+			appendErr := p.state.EmbAppend(ctx, msg.ContentID, msg.AuthorID, vecs[0], p.cfg.EmbDepth, p.cfg.EmbTTL)
 			p.observeStage("semantic", t0)
-			if err != nil {
+			if appendErr != nil {
 				rg.fail()
 			} else {
 				rg.ok()
