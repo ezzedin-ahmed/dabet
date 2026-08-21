@@ -94,12 +94,59 @@ run "no persistence anywhere" \
   --set minio.persistence.enabled=false \
   --set postgres.defaults.persistence.enabled=false
 
+# ---- THE ADMIN JOBS AGAINST AN EXTERNAL BROKER --------------------------
+# The gap this chart used to have: the topic reconciler was gated on
+# kafka.enabled, so with MSK nothing created the §4.2 topics. These cases
+# pin the decoupled behaviour — the Job must render against an external
+# bootstrap, with TLS and SASL, and with the credential by reference.
+MSK_BOOTSTRAP="b-1.dabet.abc.c2.kafka.eu-west-1.amazonaws.com:9096\,b-2.dabet.abc.c2.kafka.eu-west-1.amazonaws.com:9096"
+
+run "external broker, topic reconciler over TLS + SASL/SCRAM" \
+  --set kafka.enabled=false \
+  --set external.kafka.brokers="${MSK_BOOTSTRAP}" \
+  --set kafka.admin.auth.tls.enabled=true \
+  --set kafka.admin.auth.sasl.mechanism=SCRAM-SHA-512 \
+  --set kafka.admin.auth.sasl.existingSecret.name=dabet-kafka-admin
+
+run "external broker, private CA bundle for the reconciler" \
+  --set kafka.enabled=false \
+  --set external.kafka.brokers="b-1.kafka.internal:9093" \
+  --set kafka.admin.auth.tls.enabled=true \
+  --set kafka.admin.auth.tls.caSecret.name=kafka-ca \
+  --set kafka.admin.auth.sasl.mechanism=SCRAM-SHA-512 \
+  --set kafka.admin.auth.sasl.existingSecret.name=dabet-kafka-admin
+
+run "external broker + ACL reconciler" \
+  --set kafka.enabled=false \
+  --set external.kafka.brokers="${MSK_BOOTSTRAP}" \
+  --set kafka.admin.auth.tls.enabled=true \
+  --set kafka.admin.auth.sasl.mechanism=SCRAM-SHA-512 \
+  --set kafka.admin.auth.sasl.existingSecret.name=dabet-kafka-admin \
+  --set kafka.acls.enabled=true \
+  --set kafka.acls.rules[0].principal="User:dabet-admin" \
+  --set kafka.acls.rules[0].resourceType=cluster \
+  --set kafka.acls.rules[0].operations="{Describe,Alter,DescribeConfigs,AlterConfigs}" \
+  --set kafka.acls.rules[1].principal="User:dabet-moderation-service" \
+  --set kafka.acls.rules[1].resourceType=topic \
+  --set kafka.acls.rules[1].resourceName=messages.v1 \
+  --set kafka.acls.rules[1].operations="{Read,Describe}"
+
+# ACLs on, no rules: nothing to apply, so no Job. Guards against an empty
+# ACL Job that would "succeed" while granting nothing.
+run "acls enabled but empty rule list" \
+  --set kafka.enabled=false \
+  --set external.kafka.brokers="${MSK_BOOTSTRAP}" \
+  --set kafka.acls.enabled=true
+
 # ---- THE AWS PATH: managed services standing in for each component ------
 # This is the combination Terraform produces. Nothing self-hosted survives
 # except the pieces AWS has no equivalent for.
 run "full AWS: MSK + RDS + ElastiCache + ElastiCache-memcached + S3" \
   --set kafka.enabled=false \
-  --set external.kafka.brokers="b-1.msk.eu-west-1.amazonaws.com:9092\,b-2.msk.eu-west-1.amazonaws.com:9092" \
+  --set external.kafka.brokers="${MSK_BOOTSTRAP}" \
+  --set kafka.admin.auth.tls.enabled=true \
+  --set kafka.admin.auth.sasl.mechanism=SCRAM-SHA-512 \
+  --set kafka.admin.auth.sasl.existingSecret.name=dabet-kafka-admin \
   --set postgres.enabled=false \
   --set external.postgres.identity="postgres://dabet:pw@identity.rds.amazonaws.com:5432/dabet_identity?sslmode=require" \
   --set external.postgres.policy="postgres://dabet:pw@policy.rds.amazonaws.com:5432/dabet_policy?sslmode=require" \
@@ -130,6 +177,90 @@ run "EVERYTHING disabled" \
   --set milvus.enabled=false --set vllm.enabled=false \
   --set embedding.enabled=false \
   --set mocks.llm.enabled=false --set mocks.embedding.enabled=false
+
+# ---- invariant: the admin credential is NEVER a literal -----------------
+# The reconcilers authenticate with a SASL password. There is no values key
+# that holds one and there must never be: it reaches the pod as a
+# secretKeyRef and becomes a client.properties in a memory-backed emptyDir
+# at runtime. This asserts the rendered manifest agrees.
+echo
+echo "asserting the reconciler credential is by reference only"
+cred_out="${OUT}/credential-assert.yaml"
+helm template deps "${CHART}" \
+  --set kafka.enabled=false \
+  --set external.kafka.brokers="${MSK_BOOTSTRAP}" \
+  --set kafka.admin.auth.tls.enabled=true \
+  --set kafka.admin.auth.sasl.mechanism=SCRAM-SHA-512 \
+  --set kafka.admin.auth.sasl.existingSecret.name=dabet-kafka-admin \
+  --set kafka.acls.enabled=true \
+  --set kafka.acls.rules[0].principal="User:dabet-admin" \
+  --set kafka.acls.rules[0].resourceType=cluster \
+  --set kafka.acls.rules[0].operations="{Describe,Alter}" \
+  > "${cred_out}" 2>/dev/null
+
+# Every KAFKA_SASL_PASSWORD / KAFKA_SASL_USERNAME occurrence in an env list
+# must be followed by valueFrom, never by `value:`.
+if grep -A1 -E 'name: KAFKA_SASL_(PASSWORD|USERNAME)$' "${cred_out}" | grep -qE '^\s+value:'; then
+  echo "ASSERT FAIL  a SASL credential is rendered as a literal value"
+  FAILED=$((FAILED + 1))
+else
+  echo "ok  SASL credentials render as secretKeyRef in every reconciler Job"
+  PASSED=$((PASSED + 1))
+fi
+
+# ...and nothing secret may be in the ConfigMap the Jobs mount. The scripts
+# in there legitimately contain the printf TEMPLATE `password="%s"`, which
+# is why the pattern excludes a '%' immediately after the quote: anything
+# else there is a literal that should not exist.
+if awk '/kind: ConfigMap/,/^---/' "${cred_out}" | grep -qE 'password="[^%]'; then
+  echo "ASSERT FAIL  a JAAS password is baked into the admin ConfigMap"
+  FAILED=$((FAILED + 1))
+else
+  echo "ok  the admin ConfigMap carries no credential"
+  PASSED=$((PASSED + 1))
+fi
+
+# ---- invariant: the §4.2 numbers survive every profile ------------------
+# The registry is values, so it is overridable — but the two shipped
+# production-shaped profiles must carry the §4.2 table verbatim, and the
+# §7.2 coordination topic must be in every profile (Helm REPLACES lists, so
+# an overlay that redefines `registry` can silently drop it).
+echo
+echo "asserting the §4.2 registry"
+for profile in "" "-f ${CHART}/values-prod.yaml"; do
+  label="${profile:-values.yaml}"
+  # shellcheck disable=SC2086
+  spec="$(helm template deps "${CHART}" ${profile} 2>/dev/null \
+    | sed -n '/^  topics.txt:/,/^  [a-z]/p')"
+  bad=0
+  for want in \
+    "messages.v1 512 86400000" \
+    "flagged.v1 128 604800000" \
+    "deletions.v1 128 86400000" \
+    "usage.v1 32 604800000"
+  do
+    printf '%s\n' "${spec}" | grep -qF "${want}" || { echo "  MISSING: ${want}"; bad=1; }
+  done
+  if [ "${bad}" -eq 0 ]; then
+    echo "ok  §4.2 partition counts and retentions intact  (${label})"
+    PASSED=$((PASSED + 1))
+  else
+    echo "ASSERT FAIL  §4.2 registry drifted  (${label})"
+    FAILED=$((FAILED + 1))
+  fi
+done
+
+for profile in "" "-f ${CHART}/values-prod.yaml" "-f ${CHART}/values-local.yaml"; do
+  label="${profile:-values.yaml}"
+  # shellcheck disable=SC2086
+  if helm template deps "${CHART}" ${profile} 2>/dev/null | grep -q 'adapter.shards.v1 '; then
+    echo "ok  §7.2 adapter.shards.v1 present                (${label})"
+    PASSED=$((PASSED + 1))
+  else
+    echo "ASSERT FAIL  adapter.shards.v1 missing from the registry  (${label})"
+    FAILED=$((FAILED + 1))
+  fi
+done
 
 echo
 echo "passed=${PASSED} failed=${FAILED}"

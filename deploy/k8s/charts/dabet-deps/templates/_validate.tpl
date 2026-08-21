@@ -19,12 +19,67 @@ only hours later.
   {{- if gt (.Values.kafka.minInsyncReplicas | int) (.Values.kafka.replicas | int) }}
     {{- fail (printf "kafka.minInsyncReplicas=%d exceeds kafka.replicas=%d: every produce with acks=all would fail with NOT_ENOUGH_REPLICAS" (.Values.kafka.minInsyncReplicas | int) (.Values.kafka.replicas | int)) }}
   {{- end }}
-  {{- range .Values.kafka.topics.registry }}
-    {{- if lt (.partitions | int) 1 }}
-      {{- fail (printf "kafka topic %s: partitions must be >= 1" .name) }}
+{{- end }}
+
+{{/*
+The topic registry is checked whether or not this chart runs the brokers:
+the reconciler is no longer gated on kafka.enabled, so a bad registry is
+just as reachable on the MSK path.
+*/}}
+{{- range .Values.kafka.topics.registry }}
+  {{- if lt (.partitions | int) 1 }}
+    {{- fail (printf "kafka topic %s: partitions must be >= 1" .name) }}
+  {{- end }}
+  {{- if lt (.retentionMs | int) 1 }}
+    {{- fail (printf "kafka topic %s: retentionMs must be > 0 (docs §4.2 assigns each topic a finite retention)" .name) }}
+  {{- end }}
+{{- end }}
+
+{{- if .Values.kafka.topics.enabled }}
+  {{- if lt (include "dabet-deps.kafkaTopicRF" . | int) 1 }}
+    {{- fail "kafka.topics.replicationFactor must be >= 1" }}
+  {{- end }}
+{{- end }}
+
+{{/*
+Credentials are a secretKeyRef and nothing else. Catching the missing
+Secret name here turns "the reconciler Job CrashLoopBackOffs against a
+broker that rejected it" into a render-time message naming the key.
+*/}}
+{{- $sasl := .Values.kafka.admin.auth.sasl }}
+{{- if and $sasl.mechanism (not $sasl.existingSecret.name) }}
+  {{- fail "kafka.admin.auth.sasl.mechanism is set but kafka.admin.auth.sasl.existingSecret.name is empty: the topic and ACL reconcilers take their credential from an existing Secret by reference, never as a value." }}
+{{- end }}
+{{- if and $sasl.mechanism (not .Values.kafka.admin.auth.tls.enabled) }}
+  {{- /* Not fatal: SASL_PLAINTEXT is a legitimate configuration on a trusted
+         network, and PLAIN over it is the classic mistake rather than a
+         chart bug. But SCRAM without TLS on a managed broker never works —
+         every managed Kafka requires TLS — so say so loudly. */}}
+  {{- if hasPrefix "b-" (include "dabet-deps.kafkaAdminBootstrap" .) }}
+    {{- fail "kafka.admin.auth.sasl.mechanism is set against what looks like an MSK bootstrap string but kafka.admin.auth.tls.enabled is false. MSK offers SASL only over TLS (port 9096); the connection will be refused." }}
+  {{- end }}
+{{- end }}
+
+{{/*
+An ACL rule with no operations is a binding that grants nothing and, worse,
+still counts as "this resource has an ACL" — which on a broker with
+allow.everyone.if.no.acl.found=true flips that resource from open to closed
+for everyone. Silent, and exactly the kind of thing that shows up as an
+unexplained authorization failure hours later.
+*/}}
+{{- if .Values.kafka.acls.enabled }}
+  {{- range $i, $r := .Values.kafka.acls.rules }}
+    {{- if not $r.principal }}
+      {{- fail (printf "kafka.acls.rules[%d]: principal is required (e.g. \"User:dabet-moderation-service\")" $i) }}
     {{- end }}
-    {{- if lt (.retentionMs | int) 1 }}
-      {{- fail (printf "kafka topic %s: retentionMs must be > 0 (docs §4.2 assigns each topic a finite retention)" .name) }}
+    {{- if not (has $r.resourceType (list "cluster" "topic" "group" "transactional-id")) }}
+      {{- fail (printf "kafka.acls.rules[%d] (%s): resourceType must be cluster, topic, group or transactional-id, got %q" $i $r.principal ($r.resourceType | toString)) }}
+    {{- end }}
+    {{- if and (ne $r.resourceType "cluster") (not $r.resourceName) }}
+      {{- fail (printf "kafka.acls.rules[%d] (%s): resourceName is required for resourceType %s" $i $r.principal $r.resourceType) }}
+    {{- end }}
+    {{- if not $r.operations }}
+      {{- fail (printf "kafka.acls.rules[%d] (%s %s): operations must not be empty — an ACL with no operation grants nothing while still closing the resource to everyone else" $i $r.principal $r.resourceType) }}
     {{- end }}
   {{- end }}
 {{- end }}

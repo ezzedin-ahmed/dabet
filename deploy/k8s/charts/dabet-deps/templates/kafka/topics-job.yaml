@@ -1,8 +1,6 @@
-{{- if and .Values.kafka.enabled .Values.kafka.topics.enabled }}
-{{- $brokers := include "dabet-deps.kafkaBrokers" . -}}
+{{- $bootstrap := include "dabet-deps.kafkaAdminBootstrap" . -}}
+{{- if and .Values.kafka.topics.enabled $bootstrap -}}
 {{- $rf := include "dabet-deps.kafkaTopicRF" . | int -}}
-{{- $isr := include "dabet-deps.kafkaMinISR" . | int -}}
-{{- $cmName := include "dabet-deps.componentName" (dict "root" . "component" "kafka-topics") -}}
 {{- /*
   ============================================================================
   §4.2 TOPIC REGISTRY RECONCILER
@@ -10,6 +8,17 @@
   The partition counts and retentions in values.kafka.topics.registry are the
   §4.2 contract. This job makes the cluster match them and can be run any
   number of times.
+
+  IT IS NOT GATED ON kafka.enabled. That gate was the bug: with MSK the
+  chart's own broker is off, `auto.create.topics.enable` is false on the
+  managed cluster, and the result was a deployment that installed cleanly and
+  then failed every produce with UNKNOWN_TOPIC_OR_PARTITION. What this Job
+  needs is a broker address, not a broker StatefulSet — so the condition is
+  "we know where a broker is", which is exactly what
+  dabet-deps.kafkaAdminBootstrap answers, resolving external.kafka.brokers
+  first and the in-cluster StatefulSet second. When neither exists the Job
+  does not render, so the "everything disabled" release still comes up as two
+  objects.
 
   Idempotence has three separate cases, and getting any of them wrong is
   quietly destructive:
@@ -27,114 +36,10 @@
                                since retention is cheap to change and is the
                                §4.8 retention story in practice.
 
-  Rendering the spec as a ConfigMap rather than inlining it in `args` means
-  the checksum below changes exactly when the registry changes, which is what
-  makes the hook re-run meaningful.
+  The script lives in the shared kafka-admin ConfigMap; see
+  templates/kafka/admin-configmap.yaml.
   ============================================================================
 */ -}}
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: {{ $cmName }}
-  namespace: {{ .Release.Namespace }}
-  labels:
-    {{- include "dabet-deps.componentLabels" (dict "root" . "component" "kafka-topics") | nindent 4 }}
-  annotations:
-    "helm.sh/hook": post-install,post-upgrade
-    "helm.sh/hook-weight": "-5"
-    "helm.sh/hook-delete-policy": before-hook-creation
-data:
-  # Space separated: name partitions retention.ms extra,config,pairs
-  # (no field may contain a space, which is why the extra configs are a
-  # comma-joined list rather than repeated fields.)
-  topics.txt: |
-    {{- range .Values.kafka.topics.registry }}
-    {{- $extra := list (printf "min.insync.replicas=%d" $isr) -}}
-    {{- range $k, $v := (.config | default dict) -}}
-    {{- $extra = append $extra (printf "%s=%s" $k ($v | toString)) -}}
-    {{- end }}
-    {{/* int64, NOT bare interpolation. Helm parses values.yaml numbers as
-         float64, so a bare {{ .retentionMs }} renders 86400000 as
-         "8.64e+07" and kafka-topics.sh rejects it with "Not a number of
-         type LONG". Every retention in the §4.2 registry is large enough
-         to hit this. */ -}}
-    {{ .name }} {{ .partitions | int64 }} {{ .retentionMs | int64 }} {{ join "," $extra }}
-    {{- end }}
-  reconcile.sh: |
-    #!/usr/bin/env bash
-    set -euo pipefail
-
-    BOOTSTRAP="${KAFKA_BOOTSTRAP:?}"
-    RF="${KAFKA_RF:?}"
-    BIN=/opt/kafka/bin
-
-    # The brokers may still be forming their quorum when this hook fires.
-    echo "waiting for ${BOOTSTRAP} ..."
-    for i in $(seq 1 120); do
-      if "${BIN}/kafka-broker-api-versions.sh" --bootstrap-server "${BOOTSTRAP}" >/dev/null 2>&1; then
-        echo "brokers reachable after ${i} attempt(s)"
-        break
-      fi
-      if [ "${i}" -eq 120 ]; then
-        echo "FATAL: brokers not reachable after 120 attempts" >&2
-        exit 1
-      fi
-      sleep 5
-    done
-
-    existing="$("${BIN}/kafka-topics.sh" --bootstrap-server "${BOOTSTRAP}" --list)"
-
-    rc=0
-    while read -r topic partitions retention extra; do
-      [ -z "${topic:-}" ] && continue
-
-      configs="retention.ms=${retention}"
-      [ -n "${extra:-}" ] && configs="${configs},${extra}"
-
-      # -F because topic names contain dots, which grep would otherwise
-      # read as "any character" and match a different topic.
-      if ! printf '%s\n' "${existing}" | grep -Fqx -- "${topic}"; then
-        echo "==> creating ${topic}: partitions=${partitions} rf=${RF} ${configs}"
-        cfgargs=()
-        IFS=',' read -ra pairs <<< "${configs}"
-        for p in "${pairs[@]}"; do cfgargs+=(--config "${p}"); done
-        # --if-not-exists keeps two concurrent runs of this job from racing
-        # each other into a TopicExistsException.
-        "${BIN}/kafka-topics.sh" --bootstrap-server "${BOOTSTRAP}" \
-          --create --if-not-exists --topic "${topic}" \
-          --partitions "${partitions}" --replication-factor "${RF}" \
-          "${cfgargs[@]}"
-        continue
-      fi
-
-      current="$("${BIN}/kafka-topics.sh" --bootstrap-server "${BOOTSTRAP}" \
-        --describe --topic "${topic}" \
-        | grep -o 'PartitionCount: [0-9]*' | head -1 | awk '{print $2}')"
-      echo "==> ${topic} exists with ${current} partition(s), want ${partitions}"
-
-      if [ "${current}" -lt "${partitions}" ]; then
-        echo "    increasing to ${partitions}"
-        "${BIN}/kafka-topics.sh" --bootstrap-server "${BOOTSTRAP}" \
-          --alter --topic "${topic}" --partitions "${partitions}"
-      elif [ "${current}" -gt "${partitions}" ]; then
-        # Deliberately not fatal, and deliberately loud.
-        echo "    WARNING: ${topic} has ${current} partitions but values ask for ${partitions}." >&2
-        echo "    Kafka cannot shrink a topic. Shrinking would require delete+recreate," >&2
-        echo "    which drops every retained record and re-maps every key. Leaving it alone." >&2
-      fi
-
-      echo "    reconciling config: ${configs}"
-      "${BIN}/kafka-configs.sh" --bootstrap-server "${BOOTSTRAP}" \
-        --entity-type topics --entity-name "${topic}" \
-        --alter --add-config "${configs}"
-    done < /spec/topics.txt
-
-    echo
-    echo "final state:"
-    "${BIN}/kafka-topics.sh" --bootstrap-server "${BOOTSTRAP}" --describe \
-      | grep -E '^Topic:' || true
-    exit "${rc}"
----
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -147,6 +52,10 @@ metadata:
     # whenever the values change. `before-hook-creation` deletes the previous
     # Job first, which is what makes a re-run possible at all — a Job's
     # podTemplate is immutable, so an in-place update would be rejected.
+    #
+    # Weight 0 puts it after the ACL reconciler (-2), which matters on a
+    # cluster where the admin credential's own CreateTopic right is itself an
+    # ACL: the grant has to exist before the create is attempted.
     "helm.sh/hook": post-install,post-upgrade
     "helm.sh/hook-weight": "0"
     "helm.sh/hook-delete-policy": before-hook-creation
@@ -160,28 +69,32 @@ spec:
     spec:
       restartPolicy: OnFailure
       {{- include "dabet-deps.imagePullSecrets" . | nindent 6 }}
-      {{- include "dabet-deps.scheduling" (dict "root" . "nodeSelector" .Values.kafka.nodeSelector "tolerations" .Values.kafka.tolerations) | nindent 6 }}
+      {{- include "dabet-deps.scheduling" (dict "root" . "nodeSelector" (.Values.kafka.admin.nodeSelector | default .Values.kafka.nodeSelector) "tolerations" (.Values.kafka.admin.tolerations | default .Values.kafka.tolerations)) | nindent 6 }}
+      {{- with .Values.kafka.admin.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: topics
-          image: {{ include "dabet-deps.image" .Values.kafka.image }}
-          imagePullPolicy: {{ .Values.kafka.image.pullPolicy }}
+          image: {{ include "dabet-deps.kafkaAdminImage" . }}
+          imagePullPolicy: {{ include "dabet-deps.kafkaAdminImagePullPolicy" . }}
           command: ["/bin/bash", "/spec/reconcile.sh"]
+          {{- with .Values.kafka.admin.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           env:
-            - name: KAFKA_BOOTSTRAP
-              value: {{ $brokers | quote }}
+            {{- include "dabet-deps.kafkaAdminEnv" . | nindent 12 }}
             - name: KAFKA_RF
               value: {{ $rf | quote }}
+            - name: KAFKA_WAIT_ATTEMPTS
+              value: {{ .Values.kafka.admin.waitAttempts | quote }}
+            - name: KAFKA_WAIT_INTERVAL
+              value: {{ .Values.kafka.admin.waitIntervalSeconds | quote }}
           volumeMounts:
-            - name: spec
-              mountPath: /spec
+            {{- include "dabet-deps.kafkaAdminVolumeMounts" . | nindent 12 }}
           resources:
-            requests:
-              cpu: 50m
-              memory: 256Mi
-            limits:
-              memory: 512Mi
+            {{- toYaml .Values.kafka.admin.resources | nindent 12 }}
       volumes:
-        - name: spec
-          configMap:
-            name: {{ $cmName }}
+        {{- include "dabet-deps.kafkaAdminVolumes" . | nindent 8 }}
 {{- end }}

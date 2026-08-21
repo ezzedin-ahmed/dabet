@@ -325,11 +325,154 @@ consuming service cannot tell the difference and needs no flag.
 {{- min (.Values.kafka.replicationFactor | int) (.Values.kafka.replicas | int) -}}
 {{- end -}}
 
+{{/*
+Is the broker the one THIS chart runs?
+
+`kafka.replicas` is only a real broker count in that case. When an
+`external.kafka.brokers` string is set — MSK, Confluent, anything — the
+broker count is unknown to the chart, so capping the topic replication
+factor at `kafka.replicas` (which still has its default of 3 sitting in
+values.yaml) would silently invent a number. Everything that is only true
+of the self-hosted StatefulSet keys off this.
+*/}}
+{{- define "dabet-deps.kafkaSelfHosted" -}}
+{{- if and .Values.kafka.enabled (not .Values.external.kafka.brokers) -}}true{{- end -}}
+{{- end -}}
+
+{{/*
+Replication factor for the §4.2 topics.
+
+Self-hosted: capped at the broker count, so a one-broker laptop still
+installs. External: taken verbatim, because the chart cannot know how many
+brokers are out there and MSK's own default.replication.factor is 3.
+*/}}
 {{- define "dabet-deps.kafkaTopicRF" -}}
+{{- if include "dabet-deps.kafkaSelfHosted" . -}}
 {{- min (.Values.kafka.topics.replicationFactor | int) (.Values.kafka.replicas | int) -}}
+{{- else -}}
+{{- .Values.kafka.topics.replicationFactor | int -}}
+{{- end -}}
 {{- end -}}
 
 {{/* min.insync.replicas can never exceed the replication factor. */}}
 {{- define "dabet-deps.kafkaMinISR" -}}
 {{- min (.Values.kafka.minInsyncReplicas | int) (include "dabet-deps.kafkaRF" . | int) -}}
+{{- end -}}
+
+{{/*
+min.insync.replicas for the §4.2 TOPICS, which is not the same number as
+the broker-level one once the broker is external: it is capped at the topic
+replication factor above, not at the self-hosted quorum.
+
+`kafka.topics.minInsyncReplicas` overrides `kafka.minInsyncReplicas` when
+set, so an external cluster with a different durability contract does not
+have to lie about the in-cluster broker settings to express it.
+*/}}
+{{- define "dabet-deps.kafkaTopicMinISR" -}}
+{{- $want := .Values.kafka.minInsyncReplicas | int -}}
+{{- if not (kindIs "invalid" .Values.kafka.topics.minInsyncReplicas) -}}
+{{- $want = .Values.kafka.topics.minInsyncReplicas | int -}}
+{{- end -}}
+{{- min $want (include "dabet-deps.kafkaTopicRF" . | int) -}}
+{{- end -}}
+
+{{/*
+=============================================================================
+THE ADMIN CLIENT (topic reconciler + ACL reconciler)
+
+Both Jobs talk to whatever broker the connection contract points at, which
+is `external.kafka.brokers` when it is set and the in-cluster StatefulSet
+otherwise — the SAME resolution the services get, so the reconciler can
+never end up managing a different cluster from the one that is in use.
+`kafka.admin.bootstrapOverride` is the escape hatch for the one case where
+they legitimately differ: a broker that publishes a separate admin listener.
+=============================================================================
+*/}}
+
+{{- define "dabet-deps.kafkaAdminBootstrap" -}}
+{{- if .Values.kafka.admin.bootstrapOverride -}}
+{{- .Values.kafka.admin.bootstrapOverride -}}
+{{- else -}}
+{{- include "dabet-deps.kafkaBrokers" . -}}
+{{- end -}}
+{{- end -}}
+
+{{/* Image for the admin Jobs: kafka.image, with kafka.admin.image merged over it. */}}
+{{- define "dabet-deps.kafkaAdminImage" -}}
+{{- $img := mergeOverwrite (deepCopy .Values.kafka.image) (.Values.kafka.admin.image | default dict) -}}
+{{- include "dabet-deps.image" $img -}}
+{{- end -}}
+
+{{- define "dabet-deps.kafkaAdminImagePullPolicy" -}}
+{{- $img := mergeOverwrite (deepCopy .Values.kafka.image) (.Values.kafka.admin.image | default dict) -}}
+{{- $img.pullPolicy -}}
+{{- end -}}
+
+{{/*
+Environment for the admin Jobs.
+
+The SASL username and password are the ONLY credentials involved and they
+are always a secretKeyRef — never a literal, never a ConfigMap key. The
+Job's entrypoint reads them from the environment and writes a
+client.properties into a memory-backed emptyDir; nothing lands on disk and
+nothing lands in the rendered manifest. `helm template | grep` on a release
+of this chart will show the Secret NAME and never the value.
+*/}}
+{{- define "dabet-deps.kafkaAdminEnv" -}}
+{{- $a := .Values.kafka.admin.auth -}}
+- name: KAFKA_BOOTSTRAP
+  value: {{ include "dabet-deps.kafkaAdminBootstrap" . | quote }}
+- name: KAFKA_TLS_ENABLED
+  value: {{ $a.tls.enabled | toString | quote }}
+- name: KAFKA_TLS_SKIP_VERIFY
+  value: {{ $a.tls.skipVerify | toString | quote }}
+{{- if $a.tls.caSecret.name }}
+- name: KAFKA_TLS_CA_FILE
+  value: /kafka-ca/{{ $a.tls.caSecret.key }}
+{{- end }}
+- name: KAFKA_SASL_MECHANISM
+  value: {{ $a.sasl.mechanism | quote }}
+{{- if $a.sasl.mechanism }}
+- name: KAFKA_SASL_USERNAME
+  valueFrom:
+    secretKeyRef:
+      name: {{ required "kafka.admin.auth.sasl.existingSecret.name is required when kafka.admin.auth.sasl.mechanism is set" $a.sasl.existingSecret.name | quote }}
+      key: {{ $a.sasl.existingSecret.usernameKey | quote }}
+- name: KAFKA_SASL_PASSWORD
+  valueFrom:
+    secretKeyRef:
+      name: {{ $a.sasl.existingSecret.name | quote }}
+      key: {{ $a.sasl.existingSecret.passwordKey | quote }}
+{{- end }}
+{{- end -}}
+
+{{/* Volume mounts shared by both admin Jobs. */}}
+{{- define "dabet-deps.kafkaAdminVolumeMounts" -}}
+- name: spec
+  mountPath: /spec
+- name: run
+  mountPath: /run/kafka-admin
+{{- if .Values.kafka.admin.auth.tls.caSecret.name }}
+- name: kafka-ca
+  mountPath: /kafka-ca
+  readOnly: true
+{{- end }}
+{{- end -}}
+
+{{- define "dabet-deps.kafkaAdminVolumes" -}}
+{{- /* No defaultMode: the scripts are invoked as `bash /spec/<script>`, so
+       they never need an execute bit, and an octal literal in YAML is a
+       recurring source of 0555-read-as-555 bugs. */}}
+- name: spec
+  configMap:
+    name: {{ include "dabet-deps.componentName" (dict "root" . "component" "kafka-admin") }}
+- name: run
+  emptyDir:
+    medium: Memory
+    sizeLimit: 1Mi
+{{- if .Values.kafka.admin.auth.tls.caSecret.name }}
+- name: kafka-ca
+  secret:
+    secretName: {{ .Values.kafka.admin.auth.tls.caSecret.name }}
+{{- end }}
 {{- end -}}

@@ -1,0 +1,354 @@
+{{- $bootstrap := include "dabet-deps.kafkaAdminBootstrap" . -}}
+{{- if and $bootstrap (or .Values.kafka.topics.enabled .Values.kafka.acls.enabled) -}}
+{{- $rf := include "dabet-deps.kafkaTopicRF" . | int -}}
+{{- $isr := include "dabet-deps.kafkaTopicMinISR" . | int -}}
+{{- /*
+  ============================================================================
+  THE KAFKA ADMIN SPEC
+
+  One ConfigMap, mounted by both admin Jobs (topic reconciler, ACL
+  reconciler), holding the data they act on and the scripts that act on it.
+
+  NOTHING SECRET IS IN HERE. The SASL credentials reach the Jobs as a
+  secretKeyRef on the pod (see dabet-deps.kafkaAdminEnv); `client-config.sh`
+  turns them into a client.properties inside a memory-backed emptyDir at
+  runtime. A ConfigMap is world-readable to anything with get on the
+  namespace, which is exactly why the password may never touch it.
+
+  Rendering the spec as data rather than inlining it in `args` means the
+  hook's content changes exactly when the registry or the ACL matrix
+  changes, which is what makes a re-run meaningful.
+  ============================================================================
+*/ -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "dabet-deps.componentName" (dict "root" . "component" "kafka-admin") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dabet-deps.componentLabels" (dict "root" . "component" "kafka-admin") | nindent 4 }}
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "-10"
+    "helm.sh/hook-delete-policy": before-hook-creation
+data:
+  # Space separated: name partitions retention.ms extra,config,pairs
+  # (no field may contain a space, which is why the extra configs are a
+  # comma-joined list rather than repeated fields.)
+  topics.txt: |
+    {{- range .Values.kafka.topics.registry }}
+    {{- $extra := list (printf "min.insync.replicas=%d" $isr) -}}
+    {{- range $k, $v := (.config | default dict) -}}
+    {{- $extra = append $extra (printf "%s=%s" $k ($v | toString)) -}}
+    {{- end }}
+    {{/* int64, NOT bare interpolation. Helm parses values.yaml numbers as
+         float64, so a bare {{ .retentionMs }} renders 86400000 as
+         "8.64e+07" and kafka-topics.sh rejects it with "Not a number of
+         type LONG". Every retention in the §4.2 registry is large enough
+         to hit this. */ -}}
+    {{ .name }} {{ .partitions | int64 }} {{ .retentionMs | int64 }} {{ join "," $extra }}
+    {{- end }}
+
+  # principal|resourceType|resourceName|patternType|op,op,op
+  # '|' rather than a space because a principal is "User:name" and a future
+  # resource name could legitimately contain one.
+  acls.txt: |
+    {{- range .Values.kafka.acls.rules }}
+    {{ .principal }}|{{ .resourceType }}|{{ .resourceName | default "kafka-cluster" }}|{{ .patternType | default "literal" }}|{{ join "," .operations }}
+    {{- end }}
+
+  client-config.sh: |
+    #!/usr/bin/env bash
+    # Sourced by both reconcilers. Turns the KAFKA_* environment into a
+    # Kafka client.properties and exports CMDCFG, the --command-config
+    # argument pair (empty when the broker needs no client config at all,
+    # which is what keeps the in-cluster plaintext path byte-identical to
+    # what it was before authentication existed).
+    #
+    # The file is written into /run/kafka-admin, an emptyDir with
+    # medium: Memory. The password is therefore never on a disk, never in a
+    # ConfigMap, and never in the rendered manifest.
+
+    CFG=/run/kafka-admin/client.properties
+    CMDCFG=()
+
+    _bool() {
+      case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
+        true|1|yes|on) return 0 ;;
+        *) return 1 ;;
+      esac
+    }
+
+    # sasl.jaas.config is a Java string literal. A backslash or a double
+    # quote in the password has to be escaped or the login module fails to
+    # parse the line — and what surfaces is an authentication failure, not a
+    # syntax error, which is a long walk back to the cause.
+    _jaas_escape() { printf '%s' "${1:-}" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+
+    # Same normalisation pkg/kafkax/security.go does, so a mechanism string
+    # that works for the services works here.
+    _mechanism() {
+      local m
+      m="$(printf '%s' "${1:-}" | tr '[:lower:]' '[:upper:]' | tr '_' '-' | tr -d '[:space:]')"
+      case "${m}" in
+        "")                                          echo "" ;;
+        SCRAM-SHA-512|SCRAMSHA512|SCRAM-SHA512)      echo "SCRAM-SHA-512" ;;
+        SCRAM-SHA-256|SCRAMSHA256|SCRAM-SHA256)      echo "SCRAM-SHA-256" ;;
+        PLAIN)                                       echo "PLAIN" ;;
+        AWS-MSK-IAM|AWSMSKIAM|MSK-IAM|OAUTHBEARER-AWS-MSK-IAM) echo "AWS_MSK_IAM" ;;
+        *)                                           echo "${m}" ;;
+      esac
+    }
+
+    kafka_client_config() {
+      local tls=0 mech proto
+      _bool "${KAFKA_TLS_ENABLED:-}" && tls=1
+      mech="$(_mechanism "${KAFKA_SASL_MECHANISM:-}")"
+
+      if [ "${tls}" -eq 0 ] && [ -z "${mech}" ]; then
+        echo "broker security: plaintext, no SASL"
+        return 0
+      fi
+
+      if [ "${mech}" = "AWS_MSK_IAM" ]; then
+        # The shell tools would need aws-msk-iam-auth on the classpath, and
+        # this image does not carry it. Fail here rather than after a
+        # 120-attempt connect loop that says nothing useful.
+        echo "FATAL: KAFKA_SASL_MECHANISM=AWS_MSK_IAM is not supported by the Kafka shell tools in this image." >&2
+        echo "       Use SCRAM-SHA-512 for the admin credential (see the chart README), or run the" >&2
+        echo "       reconciler from an image with the aws-msk-iam-auth jar on the classpath." >&2
+        return 1
+      fi
+
+      umask 077
+      : > "${CFG}"
+
+      if [ "${tls}" -eq 1 ] && [ -n "${mech}" ]; then proto=SASL_SSL
+      elif [ "${tls}" -eq 1 ];                   then proto=SSL
+      else                                            proto=SASL_PLAINTEXT
+      fi
+      echo "security.protocol=${proto}" >> "${CFG}"
+
+      if [ "${tls}" -eq 1 ]; then
+        if [ -n "${KAFKA_TLS_CA_FILE:-}" ]; then
+          # PEM truststores are Kafka >= 2.7 (KIP-651). MSK brokers present a
+          # publicly trusted certificate, so this is only for a private CA.
+          echo "ssl.truststore.type=PEM"                     >> "${CFG}"
+          echo "ssl.truststore.location=${KAFKA_TLS_CA_FILE}" >> "${CFG}"
+        fi
+        if _bool "${KAFKA_TLS_SKIP_VERIFY:-}"; then
+          # The JVM's nearest equivalent: it turns off HOSTNAME verification,
+          # not chain verification. A self-signed broker still needs its CA
+          # in KAFKA_TLS_CA_FILE. Non-production either way.
+          echo "ssl.endpoint.identification.algorithm=" >> "${CFG}"
+        fi
+      fi
+
+      if [ -n "${mech}" ]; then
+        local user pass module
+        user="$(_jaas_escape "${KAFKA_SASL_USERNAME:-}")"
+        pass="$(_jaas_escape "${KAFKA_SASL_PASSWORD:-}")"
+        if [ -z "${KAFKA_SASL_USERNAME:-}" ] || [ -z "${KAFKA_SASL_PASSWORD:-}" ]; then
+          echo "FATAL: KAFKA_SASL_MECHANISM=${mech} needs KAFKA_SASL_USERNAME and KAFKA_SASL_PASSWORD." >&2
+          echo "       Both come from kafka.admin.auth.sasl.existingSecret; check that the Secret" >&2
+          echo "       exists in this namespace and carries both keys." >&2
+          return 1
+        fi
+        case "${mech}" in
+          PLAIN) module=org.apache.kafka.common.security.plain.PlainLoginModule ;;
+          *)     module=org.apache.kafka.common.security.scram.ScramLoginModule ;;
+        esac
+        echo "sasl.mechanism=${mech}" >> "${CFG}"
+        printf 'sasl.jaas.config=%s required username="%s" password="%s";\n' \
+          "${module}" "${user}" "${pass}" >> "${CFG}"
+      fi
+
+      CMDCFG=(--command-config "${CFG}")
+      # Deliberately printed WITHOUT the file's contents.
+      echo "broker security: protocol=${proto} mechanism=${mech:-none}"
+    }
+
+    # Wait for the broker to answer. The in-cluster brokers may still be
+    # forming their quorum when this hook fires; a managed cluster is
+    # already up but its DNS or its security group may not be.
+    kafka_wait() {
+      local i attempts="${KAFKA_WAIT_ATTEMPTS:-120}" interval="${KAFKA_WAIT_INTERVAL:-5}"
+      echo "waiting for ${KAFKA_BOOTSTRAP} ..."
+      for i in $(seq 1 "${attempts}"); do
+        if /opt/kafka/bin/kafka-broker-api-versions.sh \
+             --bootstrap-server "${KAFKA_BOOTSTRAP}" \
+             ${CMDCFG[@]+"${CMDCFG[@]}"} >/dev/null 2>&1; then
+          echo "brokers reachable after ${i} attempt(s)"
+          return 0
+        fi
+        if [ "${i}" -eq "${attempts}" ]; then
+          echo "FATAL: brokers not reachable after ${attempts} attempts" >&2
+          return 1
+        fi
+        sleep "${interval}"
+      done
+    }
+
+  reconcile.sh: |
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    BOOTSTRAP="${KAFKA_BOOTSTRAP:?}"
+    RF="${KAFKA_RF:?}"
+    BIN=/opt/kafka/bin
+
+    # shellcheck source=/dev/null
+    . /spec/client-config.sh
+    kafka_client_config
+    kafka_wait
+
+    existing="$("${BIN}/kafka-topics.sh" --bootstrap-server "${BOOTSTRAP}" \
+      ${CMDCFG[@]+"${CMDCFG[@]}"} --list)"
+
+    rc=0
+    while read -r topic partitions retention extra; do
+      [ -z "${topic:-}" ] && continue
+
+      configs="retention.ms=${retention}"
+      [ -n "${extra:-}" ] && configs="${configs},${extra}"
+
+      # -F because topic names contain dots, which grep would otherwise
+      # read as "any character" and match a different topic.
+      if ! printf '%s\n' "${existing}" | grep -Fqx -- "${topic}"; then
+        echo "==> creating ${topic}: partitions=${partitions} rf=${RF} ${configs}"
+        cfgargs=()
+        IFS=',' read -ra pairs <<< "${configs}"
+        for p in "${pairs[@]}"; do cfgargs+=(--config "${p}"); done
+        # --if-not-exists keeps two concurrent runs of this job from racing
+        # each other into a TopicExistsException.
+        "${BIN}/kafka-topics.sh" --bootstrap-server "${BOOTSTRAP}" \
+          ${CMDCFG[@]+"${CMDCFG[@]}"} \
+          --create --if-not-exists --topic "${topic}" \
+          --partitions "${partitions}" --replication-factor "${RF}" \
+          "${cfgargs[@]}"
+        continue
+      fi
+
+      current="$("${BIN}/kafka-topics.sh" --bootstrap-server "${BOOTSTRAP}" \
+        ${CMDCFG[@]+"${CMDCFG[@]}"} \
+        --describe --topic "${topic}" \
+        | grep -o 'PartitionCount: [0-9]*' | head -1 | awk '{print $2}')"
+      echo "==> ${topic} exists with ${current} partition(s), want ${partitions}"
+
+      if [ "${current}" -lt "${partitions}" ]; then
+        echo "    increasing to ${partitions}"
+        "${BIN}/kafka-topics.sh" --bootstrap-server "${BOOTSTRAP}" \
+          ${CMDCFG[@]+"${CMDCFG[@]}"} \
+          --alter --topic "${topic}" --partitions "${partitions}"
+      elif [ "${current}" -gt "${partitions}" ]; then
+        # Deliberately not fatal, and deliberately loud.
+        echo "    WARNING: ${topic} has ${current} partitions but values ask for ${partitions}." >&2
+        echo "    Kafka cannot shrink a topic. Shrinking would require delete+recreate," >&2
+        echo "    which drops every retained record and re-maps every key. Leaving it alone." >&2
+      fi
+
+      echo "    reconciling config: ${configs}"
+      "${BIN}/kafka-configs.sh" --bootstrap-server "${BOOTSTRAP}" \
+        ${CMDCFG[@]+"${CMDCFG[@]}"} \
+        --entity-type topics --entity-name "${topic}" \
+        --alter --add-config "${configs}"
+    done < /spec/topics.txt
+
+    echo
+    echo "final state:"
+    "${BIN}/kafka-topics.sh" --bootstrap-server "${BOOTSTRAP}" \
+      ${CMDCFG[@]+"${CMDCFG[@]}"} --describe \
+      | grep -E '^Topic:' || true
+    exit "${rc}"
+
+  acls.sh: |
+    #!/usr/bin/env bash
+    # ==========================================================================
+    # ACL RECONCILER
+    #
+    # `kafka-acls.sh --add` is idempotent: adding a binding that already
+    # exists is a no-op, so this is safe on every upgrade and every re-run.
+    #
+    # ORDER IS LOAD-BEARING. On a broker with
+    # allow.everyone.if.no.acl.found=true (the MSK default) authorisation is
+    # evaluated per RESOURCE: while a resource has no ACL at all, everyone may
+    # use it; the moment it has one, only the ACL applies. So the very first
+    # binding written for the Cluster resource is the one that decides who
+    # can write bindings at all. /spec/acls.txt is emitted with the admin
+    # principal's own cluster grants first, and this script applies the file
+    # in order, so the credential running it never locks itself out.
+    #
+    # This RECONCILES FORWARD ONLY: it adds what the values ask for and never
+    # removes anything. Deleting a binding is `kafka-acls.sh --remove`, done
+    # by hand — an automatic prune would turn a values typo into a production
+    # outage, and the failure mode of a stale extra ACL is far milder than
+    # the failure mode of a deleted one. The full list is printed at the end
+    # so a stale binding is visible.
+    # ==========================================================================
+    set -euo pipefail
+
+    BOOTSTRAP="${KAFKA_BOOTSTRAP:?}"
+    BIN=/opt/kafka/bin
+
+    # shellcheck source=/dev/null
+    . /spec/client-config.sh
+    kafka_client_config
+    kafka_wait
+
+    applied=0
+    failed=0
+    while IFS='|' read -r principal rtype rname ptype ops; do
+      [ -z "${principal:-}" ] && continue
+
+      args=(--bootstrap-server "${BOOTSTRAP}" ${CMDCFG[@]+"${CMDCFG[@]}"}
+            --add --allow-principal "${principal}")
+
+      case "${rtype}" in
+        cluster)
+          # --cluster takes no name: there is exactly one, and it is called
+          # "kafka-cluster" in every listing.
+          args+=(--cluster)
+          ;;
+        topic)
+          args+=(--topic "${rname}" --resource-pattern-type "${ptype}")
+          ;;
+        group)
+          args+=(--group "${rname}" --resource-pattern-type "${ptype}")
+          ;;
+        transactional-id)
+          args+=(--transactional-id "${rname}" --resource-pattern-type "${ptype}")
+          ;;
+        *)
+          echo "ERROR: unknown resourceType ${rtype} for ${principal}" >&2
+          failed=$((failed + 1))
+          continue
+          ;;
+      esac
+
+      IFS=',' read -ra oplist <<< "${ops}"
+      for o in "${oplist[@]}"; do args+=(--operation "${o}"); done
+
+      echo "==> ${principal} ${rtype}:${rname} (${ptype}) ${ops}"
+      if "${BIN}/kafka-acls.sh" "${args[@]}" >/dev/null; then
+        applied=$((applied + 1))
+      else
+        # Keep going: a single bad rule must not leave the rest of the matrix
+        # unapplied, which on a cluster with allow.everyone.if.no.acl.found
+        # would be a half-open, half-closed cluster.
+        echo "    FAILED" >&2
+        failed=$((failed + 1))
+      fi
+    done < /spec/acls.txt
+
+    echo
+    echo "current bindings:"
+    "${BIN}/kafka-acls.sh" --bootstrap-server "${BOOTSTRAP}" \
+      ${CMDCFG[@]+"${CMDCFG[@]}"} --list || true
+
+    echo
+    echo "applied=${applied} failed=${failed}"
+    if [ "${failed}" -ne 0 ]; then
+      echo "FATAL: ${failed} binding(s) could not be applied. Re-running is safe and idempotent." >&2
+      exit 1
+    fi
+{{- end }}

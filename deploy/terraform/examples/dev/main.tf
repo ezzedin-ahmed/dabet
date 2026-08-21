@@ -98,6 +98,19 @@ module "dabet" {
     client_authentication               = "scram"
     encryption_in_transit_client_broker = "TLS"
 
+    # ONE credential for every service, which is the switchable half of the
+    # authorisation story. It is the cheaper shape — one Secrets Manager
+    # secret and one ExternalSecret instead of six of each — and it is
+    # honestly weaker: every ACL rule collapses onto the same principal, so
+    # what that principal ends up holding is the UNION of the matrix, i.e.
+    # read and write on every topic. Fine for a dev cluster that nothing real
+    # depends on. examples/prod uses "per_service", and so does the default.
+    #
+    # The reconciler admin still gets its own credential in both modes: a
+    # shared SERVICE credential is a trade-off, a shared ADMIN credential
+    # would just hand every service CreateTopic and cluster Alter.
+    scram_mode = "shared"
+
     # 3 partitions per topic locally (docker-compose.yml) and 512 in the target
     # (§4.2). Neither is set here: topic creation belongs to the charts. What
     # the broker default controls is anything created implicitly, and a

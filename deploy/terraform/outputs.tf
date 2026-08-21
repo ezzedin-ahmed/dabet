@@ -310,8 +310,102 @@ output "postgres_password_commands" {
 }
 
 output "kafka_scram_secret_arn" {
-  description = "Secrets Manager ARN holding the MSK SASL/SCRAM {username, password}. Null unless SCRAM is in use."
+  description = <<-EOT
+    One Secrets Manager ARN holding an MSK SASL/SCRAM {username, password}.
+    Null unless SCRAM is in use.
+
+    Kept for the single-credential shape. Under msk.scram_mode="per_service"
+    there are several, and `kafka_scram_secret_arns` is the one to read.
+  EOT
   value       = module.msk.scram_secret_arn
+}
+
+output "kafka_scram_secret_arns" {
+  description = <<-EOT
+    Secrets Manager ARN per SCRAM username: one per service plus the
+    reconciler admin under "per_service", one service credential plus the admin
+    under "shared". Empty unless SCRAM is in use.
+  EOT
+  value       = module.msk.scram_secret_arns
+}
+
+output "kafka_scram_usernames" {
+  description = <<-EOT
+    SCRAM username per dabet service — the identity each one authenticates as
+    and therefore the Kafka principal its ACLs name. Every service resolves to
+    the same name under msk.scram_mode="shared".
+  EOT
+  value       = module.kafka_acls.usernames
+}
+
+output "kafka_admin_username" {
+  description = <<-EOT
+    SCRAM username for the chart's topic and ACL reconcilers.
+
+    It is not any service's credential: it is the only principal holding
+    CreateTopic, Alter and the cluster-level Alter that writing ACLs requires,
+    and it never holds Delete on anything.
+  EOT
+  value       = module.kafka_acls.admin_username
+}
+
+output "kafka_acl_matrix" {
+  description = <<-EOT
+    Every Kafka ACL binding this deployment needs, admin grants first, in the
+    shape charts/dabet-deps takes as kafka.acls.rules.
+
+    Already embedded in helm_values_dabet_deps; exposed separately so the
+    matrix can be diffed against `kafka-acls.sh --list` on a live cluster.
+  EOT
+  value       = module.kafka_acls.rules
+}
+
+output "kafka_acl_commands" {
+  description = <<-EOT
+    The same bindings as kafka-acls.sh invocations, for applying them from a
+    bastion inside the VPC rather than from the chart Job.
+
+    Terraform does not apply them. Kafka ACLs are a Kafka protocol operation —
+    the AWS provider has no resource for them, and the only provider that does
+    needs a TCP connection to a broker, which the isolated data-tier subnets do
+    not offer to anything running outside the VPC. The chart's ACL Job is the
+    supported path; this is the manual one.
+
+    ORDER MATTERS. Run them in the order given: with
+    allow.everyone.if.no.acl.found=true, the first binding written against the
+    Cluster resource decides who may write bindings at all, so the admin's own
+    Alter grant has to land first.
+
+    They assume a client.properties in the working directory:
+
+      security.protocol=SASL_SSL
+      sasl.mechanism=SCRAM-SHA-512
+      sasl.jaas.config=org.apache.kafka.common.security.scram.ScramLoginModule \
+        required username="<admin>" password="<from secretsmanager>";
+  EOT
+  value = [
+    for c in module.kafka_acls.commands :
+    replace(c, "<BOOTSTRAP>", module.msk.bootstrap_brokers_sasl_scram)
+  ]
+}
+
+output "kafka_external_secret_manifests" {
+  description = <<-EOT
+    ExternalSecret manifests for the per-service Kafka credentials and the
+    reconciler admin's, ready for `kubectl apply -f -`.
+
+    They exist as an output rather than as chart values because charts/dabet
+    renders exactly ONE ExternalSecret — for the aggregate secret document —
+    and per-service Kafka credentials need one each. `helm_values_dabet`
+    already points every service's envRaw at the Secret names below; these
+    manifests are what create them. A chart gap, recorded rather than worked
+    around, because the fix belongs in charts/dabet.
+
+      tofu output -raw kafka_external_secret_manifests | kubectl apply -f -
+
+    Empty unless SCRAM is in use.
+  EOT
+  value       = local.kafka_external_secret_manifests
 }
 
 output "kafka_sasl_mechanism" {

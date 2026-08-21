@@ -153,9 +153,65 @@ variable "client_authentication" {
 }
 
 variable "scram_username" {
-  description = "SASL/SCRAM username. Goes into the Secrets Manager value as {username, password}."
+  description = <<-EOT
+    SASL/SCRAM username for the SINGLE-CREDENTIAL fallback, used only when
+    `scram_users` is empty. Goes into the Secrets Manager value as
+    {username, password}.
+  EOT
   type        = string
   default     = "dabet"
+}
+
+variable "scram_users" {
+  description = <<-EOT
+    SASL/SCRAM users to create, as a map of username to description. One
+    Secrets Manager secret each, one generated password each, all of them
+    associated with the cluster.
+
+    Empty falls back to a single credential named by `scram_username`. That
+    fallback is the dev shape and it is worth being explicit about what it
+    costs: SCRAM authenticates but does not authorise, authorisation on a SCRAM
+    cluster is Kafka ACLs, and one credential shared by every service means the
+    ACL matrix can only ever grant that one principal the UNION of what all of
+    them need. Blast radius is then "any compromised service can do anything
+    any service can do".
+
+    Populate it from modules/kafka-acls's `scram_users` output for the
+    least-privilege shape: one principal per service plus the reconciler admin,
+    each matched by ACLs scoped to what that service actually does.
+
+    Secret names are "AmazonMSK_<cluster>_<username>", which is both the prefix
+    MSK requires and enough to tell two deployments apart in one account.
+  EOT
+  type        = map(string)
+  default     = {}
+}
+
+variable "allow_everyone_if_no_acl_found" {
+  description = <<-EOT
+    Whether a resource with NO ACL is open to every authenticated principal.
+
+    MSK's default is `true`, and this module keeps it — turning it off is a
+    two-phase operation and doing it in one apply bricks the cluster:
+
+      Phase 1  Create the cluster with this `true`, apply the ACL matrix (the
+               chart's ACL Job, or the `commands` output from a bastion), and
+               confirm every service is connected and consuming.
+      Phase 2  Set this to `false` and apply. MSK adds a configuration revision
+               and rolls the brokers.
+
+    Doing phase 2 first leaves a cluster where nothing is authorised for
+    anything, including the credential that would write the ACLs — recovering
+    means another configuration revision and another rolling restart.
+
+    Leaving it `true` is not equivalent to having no ACLs. Once a resource has
+    a binding the flag stops applying TO THAT RESOURCE, so every topic and
+    group in the matrix is genuinely restricted. What stays open is anything
+    NOT in the matrix: a topic someone creates by hand, or an internal topic.
+    Flip it to `false` in production once the matrix is proven.
+  EOT
+  type        = bool
+  default     = true
 }
 
 variable "scram_password_length" {

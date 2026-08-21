@@ -158,12 +158,30 @@ ordinal inside the container, because a StatefulSet has no per-ordinal env.
 Topics are created and reconciled by a post-install/post-upgrade Job driven by
 `kafka.topics.registry`:
 
-| Topic | Partitions | Retention |
-| --- | --- | --- |
-| `messages.v1` | 512 | 24 h |
-| `flagged.v1` | 128 | 7 d |
-| `deletions.v1` | 128 | 24 h |
-| `usage.v1` | 32 | 7 d |
+| Topic | Partitions | Retention | Source |
+| --- | --- | --- | --- |
+| `messages.v1` | 512 | 24 h | §4.2 |
+| `flagged.v1` | 128 | 7 d | §4.2 |
+| `deletions.v1` | 128 | 24 h | §4.2 |
+| `usage.v1` | 32 | 7 d | §4.2 |
+| `adapter.shards.v1` | 3 | 1 h | §7.2 / A13 |
+
+`adapter.shards.v1` is not part of the §4.2 table. It is the coordination
+topic for `provider-adapter`'s shard ring: the ring is a consumer group, a
+consumer group needs something to subscribe to, and no record is ever written
+to it — membership of the group *is* the fleet view
+(`services/provider-adapter/internal/shard/kafka.go`). The adapter tries to
+create it itself on startup, best effort, with `-1/-1` for partitions and
+replication; that only works where its principal holds `CreateTopic`, and
+under `auto.create.topics.enable=false` a failure there means the ring never
+forms. Creating it here makes sharding work either way and makes the layout a
+value rather than whatever the broker's defaults happen to be. Three
+partitions because the ring balancer ignores them entirely.
+
+> Helm **replaces** a list rather than merging it. Anything that redefines
+> `kafka.topics.registry` — including `values-local.yaml` and
+> `values-prod.yaml` — must restate every topic, or the ones it leaves out
+> silently stop being reconciled. `hack/render-matrix.sh` asserts this.
 
 The job is idempotent and safe to re-run:
 
@@ -183,6 +201,167 @@ capped at the replication factor so `acks=all` can never be unsatisfiable.
 > `values-local.yaml` shrinks the counts to 12/6/6/3 and every retention to 1 h.
 > The *ratios* are preserved so consumer-group behaviour still looks like
 > production.
+
+### The reconciler is not gated on `kafka.enabled`
+
+It used to be, and that was a day-one bug on AWS. With MSK the chart's own
+broker is off, MSK runs with `auto.create.topics.enable = false`, and the
+result was a release that installed cleanly and then failed every produce with
+`UNKNOWN_TOPIC_OR_PARTITION`.
+
+What the reconciler needs is a **broker address**, not a broker StatefulSet.
+So it renders whenever one is resolvable, using the same resolution the
+services get — `external.kafka.brokers` first, the in-cluster StatefulSet
+second, `kafka.admin.bootstrapOverride` if the broker publishes a separate
+admin listener. When neither exists the Job does not render, which is why the
+"everything disabled" release is still two objects.
+
+Two other things follow from an external broker:
+
+* **Replication factor.** `kafka.replicas` is only a real broker count when
+  this chart runs the brokers. Self-hosted, `kafka.topics.replicationFactor`
+  is capped at it so a one-broker laptop still installs; external, it is taken
+  verbatim, because the chart cannot know how many brokers are out there and
+  capping at a leftover default of 3 would be inventing a number.
+* **`min.insync.replicas`.** Defaults to `kafka.minInsyncReplicas`, capped at
+  the effective topic replication factor. `kafka.topics.minInsyncReplicas`
+  overrides it for an external cluster with a different durability contract.
+
+### Authenticating the reconciler
+
+`kafka.admin.auth` mirrors `pkg/kafkax/security.go`, so a configuration that
+works for the services works for the Job:
+
+```yaml
+kafka:
+  admin:
+    auth:
+      tls:
+        enabled: true          # MSK: SASL is only offered over TLS, port 9096
+        skipVerify: false
+        caSecret: {name: "", key: ca.crt}   # a private CA only; MSK uses a public one
+      sasl:
+        mechanism: SCRAM-SHA-512
+        existingSecret:
+          name: dabet-kafka-admin
+          usernameKey: KAFKA_SASL_USERNAME
+          passwordKey: KAFKA_SASL_PASSWORD
+```
+
+**There is no `password:` value, and there must never be one.** The credential
+reaches the pod as a `secretKeyRef` against a Secret that already exists;
+`client-config.sh` turns it into a `client.properties` inside an emptyDir with
+`medium: Memory` and `umask 077`. Nothing secret is baked into the image, into
+the mounted ConfigMap, or into the rendered manifest — `render-matrix.sh`
+asserts both halves of that.
+
+The Secret is **its own credential, not one of the service credentials**. The
+reconciler is the only principal that needs `CreateTopic`, `Alter` and
+`AlterConfigs`; giving a service those rights so a Job can borrow them would
+undo the point of the ACL matrix below. On the AWS path Terraform creates it
+as `scram_users["<cluster>-admin"]` and External Secrets Operator projects it
+into the namespace under this name.
+
+`AWS_MSK_IAM` is deliberately rejected here: the Kafka shell tools need
+`aws-msk-iam-auth` on the classpath and the `apache/kafka` image does not
+carry it. The script says so and exits rather than failing in a 120-attempt
+connect loop.
+
+---
+
+## Kafka ACLs
+
+SASL authenticates. It does not authorise: on a SCRAM cluster, authorisation
+is Kafka ACLs, and a cluster with none of them gives every credential blanket
+access to every topic. `kafka.acls` closes that.
+
+Off by default, because it is only meaningful on a broker that authenticates
+its clients and the broker this chart runs does not. Terraform turns it on for
+the MSK path and renders `kafka.acls.rules` from the same §1.5 table that
+produces the IAM policies — see `deploy/terraform/modules/kafka-acls`.
+
+```yaml
+kafka:
+  acls:
+    enabled: true
+    rules:
+      - principal: "User:dabet-moderation-service"
+        resourceType: topic            # cluster | topic | group | transactional-id
+        resourceName: messages.v1      # ignored for `cluster`
+        patternType: literal           # literal | prefixed | any
+        operations: [Read, Describe]
+```
+
+**Why a Job and not Terraform.** Kafka ACLs are a Kafka protocol operation.
+The AWS provider has no resource for them; the only Terraform provider that
+does (`Mongey/kafka`) speaks the Kafka protocol directly and therefore needs
+the machine running `tofu apply` to open a socket to the brokers. MSK brokers
+live in subnets with no route to the internet in either direction and a
+security group that admits only the EKS cluster's security group. A Terraform
+run from a laptop or a CI runner outside the VPC cannot reach them at all.
+The cluster is the one place that already has the network path, the credential
+and a scheduler — so Terraform stays the source of truth for the matrix and
+the cluster is the applier.
+
+**Ordering is load-bearing.** With `allow.everyone.if.no.acl.found = true`
+(MSK's default) authorisation is evaluated per *resource*: while a resource
+has no ACL at all everyone may use it, and the moment it has one only the ACL
+applies. So the first binding written for the `Cluster` resource decides who
+may write bindings at all. The rule list is emitted with the admin
+principal's own cluster grants first and the script applies it in order, so
+the credential running it cannot lock itself out. The ACL Job runs at hook
+weight `-2`, before the topic reconciler at `0`, because the admin's own
+`CreateTopic` right is itself an ACL.
+
+**It reconciles forward only.** `kafka-acls.sh --add` is idempotent, so
+re-running on every upgrade is safe. Nothing is ever removed: an automatic
+prune would turn a values typo into an outage, and a stale extra binding is a
+far milder failure than a deleted one. The full binding list is printed at
+the end of every run so drift is visible.
+
+### What was checked against a real broker
+
+Both reconcilers were run **as rendered by this chart**, unmodified, in the
+`apache/kafka:3.9.0` image, against a single-node KRaft broker configured the
+way MSK is: SASL/SCRAM-SHA-512, the `StandardAuthorizer`,
+`allow.everyone.if.no.acl.found = true`, and `auto.create.topics.enable =
+false`. The full 25-binding matrix applied on the first run, and the second run
+still succeeded — which is the check that matters, because by then the
+`Cluster` resource had ACLs and the admin was authorising itself with the
+binding it had just written.
+
+The matrix bites, and the failures land where they should:
+
+| As | Action | Result |
+| --- | --- | --- |
+| `review-service` | produce `deletions.v1` | allowed |
+| `review-service` | groupless assign on `flagged.v1` (§7.6) | allowed |
+| `review-service` | produce `messages.v1` / `usage.v1` | `TopicAuthorizationException` |
+| `review-service` | create a topic | denied — nothing was created |
+| `review-service` | grant itself an ACL | denied |
+| `moderation-service` | produce `flagged.v1`, consume `messages.v1` in its own group | allowed |
+| `moderation-service` | produce `messages.v1` | denied |
+| `moderation-service` | join `insights-service`'s group | `GroupAuthorizationException` |
+
+Two results are worth carrying forward:
+
+* **`allow.everyone.if.no.acl.found` really does leave the gaps open.**
+  `review-service` was able to join a consumer group *named* `review-service`
+  — it holds no group ACL, so that group has no bindings at all, so the flag
+  let it through. Every group and topic the matrix names is genuinely
+  restricted; nothing else is. That is the argument for the second phase of
+  the flip described in `deploy/terraform/modules/msk`.
+* **A service principal cannot run `kafka-topics.sh --describe`**, because
+  `TopicCommand` also fetches topic configs and that needs `DescribeConfigs`,
+  which no service is granted. The application path is unaffected — franz-go
+  needs `Describe` and `Read` — and the CLI being unusable from a service
+  credential is the correct outcome, not a missing grant.
+
+The topic reconciler's three idempotence cases were exercised over the same
+authenticated connection: create-when-absent, raise `usage.v1` from 32 to 64
+partitions, refuse to shrink `flagged.v1` from 128 to 8 (loud, non-fatal,
+exit 0, partition count untouched), and re-apply a changed retention. Three
+consecutive runs converge.
 
 ---
 
@@ -327,7 +506,7 @@ memcached:  {enabled: false}
 minio:      {enabled: false}
 
 external:
-  kafka:     {brokers: "b-1.msk...:9092,b-2.msk...:9092"}
+  kafka:     {brokers: "b-1.msk...:9096,b-2.msk...:9096"}
   postgres:
     identity: "postgres://dabet:pw@identity.rds...:5432/dabet_identity?sslmode=require"
     policy:   "postgres://dabet:pw@policy.rds...:5432/dabet_policy?sslmode=require"
@@ -338,6 +517,29 @@ external:
 
 An `external.*` value wins even when the component is enabled, so it doubles as
 a manual override.
+
+Kafka is the one component where handing it over is not purely a matter of
+addresses, because a managed broker authenticates and authorises. On the MSK
+path add:
+
+```yaml
+kafka:
+  enabled: false            # no in-cluster brokers
+  topics:
+    enabled: true           # ...but the §4.2 topics still have to exist
+  admin:
+    auth:
+      tls: {enabled: true}
+      sasl:
+        mechanism: SCRAM-SHA-512
+        existingSecret: {name: dabet-kafka-admin}
+  acls:
+    enabled: true
+    rules: [ ... ]          # rendered by deploy/terraform
+```
+
+`tofu output -raw helm_values_dabet_deps_yaml` produces exactly that block,
+filled in.
 
 With everything disabled the chart still renders — two objects, the Secret and
 the ConfigMap, carrying only the keys that were externally configured. That
@@ -352,8 +554,10 @@ helm lint deploy/k8s/charts/dabet-deps
 helm lint deploy/k8s/charts/dabet-deps -f .../values-local.yaml
 helm lint deploy/k8s/charts/dabet-deps -f .../values-prod.yaml
 
-# 22 enable/disable combinations, each rendered and pushed through
-# `kubectl apply --dry-run=client`
+# 26 enable/disable combinations, each rendered and pushed through
+# `kubectl apply --dry-run=client`, plus assertions that the §4.2 numbers
+# are intact in every shipped profile and that the reconciler credential is
+# a secretKeyRef and never a literal
 ./hack/render-matrix.sh
 NO_KUBECTL=1 ./hack/render-matrix.sh      # render only, no cluster needed
 KUBE_CONTEXT=kind-dabet ./hack/render-matrix.sh
