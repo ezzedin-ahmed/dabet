@@ -35,8 +35,11 @@ global:
 # ---------------------------------------------------------------------------
 config:
   kafkaBrokers: "dabet-deps-kafka:9092"
-  redisAddr: "dabet-deps-redis-master:6379"
-  memcachedAddrs: "dabet-deps-memcached:11211"
+  # dabet-deps runs a real 3-shard Redis cluster (§3/§4.3), addressed by its
+  # headless per-pod DNS. REDIS_CLUSTER_ENABLED below selects the cluster
+  # client; the §4.3 hash tags are what make that a config change.
+  redisAddr: "dabet-deps-redis-0.dabet-deps-redis-headless:6379,dabet-deps-redis-1.dabet-deps-redis-headless:6379,dabet-deps-redis-2.dabet-deps-redis-headless:6379"
+  memcachedAddrs: "dabet-deps-memcached-0.dabet-deps-memcached-headless:11211,dabet-deps-memcached-1.dabet-deps-memcached-headless:11211"
   # tools/mockllm — deterministic OpenAI-compatible stub. "FLAGME" violates
   # rule 1, which is what test/e2e asserts on.
   vllmEndpoint: "http://dabet-deps-mockllm:8089"
@@ -46,11 +49,16 @@ config:
   s3Endpoint: "http://dabet-deps-minio:9000"
   s3Bucket: "embeddings"
   logLevel: "debug"
+  extra:
+    REDIS_CLUSTER_ENABLED: "true"
 
 secrets:
   create: true
   data:
-    POSTGRES_DSN: "postgres://dabet:dabet@dabet-deps-postgresql:5432/dabet?sslmode=disable"
+    # dabet-deps provisions two instances per §3 (identity and policy), not
+    # one. Each service reads whichever holds its schema.
+    POSTGRES_DSN_IDENTITY: "postgres://dabet:dabet@dabet-deps-postgres-identity:5432/dabet_identity?sslmode=disable"
+    POSTGRES_DSN_POLICY: "postgres://dabet:dabet@dabet-deps-postgres-policy:5432/dabet_policy?sslmode=disable"
     CLICKHOUSE_DSN: "clickhouse://dabet:dabet@dabet-deps-clickhouse:9000/dabet"
     S3_ACCESS_KEY: "minioadmin"
     S3_SECRET_KEY: "minioadmin"
@@ -182,9 +190,10 @@ services:
       MAIL_FROM: "Dabet <no-reply@dabet.local>"
       MAIL_TLS: "none"
     secretEnv:
-      # One Postgres for every schema (§3 local column), so all four services
-      # read the same key.
-      POSTGRES_DSN: POSTGRES_DSN
+      # identity + billing live on the identity instance; policy + review on
+      # the policy one. See the dabet-deps README for why they are split that
+      # way (an identity outage stops logins; the other two fail open).
+      POSTGRES_DSN: POSTGRES_DSN_IDENTITY
       OAUTH_MOCK_CLIENT_ID: OAUTH_MOCK_CLIENT_ID
       OAUTH_MOCK_CLIENT_SECRET: OAUTH_MOCK_CLIENT_SECRET
 
@@ -205,7 +214,7 @@ services:
       MAIL_FROM: "Dabet <no-reply@dabet.local>"
       MAIL_TLS: "none"
     secretEnv:
-      POSTGRES_DSN: POSTGRES_DSN
+      POSTGRES_DSN: POSTGRES_DSN_IDENTITY
       STRIPE_SECRET_KEY: STRIPE_SECRET_KEY
       STRIPE_WEBHOOK_SECRET: STRIPE_WEBHOOK_SECRET
 
@@ -215,7 +224,7 @@ services:
       requests: { cpu: 25m, memory: 64Mi }
       limits: { cpu: 500m, memory: 256Mi }
     secretEnv:
-      POSTGRES_DSN: POSTGRES_DSN
+      POSTGRES_DSN: POSTGRES_DSN_POLICY
 
   provider-adapter:
     # Two, not one. With a single instance the A13 ring has one member and
@@ -241,7 +250,7 @@ services:
       ADAPTER_INGEST_BUFFER: "256"
       OAUTH_MOCK_TOKEN_URL: "http://dabet-deps-mockoauth:9099/oauth/token"
     secretEnv:
-      POSTGRES_DSN: POSTGRES_DSN
+      POSTGRES_DSN: POSTGRES_DSN_IDENTITY
       OAUTH_MOCK_CLIENT_ID: OAUTH_MOCK_CLIENT_ID
       OAUTH_MOCK_CLIENT_SECRET: OAUTH_MOCK_CLIENT_SECRET
 
@@ -271,7 +280,7 @@ services:
       requests: { cpu: 25m, memory: 64Mi }
       limits: { cpu: 500m, memory: 256Mi }
     secretEnv:
-      POSTGRES_DSN: POSTGRES_DSN
+      POSTGRES_DSN: POSTGRES_DSN_POLICY
 
   insights-service:
     replicas: 1
