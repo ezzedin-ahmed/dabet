@@ -22,48 +22,12 @@ locals {
   kafka_topic_arn = local.kafka_enabled ? replace(var.msk_cluster_arn, ":cluster/", ":topic/") : ""
   kafka_group_arn = local.kafka_enabled ? replace(var.msk_cluster_arn, ":cluster/", ":group/") : ""
 
-  # §4.2's topic registry, restated as who may do what. Keeping this in one
-  # place means a change to the topic table is a one-line change here.
-  kafka_access = {
-    provider-adapter = {
-      read   = ["deletions.v1"]
-      write  = ["messages.v1"]
-      create = [var.adapter_coordination_topic]
-      # The coordination topic is subscribed to but never read for records; the
-      # group membership is the whole point (§7.2).
-      read_also = [var.adapter_coordination_topic]
-    }
-    moderation-service = {
-      read      = ["messages.v1"]
-      write     = ["flagged.v1", "deletions.v1", "usage.v1"]
-      create    = []
-      read_also = []
-    }
-    review-service = {
-      read      = ["flagged.v1"]
-      write     = ["deletions.v1"]
-      create    = []
-      read_also = []
-    }
-    insights-service = {
-      read      = ["messages.v1", "flagged.v1"]
-      write     = []
-      create    = []
-      read_also = []
-    }
-    credits-service = {
-      read      = ["usage.v1"]
-      write     = []
-      create    = []
-      read_also = []
-    }
-    clusters-job = {
-      read      = []
-      write     = ["usage.v1"]
-      create    = []
-      read_also = []
-    }
-  }
+  # §1.5's producer/consumer table, restated as who may do what. It is a
+  # VARIABLE (see kafka_access) so that a root calling both this module and
+  # modules/kafka-acls generates the IAM policies and the Kafka ACLs from ONE
+  # table. Its default is the same matrix, for a root that calls this module
+  # alone.
+  kafka_access = var.kafka_access
 
   services = keys(var.service_account_names)
 }

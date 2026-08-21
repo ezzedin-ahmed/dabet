@@ -70,6 +70,54 @@ locals {
   )
 
   # ---------------------------------------------------------------------------
+  # Per-service Kafka credentials
+  #
+  # Under least privilege each service authenticates as its own SCRAM
+  # principal, so KAFKA_SASL_USERNAME and KAFKA_SASL_PASSWORD cannot come from
+  # the one shared secret document every pod reads — they have to be per pod.
+  #
+  # charts/dabet has a first-class hatch for this: services.<name>.envRaw is
+  # spliced verbatim into the container's env list, so a secretKeyRef fits
+  # without the chart needing a new key. What the chart does NOT have is a
+  # per-service ExternalSecret template — externalsecret.yaml renders exactly
+  # one, for the aggregate document — so the Secrets those refs point at are
+  # created from the `kafka_external_secret_manifests` output, which is a
+  # kubectl apply away. That is a chart gap, recorded rather than worked
+  # around, because the fix belongs in charts/dabet.
+  #
+  # In "shared" mode every service resolves to the same username, and the
+  # blocks below all point at the same Secret. The wiring is identical either
+  # way, which is what makes flipping msk.scram_mode a one-line change.
+  # ---------------------------------------------------------------------------
+  kafka_service_secret_name = { for svc, u in module.kafka_acls.usernames : svc => "dabet-kafka-${svc}" }
+
+  # Only the services that actually speak Kafka. user-service, policy-service
+  # and clustering-service have no franz-go dependency at all and get no
+  # credential — a service with no Kafka client and a Kafka credential is just
+  # an unnecessary secret.
+  kafka_service_env = module.msk.sasl_mechanism == "SCRAM-SHA-512" ? {
+    for svc, u in module.kafka_acls.usernames : svc => [
+      {
+        name = "KAFKA_SASL_USERNAME"
+        valueFrom = {
+          secretKeyRef = { name = local.kafka_service_secret_name[svc], key = "KAFKA_SASL_USERNAME" }
+        }
+      },
+      {
+        name = "KAFKA_SASL_PASSWORD"
+        valueFrom = {
+          secretKeyRef = { name = local.kafka_service_secret_name[svc], key = "KAFKA_SASL_PASSWORD" }
+        }
+      },
+    ]
+  } : {}
+
+  # The Secret the two reconciler Jobs read. Its own credential, deliberately
+  # not any service's: it is the only principal with CreateTopic and cluster
+  # Alter.
+  kafka_admin_secret_name = "dabet-kafka-admin"
+
+  # ---------------------------------------------------------------------------
   # charts/dabet
   # ---------------------------------------------------------------------------
   helm_values_dabet = {
@@ -121,13 +169,21 @@ locals {
     }
 
     services = {
-      for svc in local.services : svc => {
-        serviceAccount = {
-          annotations = {
-            "eks.amazonaws.com/role-arn" = module.iam.service_role_arns[svc]
+      for svc in local.services : svc => merge(
+        {
+          serviceAccount = {
+            annotations = {
+              "eks.amazonaws.com/role-arn" = module.iam.service_role_arns[svc]
+            }
           }
-        }
-      }
+        },
+        # Per-service SCRAM credential, for the six services that speak Kafka.
+        # Absent entirely for the other three, so their pods carry no Kafka
+        # credential at all.
+        contains(keys(local.kafka_service_env), svc) ? {
+          envRaw = local.kafka_service_env[svc]
+        } : {},
+      )
     }
   }
 
@@ -140,7 +196,49 @@ locals {
   # ---------------------------------------------------------------------------
   helm_values_dabet_deps = {
     kafka = {
+      # No in-cluster brokers...
       enabled = false
+
+      # ...but the §4.2 topics still have to exist, and MSK runs with
+      # auto.create.topics.enable=false. The chart's reconciler is no longer
+      # gated on kafka.enabled: it needs a broker ADDRESS, which
+      # external.kafka.brokers below supplies. Without this the deployment
+      # installs cleanly and then fails every produce with
+      # UNKNOWN_TOPIC_OR_PARTITION.
+      topics = {
+        enabled = true
+      }
+
+      # How the reconciler authenticates. The credential is a Secret NAME, not
+      # a value: the chart takes it as a secretKeyRef and there is no values
+      # key that could hold a password.
+      admin = {
+        auth = {
+          tls = {
+            # MSK offers SASL only over TLS (port 9096), and its brokers
+            # present a publicly trusted certificate, so no CA bundle.
+            enabled = module.msk.tls_enabled
+          }
+          sasl = {
+            mechanism = module.msk.sasl_mechanism == "SCRAM-SHA-512" ? "SCRAM-SHA-512" : ""
+            existingSecret = {
+              name = local.kafka_admin_secret_name
+            }
+          }
+        }
+      }
+
+      # SASL authenticates; it does not authorise. Without these every
+      # credential can reach every topic. The rules come from
+      # modules/kafka-acls — the same §1.5 table that produced the IAM
+      # policies — and are applied by a Job in the cluster, because the
+      # brokers have no network path to wherever Terraform runs. Off unless
+      # SCRAM is the authentication mode, since ACLs are meaningless on a
+      # cluster that does not authenticate.
+      acls = {
+        enabled = module.msk.sasl_mechanism == "SCRAM-SHA-512"
+        rules   = module.kafka_acls.rules
+      }
     }
     postgres = {
       enabled = false
@@ -180,8 +278,17 @@ locals {
       }
 
       s3 = {
-        # Empty endpoint means real S3 rather than MinIO.
-        endpoint = ""
+        # The REGIONAL URL, not the empty string.
+        #
+        # Empty means "the SDK default" to a Go client, and that is what the
+        # app chart's config.s3Endpoint relies on. It does NOT mean that to
+        # this chart: the in-cluster Milvus needs an address it can split into
+        # host, port and useSSL (templates/milvus/milvus.yaml does a urlParse),
+        # and _validate.tpl fails the whole render with "milvus needs an object
+        # store" when the key is empty and minio is disabled — which is exactly
+        # the combination this file produces. Emitting the endpoint the app
+        # chart already uses satisfies both.
+        endpoint = "https://s3.${local.region}.amazonaws.com"
         region   = local.region
         bucket   = module.s3.embeddings_bucket_name
         # No static keys: insights-service and clusters-job assume their IRSA
@@ -280,12 +387,78 @@ locals {
       MAIL_SMTP_PASSWORD = ""
     },
 
-    # SASL/SCRAM credentials for MSK. Terraform generated the password into its
-    # own Secrets Manager secret, so this points at where to copy it from
-    # rather than carrying it.
-    module.msk.sasl_mechanism == "SCRAM-SHA-512" ? {
-      KAFKA_SASL_USERNAME = "REPLACE_FROM_${module.msk.scram_secret_arn}"
-      KAFKA_SASL_PASSWORD = "REPLACE_FROM_${module.msk.scram_secret_arn}"
-    } : {},
+    # KAFKA_SASL_USERNAME / KAFKA_SASL_PASSWORD are deliberately ABSENT.
+    #
+    # This document is one Secrets Manager value that all nine pods read
+    # through a single ExternalSecret, so a Kafka credential in it would hand
+    # the same credential to every service — which is exactly what per-service
+    # SCRAM users exist to prevent. Nothing in charts/dabet references these
+    # two keys either: no service's `secretEnv` maps them, so an entry here
+    # would sit unused in nine pods' worth of Secret.
+    #
+    # The real values arrive per pod, from a per-service Secret, through
+    # services.<name>.envRaw above. Under msk.scram_mode = "shared" that is
+    # still true — the six envRaw blocks just resolve to the same credential.
   )
+
+  # ---------------------------------------------------------------------------
+  # ExternalSecret manifests for the Kafka credentials
+  #
+  # charts/dabet renders exactly one ExternalSecret, for the aggregate
+  # document. Per-service Kafka credentials need one each, plus one for the
+  # reconciler admin, and there is no chart key for them yet — so they are
+  # rendered here and applied with kubectl. Recorded as a chart gap in the
+  # README rather than worked around, because the fix belongs in charts/dabet.
+  #
+  # Each MSK SCRAM secret holds {"username": ..., "password": ...}, so the
+  # remoteRef property extracts the two fields into the two env var names
+  # pkg/kafkax reads.
+  # ---------------------------------------------------------------------------
+  kafka_external_secret_targets = module.msk.sasl_mechanism == "SCRAM-SHA-512" ? merge(
+    {
+      (local.kafka_admin_secret_name) = module.kafka_acls.admin_username
+    },
+    {
+      for svc, u in module.kafka_acls.usernames :
+      local.kafka_service_secret_name[svc] => u
+    },
+  ) : {}
+
+  kafka_external_secret_manifests = join("\n---\n", [
+    for k8s_name, scram_user in local.kafka_external_secret_targets : yamlencode({
+      apiVersion = "external-secrets.io/v1beta1"
+      kind       = "ExternalSecret"
+      metadata = {
+        name      = k8s_name
+        namespace = var.kubernetes_namespace
+      }
+      spec = {
+        refreshInterval = "1h"
+        secretStoreRef = {
+          name = var.external_secrets_store_ref.name
+          kind = var.external_secrets_store_ref.kind
+        }
+        target = {
+          name           = k8s_name
+          creationPolicy = "Owner"
+        }
+        data = [
+          {
+            secretKey = "KAFKA_SASL_USERNAME"
+            remoteRef = {
+              key      = try(module.msk.scram_secret_names[scram_user], "")
+              property = "username"
+            }
+          },
+          {
+            secretKey = "KAFKA_SASL_PASSWORD"
+            remoteRef = {
+              key      = try(module.msk.scram_secret_names[scram_user], "")
+              property = "password"
+            }
+          },
+        ]
+      }
+    })
+  ])
 }

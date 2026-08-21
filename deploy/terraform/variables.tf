@@ -197,7 +197,30 @@ variable "create_policy_instance" {
 # ---------------------------------------------------------------------------
 
 variable "msk" {
-  description = "MSK sizing and authentication. See modules/msk for how the numbers come out of §4.2."
+  description = <<-EOT
+    MSK sizing, authentication and authorisation. See modules/msk for how the
+    numbers come out of §4.2.
+
+    On authorisation, which is the part that is easy to skip: SASL/SCRAM
+    authenticates a client and says nothing about what it may do. On a SCRAM
+    cluster that is Kafka ACLs, and a cluster with no ACLs and one credential
+    gives every service blanket access to every topic.
+
+      scram_mode = "per_service"   (default) one SCRAM credential per service,
+                                   each with its own Secrets Manager secret,
+                                   and ACLs from §1.5 scoped to what that
+                                   service actually does.
+
+      scram_mode = "shared"        one credential for the lot, named by
+                                   scram_username. Fewer moving parts for a dev
+                                   cluster; blanket access by construction,
+                                   because every rule collapses onto one
+                                   principal.
+
+    The reconciler admin credential exists in both modes and is never shared
+    with a service: it is the only principal holding CreateTopic and the
+    cluster-level Alter that managing ACLs needs.
+  EOT
   type = object({
     kafka_version                       = optional(string, "3.9.x")
     broker_count                        = optional(number, 6)
@@ -209,8 +232,24 @@ variable "msk" {
     enhanced_monitoring                 = optional(string, "PER_BROKER")
     provisioned_throughput_mibps        = optional(number)
     extra_server_properties             = optional(map(string), {})
+
+    scram_mode     = optional(string, "per_service")
+    scram_username = optional(string, "dabet")
+
+    # Whether a resource with no ACL is open to every authenticated principal.
+    # MSK's default is true and this keeps it, because turning it off is a
+    # two-phase operation: apply the ACLs first, confirm the fleet is
+    # connected, THEN flip this and let MSK roll the brokers. Doing it in one
+    # apply leaves a cluster where nothing is authorised, including the
+    # credential that would write the ACLs. See modules/msk.
+    allow_everyone_if_no_acl_found = optional(bool, true)
   })
   default = {}
+
+  validation {
+    condition     = contains(["per_service", "shared"], coalesce(var.msk.scram_mode, "per_service"))
+    error_message = "msk.scram_mode must be \"per_service\" or \"shared\"."
+  }
 }
 
 # ---------------------------------------------------------------------------

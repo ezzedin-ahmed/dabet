@@ -38,7 +38,11 @@ deploy/terraform/
 │   ├── network/             VPC, three subnet tiers, NAT, VPC endpoints
 │   ├── eks/                 cluster, OIDC provider, node groups, addons
 │   ├── rds/                 one PostgreSQL instance (instantiated twice)
-│   ├── msk/                 Kafka brokers, configuration, storage autoscaling
+│   ├── msk/                 Kafka brokers, configuration, storage autoscaling,
+│   │                        one SCRAM credential per principal
+│   ├── kafka-acls/          the §1.5 authorisation matrix. CREATES NOTHING —
+│   │                        it renders one table into the chart's ACL rules,
+│   │                        the IAM statements and the SCRAM user list
 │   ├── elasticache/         Redis (cluster mode) + Memcached
 │   ├── s3/                  embeddings corpus and supporting buckets
 │   ├── iam/                 IRSA roles, one per service plus platform roles
@@ -71,13 +75,22 @@ same registry. Topic configuration changes with the application, not with the
 infrastructure. What Terraform owns is a cluster that can carry those numbers;
 see [Sizing](#sizing).
 
-There is a gap in that arrangement worth knowing about before the first
-deploy: the deps chart's topics Job is gated on `kafka.enabled`, and with MSK
-that is `false`. **So on AWS, nothing creates the topics.** Run the Job's
-script against the MSK bootstrap string, or create them by hand, before the
-services start — the brokers run with `auto.create.topics.enable = false`, so a
-missing topic is an error rather than a silently mis-shaped one-partition
-topic. Which is the right failure, but only if you are expecting it.
+> An earlier revision of this file recorded a gap here: the deps chart's topics
+> Job was gated on `kafka.enabled`, which is `false` with MSK, so **nothing
+> created the topics** and a fresh deployment failed every produce with
+> `UNKNOWN_TOPIC_OR_PARTITION`. That is fixed. The Job now needs a broker
+> *address*, not a broker StatefulSet, and `helm_values_dabet_deps` supplies
+> one along with the credential it authenticates with. See
+> [Security](#security) for how it authenticates.
+
+**Kafka ACLs — created here as data, applied from the cluster.** The
+authorisation matrix lives in `modules/kafka-acls`, which creates no resources
+at all: it turns §1.5 into the ACL rules the deps chart applies, the IAM
+statements `modules/iam` writes, and the SCRAM users `modules/msk` creates. The
+bindings themselves are written by a Job inside the cluster, because the
+brokers sit in subnets with no network path to wherever Terraform runs. That is
+a real constraint rather than a preference; the reasoning is in
+[Security](#security) and in the module header.
 
 **ClickHouse and Milvus.** See the next section.
 
@@ -421,15 +434,39 @@ services:                              # one entry per service, all nine
     serviceAccount:
       annotations:
         eks.amazonaws.com/role-arn: arn:aws:iam::<account>:role/dabet-prod-user-service
+    # no envRaw: user-service has no Kafka client at all
+
+  moderation-service:
+    serviceAccount: { annotations: { ... } }
+    # Its OWN SCRAM credential. KAFKA_SASL_MECHANISM is shared config above;
+    # the identity is not, which is the whole point of per-service users.
+    envRaw:
+      - name: KAFKA_SASL_USERNAME
+        valueFrom:
+          secretKeyRef: { name: dabet-kafka-moderation-service, key: KAFKA_SASL_USERNAME }
+      - name: KAFKA_SASL_PASSWORD
+        valueFrom:
+          secretKeyRef: { name: dabet-kafka-moderation-service, key: KAFKA_SASL_PASSWORD }
+
   credits-service: { ... }
   policy-service: { ... }
   provider-adapter: { ... }
-  moderation-service: { ... }
   review-service: { ... }
   insights-service: { ... }
   clustering-service: { ... }
   clusters-job: { ... }
 ```
+
+`envRaw` is emitted for the six services that speak Kafka and omitted for
+`user-service`, `policy-service` and `clustering-service`, which have no
+franz-go dependency — a service with no Kafka client and a Kafka credential is
+just an unnecessary secret. Under `msk.scram_mode = "shared"` the six blocks
+are still emitted and all six point at the same Secret, which is what makes
+flipping the mode a one-line change.
+
+The Secrets those refs name are created by
+`kafka_external_secret_manifests`, not by the chart — see
+[What the chart has to do with it](#what-the-chart-has-to-do-with-it).
 
 ### `charts/dabet-deps`
 
@@ -438,7 +475,21 @@ address. What stays in the cluster is exactly the set AWS has no managed
 equivalent of, plus the inference workloads:
 
 ```yaml
-kafka:     { enabled: false }
+kafka:
+  enabled: false                            # no in-cluster brokers...
+  topics:  { enabled: true }                # ...but §4.2's topics still have
+                                            # to exist, and MSK runs with
+                                            # auto.create.topics.enable=false
+  admin:
+    auth:
+      tls:  { enabled: true }               # MSK: SASL only over TLS, 9096
+      sasl:
+        mechanism: SCRAM-SHA-512
+        existingSecret: { name: dabet-kafka-admin }
+  acls:
+    enabled: true
+    rules: [ ... ]                          # the §1.5 matrix, admin first
+
 postgres:  { enabled: false }
 redis:     { enabled: false }
 memcached: { enabled: false }
@@ -487,6 +538,12 @@ carry a password. A password in a Terraform output is a password in Terraform
 state. The app chart gets its `POSTGRES_DSN_*` through External Secrets
 Operator instead, from the document below.
 
+`kafka.admin.auth.sasl.existingSecret.name` is a Secret **name**, for the same
+reason. The chart has no values key that could hold a SASL password: it renders
+a `secretKeyRef` and the Job's entrypoint turns it into a `client.properties`
+inside a memory-backed emptyDir. The Secret itself is created by one of the
+ExternalSecrets in `kafka_external_secret_manifests`.
+
 ### The Secrets Manager document
 
 The chart's ESO integration extracts one aggregate document, whose required key
@@ -521,9 +578,16 @@ postgres://dabet:REPLACE_WITH_PASSWORD@dabet-prod-identity.<id>.eu-west-1.rds.am
 
 `S3_ACCESS_KEY` and `S3_SECRET_KEY` are rendered as empty strings, because
 `S3_CREDENTIALS_SOURCE=irsa` means the pod assumes its role instead. The keys
-stay present so the pod starts. `KAFKA_SASL_USERNAME` and `KAFKA_SASL_PASSWORD`
-point at the MSK SCRAM secret Terraform generated, rather than carrying its
-value.
+stay present so the pod starts.
+
+`KAFKA_SASL_USERNAME` and `KAFKA_SASL_PASSWORD` are **absent** from it, and
+that is deliberate rather than an omission. This document is one Secrets
+Manager value that all nine pods read through a single ExternalSecret, so a
+Kafka credential in it would hand the same credential to every service —
+precisely what per-service SCRAM users exist to prevent. Nothing in
+`charts/dabet` references those two keys either: no service's `secretEnv` maps
+them. The real values arrive per pod, from a per-service Secret, through
+`services.<name>.envRaw`.
 
 ### What the chart has to do with it
 
@@ -547,14 +611,27 @@ the discovery endpoint would silently hash every key onto one "node". The
 trade-off is that adding a node changes the list and needs a re-render and a
 restart, which §6.8 makes survivable: a cache miss reads through to Postgres.
 
-**Kafka topics are the deps chart's job, and it does not do them on AWS.**
-`charts/dabet-deps` has a reconciling topics Job carrying §4.2's exact
-partition counts and retentions — but it is gated on `kafka.enabled`, which is
-`false` here. So with MSK, **nothing creates the topics**. Run that job's script
-against the MSK bootstrap string, or create them with `kafka-topics.sh`, before
-the services start: `auto.create.topics.enable` is `false` on the cluster, so a
-missing topic is an error rather than a silently mis-shaped one-partition
-topic.
+**Kafka topics are still the deps chart's job — and it now does them on AWS.**
+`charts/dabet-deps` carries a reconciling topics Job with §4.2's exact
+partition counts and retentions. It used to be gated on `kafka.enabled`, which
+is `false` here, so with MSK nothing created the topics and every produce
+failed against a cluster with `auto.create.topics.enable = false`. The gate is
+now "a broker address is resolvable", and `helm_values_dabet_deps` supplies
+`external.kafka.brokers` plus the TLS/SASL settings and the admin Secret name
+the Job authenticates with. Nothing to do by hand.
+
+**Per-service Kafka credentials need one `kubectl apply` the charts cannot do.**
+`charts/dabet` renders exactly one ExternalSecret, for the aggregate secret
+document. Per-service SCRAM credentials need one each, and there is no chart
+key for them — so `helm_values_dabet` points every service's `envRaw` at a
+per-service Secret and `kafka_external_secret_manifests` renders the
+ExternalSecrets that create those Secrets:
+
+```sh
+tofu output -raw kafka_external_secret_manifests | kubectl apply -f -
+```
+
+Recorded rather than worked around, because the fix belongs in the chart.
 
 **Two Terraform outputs have no chart key yet.**
 `platform_role_arns["milvus"]` and `platform_role_arns["clickhouse"]` exist so
@@ -802,14 +879,22 @@ aws secretsmanager put-secret-value --secret-id dabet/prod/app \
   --secret-string file:///tmp/app.json
 shred -u /tmp/app.json
 
-# 5. Create the §4.2 topics. The deps chart's topics Job is gated on an
-#    in-cluster Kafka, so with MSK nothing creates them and
-#    auto.create.topics.enable is false.
-#    See deploy/k8s/charts/dabet-deps/templates/kafka/topics-job.yaml for the
-#    registry and the reconcile script.
+# 5. Kubeconfig, then the Kafka credentials.
+#
+#    Terraform generated one SCRAM password per principal into its own
+#    Secrets Manager secret and never printed any of them. These
+#    ExternalSecrets are what project them into the namespace: one per
+#    service, plus the reconciler admin's. They must exist BEFORE the deps
+#    chart runs, because the topic and ACL Jobs mount the admin one.
+aws eks update-kubeconfig --region eu-west-1 --name dabet-prod
+kubectl create namespace dabet --dry-run=client -o yaml | kubectl apply -f -
+tofu output -raw kafka_external_secret_manifests | kubectl apply -f -
 
 # 6. Hand the contract to the charts.
-aws eks update-kubeconfig --region eu-west-1 --name dabet-prod
+#
+#    The deps chart now reconciles the §4.2 topics against MSK and applies
+#    the ACL matrix — both as post-install hooks, both idempotent. Nothing
+#    to run by hand.
 tofu output -raw helm_values_dabet_deps_yaml > /tmp/deps-aws.yaml
 tofu output -raw helm_values_dabet_yaml      > /tmp/values-aws.yaml
 
@@ -820,6 +905,12 @@ helm upgrade --install dabet ../../k8s/charts/dabet \
   --namespace dabet \
   -f ../../k8s/charts/dabet/values-aws.yaml \
   -f /tmp/values-aws.yaml
+
+# 7. Confirm the authorisation matrix landed. The Job prints it, but a
+#    direct diff against Terraform's view is the check that matters.
+kubectl -n dabet logs job/dabet-kafka-acls | tail -40
+tofu output -json kafka_acl_matrix | jq -r \
+  '.[] | "\(.principal) \(.resourceType):\(.resourceName) \(.operations | join(","))"'
 ```
 
 ### Suggested Makefile targets
@@ -887,23 +978,147 @@ therefore mean shipping a static IAM user access key, which is precisely the
 thing a managed-cloud deployment must not need.
 
 So the module defaults to **SASL/SCRAM-SHA-512 over TLS**. Terraform generates
-the credential, stores it in Secrets Manager under the `AmazonMSK_` name MSK
-insists on, encrypts it with the customer-managed key MSK insists on, grants
-`kafka.amazonaws.com` read through a resource policy, and associates it with
-the cluster. The pod reads one value through External Secrets Operator. The
+the credentials, stores each in Secrets Manager under the `AmazonMSK_` name MSK
+insists on, encrypts them with the customer-managed key MSK insists on, grants
+`kafka.amazonaws.com` read through a resource policy, and associates the lot
+with the cluster. Each pod reads its own through External Secrets Operator. The
 `iam` module still writes the per-service `kafka-cluster:*` policies, so
 switching to `client_authentication = "iam"` later is a variable change and a
 rolling broker update — no rebuild.
 
-The cost of SCRAM over IAM is where authorisation lives: SCRAM authorises at
-the Kafka ACL level rather than in IAM policy, and this module does not create
-ACLs. With one credential shared by all nine services, every service can reach
-every topic. If that matters more than the credential story, use IAM and give
-the pods a way to get AWS credentials.
-
 *Related:* `kgo.Rack` is what makes the rack-aware replica selection in the MSK
 configuration actually save money. Without a rack set on the client, the
 property is inert.
+
+> **Open, and it will bite on the first MSK deploy: three Kafka clients bypass
+> `pkg/kafkax` and therefore carry no TLS or SASL options at all.** Every
+> client built through `kafkax.NewProducer` / `NewConsumer` picks up
+> `SecurityConfig.Options()`. These three call `kgo.NewClient` directly and do
+> not:
+>
+> | Call site | What breaks |
+> | --- | --- |
+> | `services/provider-adapter/internal/shard/kafka.go` | §7.2 shard ring never forms; the fleet runs on a frozen assignment |
+> | `services/review-service/internal/queue/kafka.go` | §7.6 review queue cannot read `flagged.v1` |
+> | `services/clusters-job/internal/job/textsample.go` | §8.6 text sample cannot read `messages.v1` |
+>
+> Against a plaintext broker they work, which is why nothing has caught it. On
+> MSK they will fail to connect while the same service's `kafkax` clients
+> succeed — a partial failure that reads like a broker problem rather than a
+> client one. The fix is in Go (`services/`), outside this directory and
+> outside the change that added the ACLs, so it is recorded here rather than
+> worked around: each of the three needs the options from
+> `kafkax.DefaultSecurityConfig().Options()` appended. The ACLs granted to
+> those principals are correct and will simply go unused until it is done.
+
+**Kafka authorisation — one credential no longer reaches every topic.**
+SCRAM authenticates a client and says nothing about what it may do. On a SCRAM
+cluster that is Kafka ACLs, and an earlier revision of this directory created
+none: with one credential shared by all nine services, every service could
+read and write every topic. Two things changed.
+
+*Per-service SCRAM users.* `msk.scram_mode` defaults to `per_service`, which
+gives each of the six services that speak Kafka its own username, its own
+generated password and its own Secrets Manager secret — plus a seventh, the
+reconciler admin, which is never any service's. `shared` keeps the old shape
+for a dev cluster. The trade-off is concrete rather than philosophical: six
+extra secrets, six ExternalSecret manifests and six `envRaw` blocks, against a
+blast radius that is otherwise "any compromised service can do anything any
+service can do".
+
+*ACLs from §1.5.* `modules/kafka-acls` holds the matrix. It is derived from the
+code, not from the prose — every entry names the call site that makes the
+request — and it feeds three consumers so they cannot drift: the deps chart's
+`kafka.acls.rules`, the IAM statements in `modules/iam`, and the SCRAM user
+list in `modules/msk`.
+
+| Principal | Reads | Writes | Creates | Groups |
+| --- | --- | --- | --- | --- |
+| `provider-adapter` | `deletions.v1`, `adapter.shards.v1` | `messages.v1` | `adapter.shards.v1` | `provider-adapter`, `provider-adapter-shards` |
+| `moderation-service` | `messages.v1` | `flagged.v1`, `deletions.v1`, `usage.v1` | | `moderation-service` |
+| `review-service` | `flagged.v1` | `deletions.v1` | | *none* |
+| `insights-service` | `messages.v1`, `flagged.v1` | | | `insights-service` |
+| `credits-service` | `usage.v1` | | | `credits-service` |
+| `clusters-job` | `messages.v1` | `usage.v1` | | *none* |
+| `<name>-admin` | | | `*` | |
+
+Three entries are worth their own line, because each is a place a plausible
+guess is wrong:
+
+* **`clusters-job` consumes `messages.v1`.** §8.6's text sample
+  (`internal/job/textsample.go`) is a bounded read with `ConsumeTopics` +
+  `AfterMilli`. `modules/iam` previously had `read = []` for it, which would
+  have produced a role that could produce `usage.v1` and then fail on every
+  fetch. Fixed here.
+* **`review-service` and `clusters-job` join no consumer group.**
+  review-service assigns partitions itself with `kgo.ConsumePartitions` and
+  explicit offsets (§7.6); clusters-job's sample is groupless. They get no
+  group ACL. The IAM path still lists them, because an IAM statement naming an
+  unused group ARN is inert — while an ACL naming one flips that group from
+  "open because unlisted" to "closed to everyone else". Inert on one path, a
+  real change on the other.
+* **`adapter.shards.v1` is subscribed to and never produced to.** The consumer
+  group's *membership* is the §7.2/A13 fleet view. The adapter also creates the
+  topic itself, best effort, which is why it holds `Create` on that one name
+  and nothing else.
+
+*Idempotent producers.* §4.2 asks for `enable.idempotence=true`; `pkg/kafkax`
+gets it by setting `acks=all` and leaving franz-go's default on. On the **IAM**
+path that needs `kafka-cluster:WriteDataIdempotently` on the cluster resource,
+which `modules/iam` grants to every producing principal. On the **ACL** path it
+is `IdempotentWrite` on `Cluster` — and since KIP-679 (Kafka 3.0) the broker
+accepts topic `Write` alone, so on this 3.9 cluster the grant is redundant. It
+is kept because it is one operation on one resource and its absence, on an
+older broker, turns every produce into a `CLUSTER_AUTHORIZATION_FAILED` that
+reads like a client bug.
+
+**How the ACLs actually get applied, and why not from here.**
+Kafka ACLs are a Kafka protocol operation. The AWS provider has no resource for
+them; the only Terraform provider that does (`Mongey/kafka`) speaks the Kafka
+protocol directly, so whatever runs `tofu apply` must open a TCP connection to
+a broker. It cannot: `modules/network` puts the brokers in data-tier subnets
+whose route tables carry no default route in either direction, and
+`modules/msk` admits ingress only from a referenced security group id. A run
+from a laptop or a CI runner outside the VPC has no path to port 9096 at all,
+and adding the provider would also make `tofu plan` require a live broker and a
+credential just to read state — which breaks the credential-free validation
+this directory is built around.
+
+So the honest answer is that ACLs have to be applied from inside the cluster,
+and that is what happens. **Terraform is the source of truth; the cluster is
+the applier.** `charts/dabet-deps` runs a Job at hook weight `-2` (before the
+topic reconciler at `0`, because `CreateTopic` is itself an ACL now) that walks
+the rule list with `kafka-acls.sh --add`, which is idempotent. It reconciles
+forward only: nothing is ever removed, because an automatic prune would turn a
+values typo into an outage, and the full binding list is printed at the end of
+every run so a stale one is visible.
+
+Two things about that Job that are not incidental:
+
+* **The admin bindings come first.** MSK ships with
+  `allow.everyone.if.no.acl.found = true`, and that flag is evaluated *per
+  resource*: a resource with no binding is open to everyone, a resource with
+  one binding is closed to everyone it does not name. The first binding written
+  against the `Cluster` resource therefore decides who may write bindings from
+  then on. The matrix is emitted admin-first and applied in order, so the
+  credential running it cannot lock itself out.
+* **`allow_everyone_if_no_acl_found` stays `true`, and turning it off is a
+  two-phase change.** Phase 1: apply the ACLs and confirm the fleet is
+  connected. Phase 2: set it `false`, and MSK adds a configuration revision and
+  rolls the brokers. Doing phase 2 first leaves a cluster where nothing is
+  authorised — including the credential that would write the ACLs. Note that
+  leaving it `true` is *not* the same as having no ACLs: every topic and group
+  in the matrix has a binding and is therefore genuinely restricted. What stays
+  open is what the matrix does not name.
+
+If a team wants Terraform to own the bindings, the escape hatch is real but is
+a different topology: run Terraform on a runner inside the VPC (or through a
+bastion with a forwarded port), add the `Mongey/kafka` provider, and feed it
+`module.kafka_acls.rules`. The matrix does not change; only who applies it
+does. That is a decision about who owns the CI network, which is why it is
+documented rather than made here. For a one-off from a bastion,
+`tofu output -json kafka_acl_commands` renders the same bindings as
+`kafka-acls.sh` invocations, in the order they must be run.
 
 **S3 without static keys — resolved.** `insights-service` and `clusters-job`
 build their MinIO client from a credential chain selected by
@@ -930,10 +1145,24 @@ tofu -chdir=deploy/terraform             init -backend=false && tofu -chdir=depl
 tofu -chdir=deploy/terraform/bootstrap   init -backend=false && tofu -chdir=deploy/terraform/bootstrap   validate
 tofu -chdir=deploy/terraform/examples/dev  init -backend=false && tofu -chdir=deploy/terraform/examples/dev  validate
 tofu -chdir=deploy/terraform/examples/prod init -backend=false && tofu -chdir=deploy/terraform/examples/prod validate
-# and each of deploy/terraform/modules/*
+# and each of deploy/terraform/modules/* — ten of them, including kafka-acls
 ```
 
-All pass against AWS provider 6.61.0 and OpenTofu 1.10.6.
+All pass against AWS provider 6.61.0 and OpenTofu 1.10.6. `modules/kafka-acls`
+declares no providers at all, so `init -backend=false` on anything that calls
+it downloads nothing extra and needs no credentials.
+
+The chart half of the Kafka work is validated from the chart:
+
+```sh
+helm lint deploy/k8s/charts/dabet-deps            # and -f values-{local,prod}.yaml
+NO_KUBECTL=1 deploy/k8s/charts/dabet-deps/hack/render-matrix.sh
+```
+
+The matrix renders the topic reconciler against both an in-cluster broker and
+an external one, with and without TLS/SASL, and asserts that the §4.2 numbers
+survive every shipped profile and that the SASL credential is a `secretKeyRef`
+and never a literal.
 
 **No `plan` and no `apply` has been run against an AWS account**, because there
 are no credentials in this environment and creating real infrastructure was out
@@ -945,22 +1174,52 @@ accepts in the abstract is one AWS accepts *here*.
 One step further was possible without credentials, and was taken. Creating a
 resource needs no API call at plan time, so the `iam`, `rds`, `msk` and
 `elasticache` modules were planned offline against dummy inputs, and the
-resulting plan inspected as JSON. That confirms the parts that are computed
-rather than declared:
+resulting plan inspected as JSON. `kafka-acls` goes further still: it creates
+nothing, so it can be *applied* offline and its outputs read directly.
+Together those confirm the parts that are computed rather than declared:
 
 - the IRSA policy documents render as valid IAM, with topic and group ARNs
-  correctly derived from the MSK cluster ARN and scoped per §4.2 — including
-  `WriteDataIdempotently` on the cluster for every producer, and `CreateTopic`
-  on `adapter.shards.v1` and nothing else for `provider-adapter`;
+  correctly derived from the MSK cluster ARN and scoped per §1.5 — including
+  `WriteDataIdempotently` on the cluster for every producer, `CreateTopic` on
+  `adapter.shards.v1` and nothing else for `provider-adapter`, and `ReadData`
+  on `messages.v1` for `clusters-job`;
+- the ACL matrix renders 25 bindings with the admin's cluster grants first,
+  and switching `msk.scram_mode` to `shared` collapses them onto one principal
+  holding `Read,Write` on every topic — which is the documented trade-off,
+  made visible;
+- `modules/msk` plans seven Secrets Manager secrets (six services plus the
+  reconciler admin), each `AmazonMSK_<cluster>_<user>`, each with its own
+  resource policy, and one `aws_msk_scram_secret_association` carrying all
+  seven;
 - `rds.force_ssl` survives the map-key remapping and `shared_preload_libraries`
   is marked `pending-reboot` rather than `immediate`;
-- the MSK `server_properties` document renders as expected;
+- the MSK `server_properties` document renders as expected, including
+  `allow.everyone.if.no.acl.found=true`;
 - every security group ingress rule carries a `referenced_security_group_id`
   and no `cidr_ipv4` at all.
 
 The modules with an `aws_caller_identity` data source (`s3`, `secrets`,
 `observability`) and the root, which has one in `kms.tf`, cannot be planned this
 way — that data source is a real STS call.
+
+**What still needs a live MSK cluster.** Everything above is shape, not
+behaviour. A real cluster is the only thing that can settle:
+
+- whether MSK accepts `allow.everyone.if.no.acl.found` as an editable property
+  at the configured `kafka_version` (it is documented as editable; an
+  unsupported property fails at apply, not at plan);
+- whether the reconciler admin can in fact write the first `Cluster` binding —
+  the whole bootstrap sequence rests on MSK's per-resource evaluation of that
+  flag behaving as documented;
+- that SASL/SCRAM over TLS from the `apache/kafka` image's shell tools
+  negotiates against MSK's brokers with nothing but the JVM's default
+  truststore;
+- that seven SCRAM secrets associate cleanly in one
+  `aws_msk_scram_secret_association` — the API takes a list, but the per-secret
+  KMS and resource-policy preconditions are checked at association time;
+- and that the matrix is *complete*: an ACL that is missing shows up as a
+  `TOPIC_AUTHORIZATION_FAILED` on a producer or, worse, as a consumer that
+  simply never joins its group. The end-to-end check is step 7 of the runbook.
 
 <a id="unverified"></a>
 ### Unverified, and what would settle it

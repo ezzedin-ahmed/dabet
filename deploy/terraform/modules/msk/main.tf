@@ -44,6 +44,10 @@ locals {
     # 512 partitions x 3 replicas means a lot of concurrent fetches between
     # brokers during a replacement.
     "num.replica.fetchers" = "4"
+
+    # See the variable. This is the flag that decides whether an unlisted
+    # resource is open or closed, and flipping it is a two-phase operation.
+    "allow.everyone.if.no.acl.found" = tostring(var.allow_everyone_if_no_acl_found)
   }
 
   server_properties = merge(local.default_server_properties, var.extra_server_properties)
@@ -238,9 +242,17 @@ resource "aws_msk_cluster" "this" {
 }
 
 # ---------------------------------------------------------------------------
-# SASL/SCRAM credential
+# SASL/SCRAM credentials
 #
-# MSK imposes three constraints on the secret, none of them obvious and all of
+# ONE SECRET PER USER. `scram_users` is normally the per-service matrix from
+# modules/kafka-acls plus the reconciler's admin credential, so a compromised
+# moderation-service pod holds a credential that Kafka ACLs let it use for
+# exactly what moderation-service does. Leaving `scram_users` empty falls back
+# to the single `scram_username` credential, which is the dev shape: one
+# principal, and therefore — whatever the ACLs say — the union of every
+# permission granted to it.
+#
+# MSK imposes three constraints on each secret, none of them obvious and all of
 # them apply-time failures:
 #
 #   1. The name must begin with "AmazonMSK_".
@@ -249,39 +261,56 @@ resource "aws_msk_cluster" "this" {
 #   3. Its resource policy must let kafka.amazonaws.com read it, or the
 #      association succeeds and authentication then fails.
 #
-# The value is {"username": ..., "password": ...} — the shape MSK expects and
+# Each value is {"username": ..., "password": ...} — the shape MSK expects and
 # also the shape External Secrets Operator can project straight into
 # KAFKA_SASL_USERNAME and KAFKA_SASL_PASSWORD.
 # ---------------------------------------------------------------------------
 
+locals {
+  scram_enabled = var.client_authentication == "scram"
+
+  # Empty map means "the historical single credential", so an existing root
+  # that sets neither keeps exactly the resource it had.
+  scram_user_map = length(var.scram_users) > 0 ? var.scram_users : {
+    (var.scram_username) = "SASL/SCRAM credential for MSK cluster ${var.name}"
+  }
+
+  scram_users_effective = local.scram_enabled ? local.scram_user_map : {}
+}
+
 resource "random_password" "scram" {
-  count = var.client_authentication == "scram" ? 1 : 0
+  for_each = local.scram_users_effective
 
   length = var.scram_password_length
   # MSK rejects a SCRAM password containing a colon, and several of the
   # punctuation characters make the value awkward to pass through a shell.
+  # These survive a JAAS string literal, a YAML value and a shell word.
   special          = true
   override_special = "-_=+.~"
 }
 
 resource "aws_secretsmanager_secret" "scram" {
-  count = var.client_authentication == "scram" ? 1 : 0
+  for_each = local.scram_users_effective
 
-  name        = "AmazonMSK_${var.name}_${var.scram_username}"
-  description = "SASL/SCRAM credential for MSK cluster ${var.name}"
+  name        = "AmazonMSK_${var.name}_${each.key}"
+  description = each.value
   kms_key_id  = var.kms_key_arn
 
-  tags = merge(var.tags, { Name = "AmazonMSK_${var.name}" })
+  tags = merge(var.tags, {
+    Name         = "AmazonMSK_${var.name}_${each.key}"
+    KafkaUser    = each.key
+    KafkaCluster = var.name
+  })
 }
 
 resource "aws_secretsmanager_secret_version" "scram" {
-  count = var.client_authentication == "scram" ? 1 : 0
+  for_each = local.scram_users_effective
 
-  secret_id = aws_secretsmanager_secret.scram[0].id
+  secret_id = aws_secretsmanager_secret.scram[each.key].id
 
   secret_string = jsonencode({
-    username = var.scram_username
-    password = random_password.scram[0].result
+    username = each.key
+    password = random_password.scram[each.key].result
   })
 
   lifecycle {
@@ -292,13 +321,13 @@ resource "aws_secretsmanager_secret_version" "scram" {
 }
 
 data "aws_iam_policy_document" "scram" {
-  count = var.client_authentication == "scram" ? 1 : 0
+  for_each = local.scram_users_effective
 
   statement {
     sid       = "AllowMSKToReadTheCredential"
     effect    = "Allow"
     actions   = ["secretsmanager:GetSecretValue"]
-    resources = [aws_secretsmanager_secret.scram[0].arn]
+    resources = [aws_secretsmanager_secret.scram[each.key].arn]
 
     principals {
       type        = "Service"
@@ -308,17 +337,20 @@ data "aws_iam_policy_document" "scram" {
 }
 
 resource "aws_secretsmanager_secret_policy" "scram" {
-  count = var.client_authentication == "scram" ? 1 : 0
+  for_each = local.scram_users_effective
 
-  secret_arn = aws_secretsmanager_secret.scram[0].arn
-  policy     = data.aws_iam_policy_document.scram[0].json
+  secret_arn = aws_secretsmanager_secret.scram[each.key].arn
+  policy     = data.aws_iam_policy_document.scram[each.key].json
 }
 
 resource "aws_msk_scram_secret_association" "this" {
-  count = var.client_authentication == "scram" ? 1 : 0
+  count = local.scram_enabled ? 1 : 0
 
-  cluster_arn     = aws_msk_cluster.this.arn
-  secret_arn_list = [aws_secretsmanager_secret.scram[0].arn]
+  cluster_arn = aws_msk_cluster.this.arn
+  # One association carrying every secret. MSK models this as a single
+  # list-valued resource per cluster, so a per-user association resource would
+  # have each apply overwrite the last.
+  secret_arn_list = sort([for u, _ in local.scram_users_effective : aws_secretsmanager_secret.scram[u].arn])
 
   # The secret needs a version to associate, and MSK needs the resource policy
   # to read it. Neither dependency is implied by the ARN reference above.

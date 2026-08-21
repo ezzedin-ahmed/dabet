@@ -118,6 +118,22 @@ module "dabet" {
     client_authentication               = "scram"
     encryption_in_transit_client_broker = "TLS"
 
+    # SCRAM authenticates; it does not authorise. Authorisation on a SCRAM
+    # cluster is Kafka ACLs, so one credential shared by every service would
+    # mean every service can reach every topic whatever the ACLs say. Each
+    # service gets its own principal, its own generated password and its own
+    # Secrets Manager secret, and the §1.5 matrix in modules/kafka-acls scopes
+    # each one to what that service actually does. Production default.
+    scram_mode = "per_service"
+
+    # Left at MSK's default. Turning it off is a TWO-PHASE change: apply the
+    # ACLs and confirm the fleet is connected, THEN set this false and let MSK
+    # roll the brokers. Doing it in one apply leaves a cluster where nothing is
+    # authorised, including the credential that would write the ACLs. Worth
+    # doing once the matrix is proven — it is what closes anything the matrix
+    # does not name.
+    allow_everyone_if_no_acl_found = true
+
     enhanced_monitoring = "PER_BROKER"
 
     # Provisioned EBS throughput is available only from the larger instance

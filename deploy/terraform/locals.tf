@@ -55,7 +55,16 @@ locals {
   #     so it gets an identity and no secret permissions at all.
   #   - the JWT signing key goes only to user-service, which mints tokens
   #     (§5.4). Everything that merely validates one needs the public half.
-  service_secret_arns = {
+  # Each service's own SASL/SCRAM credential, on the Secrets Store CSI path.
+  # Scoped to that service's secret and no other: the whole point of a
+  # credential per principal is that moderation-service cannot read
+  # insights-service's. Empty when the cluster is not on SCRAM.
+  kafka_secret_arns = {
+    for svc, u in module.kafka_acls.usernames :
+    svc => compact([try(module.msk.scram_secret_arns[u], "")])
+  }
+
+  service_secret_arns_base = {
     user-service = [
       local.identity_db_secret,
       local.app_secrets["jwt/private-key"],
@@ -103,5 +112,10 @@ locals {
     clusters-job = [
       local.app_secrets["clickhouse/password"],
     ]
+  }
+
+  service_secret_arns = {
+    for svc, arns in local.service_secret_arns_base :
+    svc => distinct(concat(arns, try(local.kafka_secret_arns[svc], [])))
   }
 }

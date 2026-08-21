@@ -66,16 +66,92 @@ variable "msk_cluster_arn" {
   default     = null
 }
 
+variable "kafka_access" {
+  description = <<-EOT
+    Which topics each service reads, writes and creates. §1.5, verified against
+    the code rather than the prose — see modules/kafka-acls/variables.tf for the
+    call site behind every entry.
+
+    `read_also` exists for a topic that is subscribed to but never read for
+    records; it is folded into the same ConsumeTopics statement as `read` and
+    is kept separate only so the distinction survives in the source.
+
+    Pass modules/kafka-acls's `kafka_access` output here when both modules are
+    in play, so the IAM policies and the Kafka ACLs are generated from one
+    table and cannot drift.
+
+    NOTE on clusters-job: it DOES consume messages.v1. §8.6's text sample
+    (services/clusters-job/internal/job/textsample.go) is a groupless bounded
+    read with kgo.ConsumeTopics + AfterMilli. An earlier revision of this
+    module had `read = []` for it, which would have produced a role that could
+    produce usage.v1 and then fail on every fetch.
+  EOT
+  type = map(object({
+    read      = optional(list(string), [])
+    write     = optional(list(string), [])
+    create    = optional(list(string), [])
+    read_also = optional(list(string), [])
+  }))
+  default = {
+    provider-adapter = {
+      read  = ["deletions.v1"]
+      write = ["messages.v1"]
+      # The adapter creates the coordination topic itself on startup with a
+      # best-effort CreateTopics, and the cluster runs with
+      # auto.create.topics.enable=false.
+      create = ["adapter.shards.v1"]
+      # Subscribed to but never read for records; the group membership is the
+      # whole point (§7.2/A13).
+      read_also = ["adapter.shards.v1"]
+    }
+    moderation-service = {
+      read  = ["messages.v1"]
+      write = ["flagged.v1", "deletions.v1", "usage.v1"]
+    }
+    review-service = {
+      read  = ["flagged.v1"]
+      write = ["deletions.v1"]
+    }
+    insights-service = {
+      read = ["messages.v1", "flagged.v1"]
+    }
+    credits-service = {
+      read = ["usage.v1"]
+    }
+    clusters-job = {
+      read  = ["messages.v1"]
+      write = ["usage.v1"]
+    }
+  }
+}
+
 variable "kafka_consumer_groups" {
   description = <<-EOT
     Consumer group names per service, matching what the binaries actually join.
     These come from the code: moderation-service and credits-service take theirs
     from MOD_CONSUMER_GROUP / CREDITS_CONSUMER_GROUP and default to the service
-    name; insights-service hardcodes "insights-service"; provider-adapter uses
-    "provider-adapter" on deletions.v1 and "provider-adapter-shards" for its
-    §7.2 sharding coordinator. review-service assigns partitions itself (§7.6)
-    and joins no group, but is granted one anyway so that switching it to a
-    group later is not an IAM change.
+    name; insights-service hardcodes "insights-service" in
+    internal/ingest/pipeline.go; provider-adapter uses "provider-adapter" on
+    deletions.v1 (const in internal/deletion/deletion.go) and
+    "provider-adapter-shards" for its §7.2 sharding coordinator.
+
+    review-service and clusters-job join NO GROUP — review-service assigns
+    partitions itself with kgo.ConsumePartitions (§7.6) and clusters-job takes
+    a groupless bounded sample of messages.v1. The defaults below still list
+    them, because on THIS path an IAM statement scoped to a group ARN that is
+    never used is inert, and switching either service to a group later is then
+    not an IAM change.
+
+    The Kafka ACL path does not do the same thing, and the asymmetry is
+    deliberate: an ACL on an unused group flips that group from "open because
+    unlisted" to "closed to everyone the binding does not name" on a broker
+    with allow.everyone.if.no.acl.found=true. Inert on one path, a real change
+    on the other. modules/kafka-acls therefore emits only the groups the
+    binaries actually join, and a root wiring both should pass that output here
+    if it wants the two to match exactly.
+
+    The "-*" entries are prefixed patterns covering a deployment that overrides
+    MOD_CONSUMER_GROUP or CREDITS_CONSUMER_GROUP with a suffixed name.
   EOT
   type        = map(list(string))
   default = {
@@ -86,17 +162,6 @@ variable "kafka_consumer_groups" {
     review-service     = ["review-service", "review-service-*"]
     clusters-job       = ["clusters-job", "clusters-job-*"]
   }
-}
-
-variable "adapter_coordination_topic" {
-  description = <<-EOT
-    The §7.2 sharding coordination topic. provider-adapter creates it itself on
-    startup (a CreateTopics call, best effort), so with
-    auto.create.topics.enable=false the adapter's role needs CreateTopic on
-    exactly this name and nothing else.
-  EOT
-  type        = string
-  default     = "adapter.shards.v1"
 }
 
 variable "embeddings_bucket_arn" {

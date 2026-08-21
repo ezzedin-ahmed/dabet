@@ -32,14 +32,62 @@ output "bootstrap_brokers_sasl_scram" {
   value       = aws_msk_cluster.this.bootstrap_brokers_sasl_scram
 }
 
+output "scram_secret_arns" {
+  description = <<-EOT
+    Secrets Manager ARN per SCRAM username, each holding
+    {username, password}. Empty unless SCRAM is in use.
+
+    This is what the charts point KAFKA_SASL_USERNAME and KAFKA_SASL_PASSWORD
+    at — per service under least privilege, and at the one shared entry when
+    `scram_users` was left empty.
+  EOT
+  value       = { for u, s in aws_secretsmanager_secret.scram : u => s.arn }
+}
+
+output "scram_secret_names" {
+  description = "Secrets Manager secret NAME per SCRAM username, which is what an ExternalSecret's remoteRef takes."
+  value       = { for u, s in aws_secretsmanager_secret.scram : u => s.name }
+}
+
+output "scram_usernames" {
+  description = "Every SCRAM username with a credential on this cluster."
+  value       = sort(keys(local.scram_users_effective))
+}
+
 output "scram_secret_arn" {
   description = <<-EOT
-    Secrets Manager ARN holding {username, password} for SASL/SCRAM. Null unless
-    SCRAM is in use.
-
-    This is what the charts point KAFKA_SASL_USERNAME and KAFKA_SASL_PASSWORD at.
+    A single SCRAM secret ARN, kept for the one-credential shape and for
+    callers written before per-user credentials existed. It resolves to
+    `scram_username`'s secret when that user exists, and otherwise to the
+    lowest-named one, which is arbitrary — use `scram_secret_arns` when more
+    than one user is configured.
   EOT
-  value       = try(aws_secretsmanager_secret.scram[0].arn, null)
+  value = (
+    length(aws_secretsmanager_secret.scram) == 0 ? null :
+    contains(keys(aws_secretsmanager_secret.scram), var.scram_username)
+    ? aws_secretsmanager_secret.scram[var.scram_username].arn
+    : aws_secretsmanager_secret.scram[sort(keys(aws_secretsmanager_secret.scram))[0]].arn
+  )
+}
+
+output "scram_secret_arn_prefix" {
+  description = <<-EOT
+    Wildcard ARN covering every SCRAM secret for this cluster, for granting
+    External Secrets Operator read access to the lot without listing them.
+    Null unless SCRAM is in use.
+
+    Built from a real secret's ARN because a Secrets Manager ARN carries a
+    random six-character suffix that cannot be predicted.
+  EOT
+  value = (
+    length(aws_secretsmanager_secret.scram) == 0 ? null :
+    format(
+      "%s:secret:AmazonMSK_%s_*",
+      # arn:aws:secretsmanager:<region>:<account>
+      join(":", slice(split(":", values(aws_secretsmanager_secret.scram)[0].arn), 0, 5)),
+      var.name,
+    )
+  )
 }
 
 output "sasl_mechanism" {

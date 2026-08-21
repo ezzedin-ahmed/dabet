@@ -141,7 +141,38 @@ module "rds_policy" {
 
 # ---------------------------------------------------------------------------
 # Kafka
+#
+# Two modules, and only one of them creates anything.
+#
+#   kafka_acls  is the §1.5 producer/consumer table. No provider, no resources.
+#               It renders the table into the Kafka ACL rules the deps chart
+#               applies, the IAM statements modules/iam writes, and the SCRAM
+#               users modules/msk creates — so all three come from one source
+#               and cannot drift apart.
+#
+#   msk         is the cluster, plus one Secrets Manager credential per SCRAM
+#               user.
+#
+# The ACLs themselves are applied by a Job in the cluster, not from here. The
+# brokers sit in subnets with no route to anywhere Terraform runs; see the
+# header of modules/kafka-acls/main.tf for the full reasoning.
 # ---------------------------------------------------------------------------
+
+module "kafka_acls" {
+  source = "./modules/kafka-acls"
+
+  mode            = var.msk.scram_mode
+  username_prefix = "${var.name}-"
+  shared_username = var.msk.scram_username
+  admin_username  = "${var.name}-admin"
+
+  # bootstrap_brokers is deliberately NOT passed. modules/msk consumes this
+  # module's scram_users, so handing it an MSK output back would put a value
+  # from each module in the other's inputs — legal today, because Terraform
+  # graphs individual variables rather than whole modules, but a cycle waiting
+  # for someone to add one reference. The `commands` output carries a
+  # <BOOTSTRAP> placeholder and outputs.tf substitutes the real string.
+}
 
 module "msk" {
   source = "./modules/msk"
@@ -162,6 +193,13 @@ module "msk" {
   enhanced_monitoring                 = var.msk.enhanced_monitoring
   provisioned_throughput_mibps        = var.msk.provisioned_throughput_mibps
   extra_server_properties             = var.msk.extra_server_properties
+
+  # One credential per service plus the reconciler admin, or — when
+  # msk.scram_mode is "shared" — one service credential plus the admin.
+  scram_users    = module.kafka_acls.scram_users
+  scram_username = var.msk.scram_username
+
+  allow_everyone_if_no_acl_found = var.msk.allow_everyone_if_no_acl_found
 
   kms_key_arn        = aws_kms_key.data.arn
   log_kms_key_arn    = aws_kms_key.logs.arn
@@ -254,7 +292,25 @@ module "iam" {
   namespace             = var.kubernetes_namespace
   service_account_names = local.service_account_names
 
+  # Only the IAM authentication path puts topic authorisation in IAM policy.
+  # Under SCRAM the equivalent statements would be inert — MSK does not consult
+  # IAM for a SASL/SCRAM principal — so the roles are left without them and
+  # authorisation lives entirely in the Kafka ACLs from module.kafka_acls.
   msk_cluster_arn = var.msk.client_authentication == "iam" ? module.msk.cluster_arn : null
+
+  # One table, two rendering paths: whichever of the two is live, it is
+  # generated from modules/kafka-acls rather than from a second copy here.
+  kafka_access = module.kafka_acls.kafka_access
+
+  # Groups: the ones the binaries actually join, plus a prefixed hedge for the
+  # two whose group name is an env variable (MOD_CONSUMER_GROUP,
+  # CREDITS_CONSUMER_GROUP). The hedge is safe HERE and not in the ACLs,
+  # because an IAM statement naming a group nothing ever joins is inert, while
+  # an ACL naming one closes that group to everyone else.
+  kafka_consumer_groups = {
+    for svc, groups in module.kafka_acls.kafka_consumer_groups :
+    svc => distinct(concat(groups, [for g in groups : "${g}-*"]))
+  }
 
   embeddings_bucket_arn = module.s3.embeddings_bucket_arn
   milvus_bucket_arn     = module.s3.milvus_bucket_arn
@@ -271,13 +327,17 @@ module "iam" {
     enabled              = true
     namespace            = var.external_secrets_namespace
     service_account_name = var.external_secrets_service_account
-    secret_arn_prefixes = distinct([
+    secret_arn_prefixes = distinct(compact([
       module.secrets.secret_arn_prefix,
       # The RDS-managed master password secrets sit outside the module's path,
       # so they are granted by their own ARNs rather than by the prefix.
       module.rds_identity.master_user_secret_arn,
       local.policy_db.secret_arn,
-    ])
+      # The SCRAM credentials live under the AmazonMSK_ prefix MSK insists on,
+      # which is also outside the deployment's own path. ESO needs them to
+      # project the per-service Kafka credentials and the reconciler admin's.
+      module.msk.scram_secret_arn_prefix,
+    ]))
   }
 
   milvus_service_account = {
