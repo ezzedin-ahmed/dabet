@@ -77,6 +77,12 @@ spec:
               ORDINAL="${HOSTNAME##*-}"
               export KAFKA_NODE_ID="$((ORDINAL + 1))"
               export KAFKA_ADVERTISED_LISTENERS="PLAINTEXT://${HOSTNAME}.{{ $hs }}.{{ $dom }}:{{ $cport }}"
+              {{- if .Values.kafka.externalAccess.enabled }}
+              # A client outside the cluster cannot resolve the pod DNS above,
+              # and dials whatever the broker advertises -- so each broker must
+              # advertise its own NodePort, not a shared Service address.
+              export KAFKA_ADVERTISED_LISTENERS="${KAFKA_ADVERTISED_LISTENERS},EXTERNAL://{{ required "kafka.externalAccess.advertisedHost is required when externalAccess is enabled" .Values.kafka.externalAccess.advertisedHost }}:$(({{ .Values.kafka.externalAccess.nodePortBase }} + ORDINAL))"
+              {{- end }}
               echo "starting broker node.id=${KAFKA_NODE_ID} advertised=${KAFKA_ADVERTISED_LISTENERS}"
               exec /etc/kafka/docker/run
           env:
@@ -85,9 +91,9 @@ spec:
             - name: KAFKA_CONTROLLER_QUORUM_VOTERS
               value: {{ join "," $voters | quote }}
             - name: KAFKA_LISTENERS
-              value: "PLAINTEXT://:{{ $cport }},CONTROLLER://:{{ $qport }}"
+              value: "PLAINTEXT://:{{ $cport }},CONTROLLER://:{{ $qport }}{{ if .Values.kafka.externalAccess.enabled }},EXTERNAL://:{{ .Values.kafka.listeners.externalPort }}{{ end }}"
             - name: KAFKA_LISTENER_SECURITY_PROTOCOL_MAP
-              value: "PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT"
+              value: "PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT{{ if .Values.kafka.externalAccess.enabled }},EXTERNAL:PLAINTEXT{{ end }}"
             - name: KAFKA_CONTROLLER_LISTENER_NAMES
               value: "CONTROLLER"
             - name: KAFKA_INTER_BROKER_LISTENER_NAME

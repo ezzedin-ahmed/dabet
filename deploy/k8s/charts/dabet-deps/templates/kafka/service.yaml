@@ -51,3 +51,35 @@ spec:
       port: {{ .Values.kafka.listeners.clientPort }}
       targetPort: client
 {{- end }}
+{{- if and .Values.kafka.enabled .Values.kafka.externalAccess.enabled }}
+{{- $root := . }}
+{{- range $i := until (int .Values.kafka.replicas) }}
+---
+{{- /*
+  One NodePort per broker, on purpose. A Kafka client dials whatever the
+  broker advertises, so a single NodePort in front of all three would hand
+  an external client pod DNS it cannot resolve. Each broker advertises its
+  own <advertisedHost>:<nodePortBase + ordinal>, and this is the Service
+  that makes that address real.
+*/ -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "dabet-deps.componentName" (dict "root" $root "component" (printf "kafka-ext-%d" $i)) }}
+  namespace: {{ $root.Release.Namespace }}
+  labels:
+    {{- include "dabet-deps.componentLabels" (dict "root" $root "component" "kafka") | nindent 4 }}
+spec:
+  type: NodePort
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "dabet-deps.selectorLabels" (dict "root" $root "component" "kafka") | nindent 4 }}
+    statefulset.kubernetes.io/pod-name: {{ include "dabet-deps.componentName" (dict "root" $root "component" "kafka") }}-{{ $i }}
+  ports:
+    - name: external
+      port: {{ $root.Values.kafka.listeners.externalPort }}
+      targetPort: {{ $root.Values.kafka.listeners.externalPort }}
+      nodePort: {{ add $root.Values.kafka.externalAccess.nodePortBase $i }}
+      protocol: TCP
+{{- end }}
+{{- end }}

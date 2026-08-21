@@ -514,3 +514,60 @@ schedule is analytically exact and that a stall lands as lag rather than
 sliding the clock; that the Prometheus parser handles real exposition text
 including histograms, quoted label values and counter resets; and that the
 result document's shape holds and never contains a NaN.
+
+## Kubernetes run, 2026-08-21: per-key concurrency did not pay off
+
+**Rig.** k3s on a 20-core / 30 GB node; load generated from a *separate* machine
+over a 0.38 ms wired LAN at ~50 MB/s, so the generator never competed with the
+system under test. Brokers reached through per-broker NodePorts
+(`kafka.externalAccess`), APIs and metrics through NodePorts — no
+`kubectl port-forward` anywhere in the measured path, because a debug proxy
+funnels everything through one process and becomes the bottleneck. Generator
+self-benchmark: 594K–978K msg/s, three orders of magnitude above every rate
+tested, so no result here is generator-bound.
+
+Deployment: 1 `moderation-service` replica, `messages.v1` at 12 partitions,
+3 Kafka brokers, 3 Redis shards — all co-located on the single node.
+
+**What was tested.** `KAFKA_CONSUMER_KEY_CONCURRENCY` 1 vs 8. The premise was
+that §7.3 requires ordering per `(sender, content)` — the record key — not per
+partition, so fanning a partition out to N key-routed workers should lift the
+per-partition ceiling.
+
+**Result: no benefit, and a measurable cost.** At equal throughput (1 500 msg/s)
+`moderation-service` drew **809 m** of CPU at concurrency 1 and **962 m** at
+concurrency 8 — about 19% more CPU for the same work. Higher rates were worse,
+not better, at concurrency 8.
+
+**Attribution — why.** Kafka is the bottleneck, not moderation:
+
+| component | CPU at 1 500 msg/s |
+| --- | --- |
+| Kafka (3 brokers, summed) | **~7.2–7.5 cores** |
+| moderation-service | 0.8–1.0 cores |
+| Redis (3 shards, summed) | ~0.5 cores |
+
+Moderation never approached saturation, so widening its internal parallelism
+could not relieve the constraint; the fan-out machinery (per-partition
+coordinator, per-worker queues, low-water-mark commit tracking) is pure overhead
+in that regime, and deeper in-flight queues add pressure to the component that
+*is* saturated.
+
+Three brokers sharing one node is not a realistic topology — in production they
+are separate machines — which is precisely why Kafka binds first here. The same
+thing happened on the earlier laptop run, for the same reason.
+
+**Conclusion.** The optimisation is correct and unit-tested (ordering per key,
+low-water-mark commits, crash-resume), but it **cannot be validated on a
+single-node Kafka**, and on the evidence available it should stay off. The
+default is 1 in code and in compose. Enable it only where the brokers
+demonstrably have headroom and moderation is provably the constraint —
+`kafka_consumer_lag_messages` rising while moderation CPU sits well below its
+limit is the signal to look for.
+
+**Caveat on the A/B latency figures.** Run-to-run variance across this session
+was large: identical configurations at 1 500 msg/s produced p95 values from
+12 ms to 50 s as the node accumulated Kafka data across repeated runs. State was
+not reset between rungs. The CPU attribution above was consistent across every
+sample and is the defensible finding; the paired latency numbers are not, and
+are deliberately not quoted as a before/after.

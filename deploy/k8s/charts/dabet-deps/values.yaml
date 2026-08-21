@@ -119,6 +119,16 @@ kafka:
   listeners:
     clientPort: 9092
     controllerPort: 9093
+    externalPort: 9094
+  # Reaching the brokers from outside the cluster. Kafka clients follow the
+  # advertised listener, so a plain NodePort is not enough: each broker must
+  # advertise an address the client can actually dial. One NodePort Service per
+  # broker, advertised as <advertisedHost>:<nodePortBase + ordinal>.
+  externalAccess:
+    enabled: false
+    # Node IP (or any address routing to it) that external clients will use.
+    advertisedHost: ""
+    nodePortBase: 31090
   # Applied to __consumer_offsets and the transaction state log. Capped at
   # `replicas` by the template so a 1-broker laptop still starts.
   replicationFactor: 3
