@@ -1202,8 +1202,28 @@ The modules with an `aws_caller_identity` data source (`s3`, `secrets`,
 `observability`) and the root, which has one in `kms.tf`, cannot be planned this
 way — that data source is a real STS call.
 
-**What still needs a live MSK cluster.** Everything above is shape, not
-behaviour. A real cluster is the only thing that can settle:
+**The ACL matrix was checked against a real broker, just not a real MSK one.**
+The rendered rules were applied by the chart's own Job scripts, unmodified, in
+the `apache/kafka:3.9.0` image, against a single-node KRaft broker configured
+the way MSK is: SASL/SCRAM-SHA-512, the `StandardAuthorizer`,
+`allow.everyone.if.no.acl.found = true`, `auto.create.topics.enable = false`.
+All 25 bindings applied on the first run and again on the second — the run that
+proves the admin did not lock itself out by writing the first `Cluster`
+binding. Authorisation then behaved as the matrix says: `review-service` could
+produce `deletions.v1` and do a groupless assign on `flagged.v1`, and was
+refused `messages.v1`, `usage.v1`, topic creation and ACL writes;
+`moderation-service` could consume `messages.v1` in its own group and was
+refused `insights-service`'s. The per-service ACL table in
+`charts/dabet-deps/README.md` has the full result.
+
+That run also confirmed the caveat about the flag rather than just asserting
+it: `review-service` *was* able to join a group named `review-service`,
+because it holds no group ACL and an unlisted resource stays open. Everything
+the matrix names is restricted; nothing else is.
+
+**What still needs a live MSK cluster.** Everything above is shape and generic
+Kafka behaviour, not AWS behaviour. A real cluster is the only thing that can
+settle:
 
 - whether MSK accepts `allow.everyone.if.no.acl.found` as an editable property
   at the configured `kafka_version` (it is documented as editable; an
@@ -1211,9 +1231,9 @@ behaviour. A real cluster is the only thing that can settle:
 - whether the reconciler admin can in fact write the first `Cluster` binding —
   the whole bootstrap sequence rests on MSK's per-resource evaluation of that
   flag behaving as documented;
-- that SASL/SCRAM over TLS from the `apache/kafka` image's shell tools
-  negotiates against MSK's brokers with nothing but the JVM's default
-  truststore;
+- that SASL/SCRAM **over TLS** negotiates against MSK's brokers with nothing
+  but the JVM's default truststore — the local run above was
+  `SASL_PLAINTEXT`, so the SCRAM half is proven and the TLS half is not;
 - that seven SCRAM secrets associate cleanly in one
   `aws_msk_scram_secret_association` — the API takes a list, but the per-secret
   KMS and resource-policy preconditions are checked at association time;

@@ -319,6 +319,50 @@ prune would turn a values typo into an outage, and a stale extra binding is a
 far milder failure than a deleted one. The full binding list is printed at
 the end of every run so drift is visible.
 
+### What was checked against a real broker
+
+Both reconcilers were run **as rendered by this chart**, unmodified, in the
+`apache/kafka:3.9.0` image, against a single-node KRaft broker configured the
+way MSK is: SASL/SCRAM-SHA-512, the `StandardAuthorizer`,
+`allow.everyone.if.no.acl.found = true`, and `auto.create.topics.enable =
+false`. The full 25-binding matrix applied on the first run, and the second run
+still succeeded — which is the check that matters, because by then the
+`Cluster` resource had ACLs and the admin was authorising itself with the
+binding it had just written.
+
+The matrix bites, and the failures land where they should:
+
+| As | Action | Result |
+| --- | --- | --- |
+| `review-service` | produce `deletions.v1` | allowed |
+| `review-service` | groupless assign on `flagged.v1` (§7.6) | allowed |
+| `review-service` | produce `messages.v1` / `usage.v1` | `TopicAuthorizationException` |
+| `review-service` | create a topic | denied — nothing was created |
+| `review-service` | grant itself an ACL | denied |
+| `moderation-service` | produce `flagged.v1`, consume `messages.v1` in its own group | allowed |
+| `moderation-service` | produce `messages.v1` | denied |
+| `moderation-service` | join `insights-service`'s group | `GroupAuthorizationException` |
+
+Two results are worth carrying forward:
+
+* **`allow.everyone.if.no.acl.found` really does leave the gaps open.**
+  `review-service` was able to join a consumer group *named* `review-service`
+  — it holds no group ACL, so that group has no bindings at all, so the flag
+  let it through. Every group and topic the matrix names is genuinely
+  restricted; nothing else is. That is the argument for the second phase of
+  the flip described in `deploy/terraform/modules/msk`.
+* **A service principal cannot run `kafka-topics.sh --describe`**, because
+  `TopicCommand` also fetches topic configs and that needs `DescribeConfigs`,
+  which no service is granted. The application path is unaffected — franz-go
+  needs `Describe` and `Read` — and the CLI being unusable from a service
+  credential is the correct outcome, not a missing grant.
+
+The topic reconciler's three idempotence cases were exercised over the same
+authenticated connection: create-when-absent, raise `usage.v1` from 32 to 64
+partitions, refuse to shrink `flagged.v1` from 128 to 8 (loud, non-fatal,
+exit 0, partition count untouched), and re-apply a changed retention. Three
+consecutive runs converge.
+
 ---
 
 ## Redis Cluster
