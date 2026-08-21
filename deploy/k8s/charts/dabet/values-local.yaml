@@ -255,6 +255,9 @@ services:
       OAUTH_MOCK_CLIENT_SECRET: OAUTH_MOCK_CLIENT_SECRET
 
   moderation-service:
+    # Measured: one replica draws ~1.3 cores at saturation, so a 1-core limit
+    # throttles it at roughly 700 msg/s and you end up measuring the ceiling
+    # rather than the software (see test/load/RESULTS.md).
     # One is enough to prove the pipeline; the load harness is what needs
     # three, and it needs a real broker with real partitions to be worth
     # running (test/load/README.md, "Why the overlay exists").
@@ -262,7 +265,7 @@ services:
     terminationGracePeriodSeconds: 30
     resources:
       requests: { cpu: 50m, memory: 128Mi }
-      limits: { cpu: 1, memory: 512Mi }
+      limits: { cpu: 4, memory: 1Gi }
     env:
       POLICY_ENDPOINT: "dabet-policy-service:7101"
       CREDITS_ENDPOINT: "http://dabet-credits-service:8080"

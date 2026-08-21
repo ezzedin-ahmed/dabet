@@ -517,6 +517,13 @@ result document's shape holds and never contains a NaN.
 
 ## Kubernetes run, 2026-08-21: per-key concurrency did not pay off
 
+> **Superseded in part by [RESULTS.md](RESULTS.md).** The conclusion below is
+> right, but the attribution in it was reached before I noticed that
+> `moderation-service` was pinned at a 1-core limit and therefore throttled.
+> RESULTS.md re-runs the comparison with the throttle removed and a rig that
+> resets state between rungs; the conclusion survives, on better evidence.
+
+
 **Rig.** k3s on a 20-core / 30 GB node; load generated from a *separate* machine
 over a 0.38 ms wired LAN at ~50 MB/s, so the generator never competed with the
 system under test. Brokers reached through per-broker NodePorts
