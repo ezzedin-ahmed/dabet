@@ -40,40 +40,63 @@ func TestSeenGuard(t *testing.T) {
 	}
 }
 
+// takeToken drives the merged script with only the rate stage enabled,
+// which is how the rate limiter reaches the token bucket now.
+func takeToken(t *testing.T, s *RedisState, capacity, refillPerSec float64, now time.Time, ttl time.Duration) bool {
+	t.Helper()
+	res, err := s.Cascade(context.Background(), "ct", "au", CascadeParams{
+		Rate: &RateParams{Capacity: capacity, RefillPerSec: refillPerSec, Now: now, TTL: ttl},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return res.Hit == CascadeNone
+}
+
+// dupCheck drives the merged script with only the duplicate stage enabled.
+func dupCheck(t *testing.T, s *RedisState, hash string, depth int, ttl time.Duration) bool {
+	t.Helper()
+	res, err := s.Cascade(context.Background(), "ct", "au", CascadeParams{
+		Dup: &DupParams{Hash: hash, Depth: depth, TTL: ttl},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return res.Hit == CascadeDuplicate
+}
+
 // Rate-limit bucket math: burst up to capacity, then refill at
 // messages/seconds per second. The clock is passed as a script argument,
 // so a fake clock drives refill deterministically.
 func TestRateLimitBucketBurstThenRefill(t *testing.T) {
 	s, mr := newTestState(t)
-	ctx := context.Background()
 	key := rediskeys.Rate("ct", "au")
 	now := t0
 	const capacity, refillPerSec = 3.0, 1.0 // 3 msgs / 3 s
 
 	for i := 0; i < 3; i++ {
-		ok, err := s.TakeToken(ctx, key, capacity, refillPerSec, now, 6*time.Second)
-		if err != nil || !ok {
-			t.Fatalf("burst token %d = (%v, %v), want allowed", i+1, ok, err)
+		if !takeToken(t, s, capacity, refillPerSec, now, 6*time.Second) {
+			t.Fatalf("burst token %d denied, want allowed", i+1)
 		}
 	}
-	if ok, _ := s.TakeToken(ctx, key, capacity, refillPerSec, now, 6*time.Second); ok {
+	if takeToken(t, s, capacity, refillPerSec, now, 6*time.Second) {
 		t.Fatal("bucket exhausted, 4th take must be denied")
 	}
 
 	// 500 ms refills only half a token: still denied.
-	if ok, _ := s.TakeToken(ctx, key, capacity, refillPerSec, now.Add(500*time.Millisecond), 6*time.Second); ok {
+	if takeToken(t, s, capacity, refillPerSec, now.Add(500*time.Millisecond), 6*time.Second) {
 		t.Fatal("half a token must not admit")
 	}
 	// A further second refills past 1 (0.5 - already spent? no: denied takes
 	// consume nothing), so at +1.5s the bucket holds 1.5 tokens.
-	if ok, err := s.TakeToken(ctx, key, capacity, refillPerSec, now.Add(1500*time.Millisecond), 6*time.Second); err != nil || !ok {
-		t.Fatalf("refilled token = (%v, %v), want allowed", ok, err)
+	if !takeToken(t, s, capacity, refillPerSec, now.Add(1500*time.Millisecond), 6*time.Second) {
+		t.Fatal("refilled token denied, want allowed")
 	}
 	// Refill never exceeds capacity: after an hour only 3 tokens exist.
 	later := now.Add(time.Hour)
 	allowed := 0
 	for i := 0; i < 5; i++ {
-		if ok, _ := s.TakeToken(ctx, key, capacity, refillPerSec, later, 6*time.Second); ok {
+		if takeToken(t, s, capacity, refillPerSec, later, 6*time.Second) {
 			allowed++
 		}
 	}
@@ -86,26 +109,50 @@ func TestRateLimitBucketBurstThenRefill(t *testing.T) {
 	}
 }
 
+// The sampler's own key is in another slot family and keeps its own
+// script, so the same arithmetic has to hold through TakeToken too.
+func TestSamplerAndRateShareTheSameBucketMaths(t *testing.T) {
+	s, _ := newTestState(t)
+	ctx := context.Background()
+	key := rediskeys.Samp("ct")
+	const capacity, refillPerSec = 3.0, 1.0
+
+	for i := 0; i < 3; i++ {
+		if ok, err := s.TakeToken(ctx, key, capacity, refillPerSec, t0, 6*time.Second); err != nil || !ok {
+			t.Fatalf("burst token %d = (%v, %v), want allowed", i+1, ok, err)
+		}
+	}
+	if ok, _ := s.TakeToken(ctx, key, capacity, refillPerSec, t0, 6*time.Second); ok {
+		t.Fatal("bucket exhausted, 4th take must be denied")
+	}
+	if ok, _ := s.TakeToken(ctx, key, capacity, refillPerSec, t0.Add(500*time.Millisecond), 6*time.Second); ok {
+		t.Fatal("half a token must not admit")
+	}
+	if ok, err := s.TakeToken(ctx, key, capacity, refillPerSec, t0.Add(1500*time.Millisecond), 6*time.Second); err != nil || !ok {
+		t.Fatalf("refilled token = (%v, %v), want allowed", ok, err)
+	}
+}
+
 func TestDupCheckMembershipAndDepth(t *testing.T) {
 	s, mr := newTestState(t)
-	ctx := context.Background()
 	key := rediskeys.Dup("ct", "au")
 
-	hit, err := s.DupCheck(ctx, key, "h1", 3, 5*time.Minute)
-	if err != nil || hit {
-		t.Fatalf("first hash = (%v, %v), want miss", hit, err)
+	if dupCheck(t, s, "h1", 3, 5*time.Minute) {
+		t.Fatal("first hash must miss")
 	}
-	hit, _ = s.DupCheck(ctx, key, "h1", 3, 5*time.Minute)
-	if !hit {
+	if !dupCheck(t, s, "h1", 3, 5*time.Minute) {
 		t.Fatal("repeated hash must hit")
 	}
-	// Push h2..h4 (depth 3): h1 gets evicted from the window.
+	// Push h2..h4 (depth 3): h1 gets evicted from the window. Note the hit
+	// above pushed h1 a second time, so the window holds [h1 h1] here —
+	// the script pushes unconditionally, exactly as the separate duplicate
+	// script did, and the eviction order depends on it.
 	for _, h := range []string{"h2", "h3", "h4"} {
-		if hit, _ := s.DupCheck(ctx, key, h, 3, 5*time.Minute); hit {
+		if dupCheck(t, s, h, 3, 5*time.Minute) {
 			t.Fatalf("fresh hash %s must miss", h)
 		}
 	}
-	if hit, _ := s.DupCheck(ctx, key, "h1", 3, 5*time.Minute); hit {
+	if dupCheck(t, s, "h1", 3, 5*time.Minute) {
 		t.Fatal("h1 aged out of the depth window, must miss")
 	}
 	if ttl := mr.TTL(key); ttl != 5*time.Minute {
@@ -152,21 +199,33 @@ func TestEmbSimilarityAndWindow(t *testing.T) {
 	b := []float32{0, 1, 0}
 	almostA := []float32{0.99, 0.05, 0}
 
-	sim, err := s.EmbMaxSimilarity(ctx, key, a, 2, 5*time.Minute)
-	if err != nil || sim != 0 {
-		t.Fatalf("empty history sim = (%v, %v), want 0", sim, err)
+	// The read half rides the merged call, the cosine is computed in Go
+	// and the append is its own round trip — the same sequence the
+	// semantic stage performs.
+	compare := func(vec []float32) float64 {
+		t.Helper()
+		res, err := s.Cascade(ctx, "ct", "au", CascadeParams{EmbDepth: 2})
+		if err != nil {
+			t.Fatal(err)
+		}
+		sim := maxSimilarity(vec, res.Vectors)
+		if err := s.EmbAppend(ctx, "ct", "au", vec, 2, 5*time.Minute); err != nil {
+			t.Fatal(err)
+		}
+		return sim
 	}
-	sim, _ = s.EmbMaxSimilarity(ctx, key, b, 2, 5*time.Minute)
-	if sim >= 0.5 {
+
+	if sim := compare(a); sim != 0 {
+		t.Fatalf("empty history sim = %v, want 0", sim)
+	}
+	if sim := compare(b); sim >= 0.5 {
 		t.Fatalf("orthogonal sim = %v, want ~0", sim)
 	}
-	sim, _ = s.EmbMaxSimilarity(ctx, key, almostA, 2, 5*time.Minute)
-	if sim < 0.95 {
+	if sim := compare(almostA); sim < 0.95 {
 		t.Fatalf("near-duplicate sim = %v, want >= 0.95", sim)
 	}
 	// Depth 2: a has been evicted (list holds almostA, b).
-	sim, _ = s.EmbMaxSimilarity(ctx, key, a, 2, 5*time.Minute)
-	if sim < 0.9 { // still similar to almostA
+	if sim := compare(a); sim < 0.9 { // still similar to almostA
 		t.Fatalf("sim vs retained almostA = %v", sim)
 	}
 	if ttl := mr.TTL(key); ttl != 5*time.Minute {

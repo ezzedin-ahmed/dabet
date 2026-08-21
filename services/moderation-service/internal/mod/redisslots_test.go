@@ -1,10 +1,12 @@
 package mod
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"go/ast"
 	"go/parser"
+	"go/printer"
 	"go/token"
 	"io/fs"
 	"regexp"
@@ -43,6 +45,17 @@ import (
 // a static scan of the scripts, a static scan of the call sites, and a
 // slot-checking hook on a live client that watches the real operations
 // run. Add a cross-tag script later and at least one of them fails.
+//
+// NOTE ON WHAT CHANGED. This audit used to enforce the stricter proxy
+// "one key per script", which was true of the code and easy to check. It
+// is no longer the invariant: cascadeLua deliberately holds rate:, dup:
+// and emb: for ONE pair, which is legal precisely because §4.3 gives them
+// the same tag. The rule enforced here is now the real one — every key a
+// script touches must provably share a hash tag — checked statically at
+// the call site (the keys must be built from pairKeyBuilders with
+// identical arguments) and dynamically from the slots the client actually
+// routes on. TestSlotAuditCatchesACrossTagScript and
+// TestSlotAuditCatchesACrossTagTransaction keep it from going vacuous.
 
 // ---------------------------------------------------------------------------
 // Redis Cluster's key -> slot function (CRC16-CCITT of the hash tag, mod
@@ -149,14 +162,21 @@ func TestKeyFamilySlots(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Static scan 1: every Lua script in this package uses KEYS[1] and nothing
-// else. A script that read KEYS[2] would be a cross-slot failure waiting
-// for cluster mode, however the caller happened to tag its keys.
+// Static scan 1: every Lua script in this package indexes KEYS by a small
+// constant, and never more slots than its call site declares. A script
+// that read KEYS[4] when only three keys are passed, or that iterated
+// #KEYS, would make the key count unauditable — and in cluster mode an
+// unauditable key count is a cross-slot failure waiting to happen.
 // ---------------------------------------------------------------------------
+
+// maxScriptKeys is the largest number of keys any script here may take: the
+// three (content, author) keys cascadeLua owns. Raising it is a decision
+// about §4.3, not a detail — a fourth key would have to carry the same tag.
+const maxScriptKeys = 3
 
 var keysIndexRe = regexp.MustCompile(`KEYS\s*\[\s*([^\]]*?)\s*\]`)
 
-func TestEveryLuaScriptUsesOnlyKEYS1(t *testing.T) {
+func TestEveryLuaScriptIndexesKeysByConstant(t *testing.T) {
 	scripts := 0
 	for file, lit := range packageStringLiterals(t) {
 		if !strings.Contains(lit.value, "KEYS[") && !strings.Contains(lit.value, "KEYS [") {
@@ -164,36 +184,47 @@ func TestEveryLuaScriptUsesOnlyKEYS1(t *testing.T) {
 		}
 		scripts++
 		for _, m := range keysIndexRe.FindAllStringSubmatch(lit.value, -1) {
-			if m[1] != "1" {
+			n, err := strconv.Atoi(m[1])
+			if err != nil || n < 1 || n > maxScriptKeys {
 				t.Errorf("%s:%d: Lua script indexes KEYS[%s]; in Redis Cluster a script may only touch "+
-					"keys in one slot, and §4.3's hash tags cannot rescue a second key from another family. "+
-					"Either give both keys the same tag or split the script.", file, lit.line, m[1])
+					"keys in one slot, so every index must be a constant in 1..%d and every key must "+
+					"carry the same §4.3 hash tag. Either tag them alike or split the script.",
+					file, lit.line, m[1], maxScriptKeys)
 			}
 		}
 		if strings.Contains(lit.value, "#KEYS") {
 			t.Errorf("%s:%d: Lua script iterates over #KEYS; the key count is then unauditable statically. "+
-				"Keep scripts to a single key.", file, lit.line)
+				"Index KEYS by constant.", file, lit.line)
 		}
 	}
-	// bucketLua and dupLua. If a rename or a move makes this zero the scan
-	// is checking nothing, which is worse than failing.
+	// bucketLua and cascadeLua. If a rename or a move makes this zero the
+	// scan is checking nothing, which is worse than failing.
 	if scripts < 2 {
 		t.Fatalf("found %d Lua scripts to audit, want at least the 2 in redisstate.go", scripts)
 	}
 }
 
 // ---------------------------------------------------------------------------
-// Static scan 2: every script invocation passes at most one key. A script
-// that only ever reads KEYS[1] but is handed two keys still fails in
-// cluster mode, because the client routes on the whole key list.
+// Static scan 2: every script invocation passes keys that provably share
+// one hash tag. A script that only ever reads KEYS[1] but is handed two
+// keys still fails in cluster mode, because the client routes on the whole
+// key list — and a multi-key script is only legal when the keys are built
+// from the same (content, author) pair.
 // ---------------------------------------------------------------------------
 
-func TestEveryScriptCallPassesOneKey(t *testing.T) {
+// pairKeyBuilders are the rediskeys constructors whose result carries the
+// {content:author} tag. Two calls to any of them with the same arguments
+// are guaranteed by pkg/rediskeys to land in one slot; TestKeyFamilySlots
+// above is what keeps that guarantee honest.
+var pairKeyBuilders = map[string]bool{"Rate": true, "Dup": true, "Emb": true}
+
+func TestEveryScriptCallPassesOneSlot(t *testing.T) {
 	fset := token.NewFileSet()
 	pkgs, err := parser.ParseDir(fset, ".", nonTestGoFile, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
+	checked := 0
 	for _, pkg := range pkgs {
 		ast.Inspect(pkg, func(n ast.Node) bool {
 			call, ok := n.(*ast.CallExpr)
@@ -221,16 +252,87 @@ func TestEveryScriptCallPassesOneKey(t *testing.T) {
 				if id, ok := at.Elt.(*ast.Ident); !ok || id.Name != "string" {
 					continue
 				}
-				if len(lit.Elts) > 1 {
-					pos := fset.Position(lit.Pos())
-					t.Errorf("%s: %s is called with %d keys; a Redis Cluster script may only touch keys "+
-						"in one slot. Confirm they share a §4.3 hash tag, or split the call.",
-						pos, sel.Sel.Name, len(lit.Elts))
+				checked++
+				pos := fset.Position(lit.Pos())
+				if len(lit.Elts) > maxScriptKeys {
+					t.Errorf("%s: %s is called with %d keys, more than the %d one hash tag covers here",
+						pos, sel.Sel.Name, len(lit.Elts), maxScriptKeys)
+				}
+				if len(lit.Elts) < 2 {
+					continue
+				}
+				// Multi-key call: every element must be a pair-tagged
+				// rediskeys constructor applied to the SAME arguments, so
+				// the whole list is one tag and therefore one slot.
+				var tags []string
+				for _, elt := range lit.Elts {
+					tag, err := pairKeyTag(fset, elt)
+					if err != nil {
+						t.Errorf("%s: %s is called with %d keys and %v; a multi-key Redis Cluster script "+
+							"is only legal when every key is built from one §4.3 hash tag, which has to be "+
+							"visible here. Build the keys inline from rediskeys, or split the call.",
+							pos, sel.Sel.Name, len(lit.Elts), err)
+						break
+					}
+					tags = append(tags, tag)
+				}
+				for _, tag := range tags {
+					if tag != tags[0] {
+						t.Errorf("%s: %s is called with keys tagged %v; a Redis Cluster script may only "+
+							"touch keys in one slot", pos, sel.Sel.Name, tags)
+						break
+					}
 				}
 			}
 			return true
 		})
 	}
+	if checked == 0 {
+		t.Fatal("found no script key lists to audit; the scan would be vacuous")
+	}
+}
+
+// pairKeyTag renders the hash tag a key expression will produce, or an
+// error describing why it cannot be established statically.
+func pairKeyTag(fset *token.FileSet, expr ast.Expr) (string, error) {
+	call, ok := expr.(*ast.CallExpr)
+	if !ok {
+		return "", fmt.Errorf("key %s is not a rediskeys constructor call", render(fset, expr))
+	}
+	sel, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok {
+		return "", fmt.Errorf("key %s is not a rediskeys constructor call", render(fset, expr))
+	}
+	pkg, ok := sel.X.(*ast.Ident)
+	if !ok || pkg.Name != "rediskeys" {
+		return "", fmt.Errorf("key %s does not come from pkg/rediskeys", render(fset, expr))
+	}
+	if !pairKeyBuilders[sel.Sel.Name] {
+		return "", fmt.Errorf("rediskeys.%s is not one of the {content:author}-tagged builders %v",
+			sel.Sel.Name, sortedKeys(pairKeyBuilders))
+	}
+	var args []string
+	for _, a := range call.Args {
+		args = append(args, render(fset, a))
+	}
+	return strings.Join(args, ","), nil
+}
+
+func render(fset *token.FileSet, node ast.Node) string {
+	var buf bytes.Buffer
+	if err := printer.Fprint(&buf, fset, node); err != nil {
+		return "<unprintable>"
+	}
+	return buf.String()
+}
+
+func sortedKeys(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // ---------------------------------------------------------------------------
@@ -341,14 +443,16 @@ func commandKeys(t *testing.T, cmd redis.Cmder) (string, []string) {
 			t.Errorf("%s: unparseable numkeys %v", name, args[2])
 			return name, nil
 		}
-		if n > 1 {
-			t.Errorf("%s is invoked with numkeys=%d; §4.3's scripts must stay single-key so they are "+
-				"legal in Redis Cluster", name, n)
+		if n > maxScriptKeys {
+			t.Errorf("%s is invoked with numkeys=%d; §4.3's scripts may span at most the %d keys of one "+
+				"(content, author) hash tag", name, n, maxScriptKeys)
 		}
 		var keys []string
 		for i := 0; i < n && 3+i < len(args); i++ {
 			keys = append(keys, fmt.Sprint(args[3+i]))
 		}
+		// The caller routes on exactly these; assertOneSlot checks they
+		// are one slot, which is the rule a multi-key script must meet.
 		return name, keys
 	}
 	if noKeyCmds[name] {
@@ -380,22 +484,80 @@ func TestEveryRedisOperationStaysInOneSlot(t *testing.T) {
 	if _, err := s.Seen(ctx, "msg-1", 5*time.Minute); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.TakeToken(ctx, rediskeys.Rate(contentID, authorID), 3, 1, t0, 6*time.Second); err != nil {
-		t.Fatal(err)
-	}
 	if _, err := s.TakeToken(ctx, rediskeys.Samp(contentID), 30, 0.5, t0, 5*time.Minute); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.DupCheck(ctx, rediskeys.Dup(contentID, authorID), "h1", 3, 5*time.Minute); err != nil {
-		t.Fatal(err)
+	// The merged script, with every stage on: it is the one call that
+	// spans three keys, and the hook checks the slots the client routes
+	// on. Twice, so the second call sees a non-empty duplicate window and
+	// a non-empty comparison window.
+	full := CascadeParams{
+		Rate:     &RateParams{Capacity: 3, RefillPerSec: 1, Now: t0, TTL: 6 * time.Second},
+		Dup:      &DupParams{Hash: "h1", Depth: 3, TTL: 5 * time.Minute},
+		EmbDepth: 2,
 	}
-	// Twice, so the second call exercises the read-then-TxPipeline path
-	// with a non-empty history.
 	for i := 0; i < 2; i++ {
-		if _, err := s.EmbMaxSimilarity(ctx, rediskeys.Emb(contentID, authorID),
-			[]float32{1, 0, 0}, 2, 5*time.Minute); err != nil {
+		if _, err := s.Cascade(ctx, contentID, authorID, full); err != nil {
 			t.Fatal(err)
 		}
+		if err := s.EmbAppend(ctx, contentID, authorID, []float32{1, 0, 0}, 2, 5*time.Minute); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// And with every merged stage off, which must still be a legal call.
+	if _, err := s.Cascade(ctx, contentID, authorID, CascadeParams{}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestSlotAuditCatchesACrossTagScript is the companion proof for the
+// multi-key script the merge introduced: hand EVAL a key list that mixes
+// two tag families and the hook must report it. Without this the relaxed
+// numkeys rule above would be a hole rather than a rule.
+func TestSlotAuditCatchesACrossTagScript(t *testing.T) {
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+
+	spy := &testing.T{}
+	rdb.AddHook(&slotAudit{t: spy})
+
+	ctx := context.Background()
+	// dup:{ct-1:au-1} and samp:{ct-1} are different tags, so this script
+	// is illegal in cluster mode however harmless it looks here.
+	script := redis.NewScript(`redis.call('SET', KEYS[1], '1') redis.call('SET', KEYS[2], '1') return 1`)
+	if err := script.Run(ctx, rdb, []string{
+		rediskeys.Dup("ct-1", "au-1"),
+		rediskeys.Samp("ct-1"),
+	}).Err(); err != nil {
+		t.Fatal(err)
+	}
+	if !spy.Failed() {
+		t.Fatal("the slot audit did not notice a script spanning two hash-tag families")
+	}
+}
+
+// And the tag families the merged script DOES span must be accepted, or
+// the check above would be indistinguishable from a blanket ban.
+func TestSlotAuditAcceptsTheMergedPairKeys(t *testing.T) {
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+
+	spy := &testing.T{}
+	rdb.AddHook(&slotAudit{t: spy})
+
+	ctx := context.Background()
+	script := redis.NewScript(`return {KEYS[1], KEYS[2], KEYS[3]}`)
+	if err := script.Run(ctx, rdb, []string{
+		rediskeys.Rate("ct-1", "au-1"),
+		rediskeys.Dup("ct-1", "au-1"),
+		rediskeys.Emb("ct-1", "au-1"),
+	}).Err(); err != nil {
+		t.Fatal(err)
+	}
+	if spy.Failed() {
+		t.Fatal("the slot audit rejected three keys that share one §4.3 hash tag")
 	}
 }
 
